@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "description": "AlfyChat - Gateway WebSocket centralisé",
   "main": "dist/index.js",
-  "packageManager": "bun",
+  "packageManager": "bun@1.2.0",
   "scripts": {
     "build": "tsc",
     "dev": "bun --hot src/index.ts",
-    "start": "bun dist/index.js"
+    "start": "bun src/index.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

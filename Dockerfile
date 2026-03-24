@@ -1,4 +1,4 @@
-FROM oven/bun:1-alpine AS builder
+FROM oven/bun:1-alpine
 
 WORKDIR /app
 
@@ -11,17 +11,8 @@ RUN bun install
 # Copier le code source
 COPY . .
 
-# Compiler TypeScript
-RUN bun run build
-
-FROM oven/bun:1-alpine
-WORKDIR /app
-COPY package.json bun.lockb* ./
-RUN bun install --production
-COPY --from=builder /app/dist ./dist
-
 # Exposer le port
 EXPOSE 3000
 
-# Démarrer l'application
-CMD ["bun", "run", "start"]
+# Démarrer l'application (Bun exécute TypeScript nativement)
+CMD ["bun", "src/index.ts"]
