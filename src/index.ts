@@ -200,12 +200,12 @@ async function safeJson(response: Response): Promise<any> {
   try { return JSON.parse(text); } catch { return null; }
 }
 
-// GET /api/friends → GET /friends/users/:userId
+// GET /api/friends → GET /friends/
 app.get('/api/friends', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/users/${userId}`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/`, {
       headers: {
         'Content-Type': 'application/json',
         ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -220,12 +220,12 @@ app.get('/api/friends', async (req, res) => {
   }
 });
 
-// GET /api/friends/requests → GET /friends/users/:userId/requests
+// GET /api/friends/requests → GET /friends/requests
 app.get('/api/friends/requests', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/users/${userId}/requests`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/requests`, {
       headers: {
         'Content-Type': 'application/json',
         ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -244,12 +244,12 @@ app.get('/api/friends/requests', async (req, res) => {
   }
 });
 
-// GET /api/friends/blocked → GET /friends/users/:userId/blocked
+// GET /api/friends/blocked → GET /friends/blocked
 app.get('/api/friends/blocked', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/users/${userId}/blocked`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/blocked`, {
       headers: {
         'Content-Type': 'application/json',
         ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -264,19 +264,20 @@ app.get('/api/friends/blocked', async (req, res) => {
   }
 });
 
-// DELETE /api/friends/:friendId → DELETE /friends/users/:userId/friends/:friendId
+// DELETE /api/friends/:friendId → DELETE /friends/:friendId
 app.delete('/api/friends/:friendId', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   const { friendId } = req.params;
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/users/${userId}/friends/${friendId}`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/${friendId}`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
         ...(req.headers.authorization && { authorization: req.headers.authorization }),
         'X-User-Id': userId,
       },
+      body: JSON.stringify({ userId }),
     });
     const data = await safeJson(response);
     if (response.ok) {
@@ -290,13 +291,13 @@ app.delete('/api/friends/:friendId', async (req, res) => {
   }
 });
 
-// POST /api/friends/:targetId/block → POST /friends/block
+// POST /api/friends/:targetId/block → POST /friends/:targetId/block
 app.post('/api/friends/:targetId/block', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   const { targetId } = req.params;
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/block`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/block`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -313,19 +314,20 @@ app.post('/api/friends/:targetId/block', async (req, res) => {
   }
 });
 
-// POST /api/friends/:targetId/unblock → DELETE /friends/users/:userId/blocked/:targetId
+// POST /api/friends/:targetId/unblock → POST /friends/:targetId/unblock
 app.post('/api/friends/:targetId/unblock', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   const { targetId } = req.params;
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/users/${userId}/blocked/${targetId}`, {
-      method: 'DELETE',
+    const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/unblock`, {
+      method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(req.headers.authorization && { authorization: req.headers.authorization }),
         'X-User-Id': userId,
       },
+      body: JSON.stringify({ userId }),
     });
     const data = await safeJson(response);
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
@@ -341,7 +343,7 @@ app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   const { requestId } = req.params;
   try {
-    const response = await fetch(`${FRIENDS_URL}/friends/requests/${requestId}/reject`, {
+    const response = await fetch(`${FRIENDS_URL}/friends/requests/${requestId}/decline`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
