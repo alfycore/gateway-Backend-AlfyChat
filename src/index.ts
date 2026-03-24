@@ -98,12 +98,17 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
     // Vérifier si c'est du JSON valide
     const contentType = response.headers.get('content-type');
     if (contentType && contentType.includes('application/json')) {
-      const data = await response.json();
-      res.status(response.status).json(data);
+      const data = await safeJson(response);
+      res.status(response.status).json(data ?? { error: 'Réponse vide' });
     } else {
-      // Si ce n'est pas du JSON, retourner une erreur standard
-      logger.error(`Service ${targetUrl} retourne du non-JSON:`, await response.text());
-      res.status(response.status).json({ error: 'Service non disponible' });
+      const text = await response.text();
+      // Si ce n'est pas du JSON mais que la réponse est vide (204 No Content, etc.)
+      if (!text) {
+        res.status(response.status).json({ success: response.ok });
+      } else {
+        logger.error(`Service ${targetUrl} retourne du non-JSON:`, text);
+        res.status(response.status).json({ error: 'Service non disponible' });
+      }
     }
   } catch (error) {
     logger.error('Erreur proxy:', error);
@@ -188,6 +193,13 @@ app.post('/api/friends/requests/:requestId/accept', async (req, res) => {
   }
 });
 
+// Helper : parse JSON sans planter si la réponse n'est pas du JSON
+async function safeJson(response: Response): Promise<any> {
+  const text = await response.text();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { return null; }
+}
+
 // GET /api/friends → GET /friends/users/:userId
 app.get('/api/friends', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
@@ -200,8 +212,8 @@ app.get('/api/friends', async (req, res) => {
         'X-User-Id': userId,
       },
     });
-    const data = await response.json();
-    res.status(response.status).json({ success: response.ok, data: response.ok ? data : undefined, error: !response.ok ? (data as any).error : undefined });
+    const data = await safeJson(response);
+    res.status(response.status).json({ success: response.ok, data: response.ok ? (data ?? []) : undefined, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
   } catch (error) {
     logger.error('Erreur getFriends:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -220,8 +232,12 @@ app.get('/api/friends/requests', async (req, res) => {
         'X-User-Id': userId,
       },
     });
-    const data = await response.json();
-    res.status(response.status).json({ success: response.ok, data: response.ok ? data : undefined, error: !response.ok ? (data as any).error : undefined });
+    const data = await safeJson(response);
+    // Le frontend attend { received: [], sent: [] }
+    const normalized = response.ok
+      ? (Array.isArray(data) ? { received: data, sent: [] } : (data ?? { received: [], sent: [] }))
+      : undefined;
+    res.status(response.status).json({ success: response.ok, data: normalized, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
   } catch (error) {
     logger.error('Erreur getFriendRequests:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -240,8 +256,8 @@ app.get('/api/friends/blocked', async (req, res) => {
         'X-User-Id': userId,
       },
     });
-    const data = await response.json();
-    res.status(response.status).json({ success: response.ok, data: response.ok ? data : undefined, error: !response.ok ? (data as any).error : undefined });
+    const data = await safeJson(response);
+    res.status(response.status).json({ success: response.ok, data: response.ok ? (data ?? []) : undefined, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
   } catch (error) {
     logger.error('Erreur getBlockedUsers:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -262,12 +278,12 @@ app.delete('/api/friends/:friendId', async (req, res) => {
         'X-User-Id': userId,
       },
     });
-    const data = await response.json();
+    const data = await safeJson(response);
     if (response.ok) {
       io.to(`user:${userId}`).emit('FRIEND_REMOVE', { type: 'FRIEND_REMOVE', payload: { friendId }, timestamp: new Date() });
       io.to(`user:${friendId}`).emit('FRIEND_REMOVE', { type: 'FRIEND_REMOVE', payload: { friendId: userId }, timestamp: new Date() });
     }
-    res.status(response.status).json({ success: response.ok, ...(data as object) });
+    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
     logger.error('Erreur removeFriend:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -289,8 +305,8 @@ app.post('/api/friends/:targetId/block', async (req, res) => {
       },
       body: JSON.stringify({ userId, blockedUserId: targetId }),
     });
-    const data = await response.json();
-    res.status(response.status).json({ success: response.ok, ...(data as object) });
+    const data = await safeJson(response);
+    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
     logger.error('Erreur blockUser:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -311,8 +327,8 @@ app.post('/api/friends/:targetId/unblock', async (req, res) => {
         'X-User-Id': userId,
       },
     });
-    const data = await response.json();
-    res.status(response.status).json({ success: response.ok, ...(data as object) });
+    const data = await safeJson(response);
+    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
     logger.error('Erreur unblockUser:', error);
     res.status(502).json({ success: false, error: 'Service indisponible' });
@@ -334,7 +350,7 @@ app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
       },
       body: JSON.stringify({ userId }),
     });
-    const data = await response.json().catch(() => ({}));
+    const data = await safeJson(response) ?? {};
     res.status(response.status).json({ success: response.ok, ...(data as object) });
   } catch (error) {
     logger.error('Erreur declineFriendRequest:', error);
