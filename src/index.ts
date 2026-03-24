@@ -213,10 +213,10 @@ app.get('/api/friends', async (req, res) => {
       },
     });
     const data = await safeJson(response);
-    res.status(response.status).json({ success: response.ok, data: response.ok ? (data ?? []) : undefined, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
+    res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
   } catch (error) {
     logger.error('Erreur getFriends:', error);
-    res.status(502).json({ success: false, error: 'Service indisponible' });
+    res.status(502).json({ error: 'Service indisponible' });
   }
 });
 
@@ -236,11 +236,11 @@ app.get('/api/friends/requests', async (req, res) => {
     // Le frontend attend { received: [], sent: [] }
     const normalized = response.ok
       ? (Array.isArray(data) ? { received: data, sent: [] } : (data ?? { received: [], sent: [] }))
-      : undefined;
-    res.status(response.status).json({ success: response.ok, data: normalized, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
+      : (data ?? { error: 'Erreur service' });
+    res.status(response.status).json(normalized);
   } catch (error) {
     logger.error('Erreur getFriendRequests:', error);
-    res.status(502).json({ success: false, error: 'Service indisponible' });
+    res.status(502).json({ received: [], sent: [] });
   }
 });
 
@@ -257,10 +257,10 @@ app.get('/api/friends/blocked', async (req, res) => {
       },
     });
     const data = await safeJson(response);
-    res.status(response.status).json({ success: response.ok, data: response.ok ? (data ?? []) : undefined, error: !response.ok ? (data?.error ?? 'Erreur service') : undefined });
+    res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
   } catch (error) {
     logger.error('Erreur getBlockedUsers:', error);
-    res.status(502).json({ success: false, error: 'Service indisponible' });
+    res.status(502).json({ error: 'Service indisponible' });
   }
 });
 
@@ -697,6 +697,10 @@ app.all('/api/media/*', async (req, res) => {
 
 // Routes Uploads — proxy des fichiers statiques depuis le service média
 app.get('/uploads/*', async (req, res) => {
+  // CORP doit être présent sur toutes les réponses (succès ET erreur)
+  // pour éviter NS_ERROR_DOM_CORP_FAILED sur Firefox/Chrome avec COEP
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   try {
     const url = `${MEDIA_URL}${req.originalUrl}`;
     const response = await fetch(url);
@@ -710,8 +714,6 @@ app.get('/uploads/*', async (req, res) => {
     const cacheControl = response.headers.get('cache-control');
     if (contentType) res.setHeader('Content-Type', contentType);
     if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
     const buffer = Buffer.from(await response.arrayBuffer());
     res.send(buffer);
