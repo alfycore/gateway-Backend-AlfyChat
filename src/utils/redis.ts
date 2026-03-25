@@ -106,6 +106,54 @@ export class RedisClient {
     await this.client.del(key);
   }
 
+  // ============ IP BAN ============
+
+  async banIP(ip: string, reason: string, bannedBy: string): Promise<void> {
+    const data = JSON.stringify({ reason, bannedBy, bannedAt: new Date().toISOString() });
+    await this.client.hset('banned:ips', ip, data);
+  }
+
+  async unbanIP(ip: string): Promise<void> {
+    await this.client.hdel('banned:ips', ip);
+  }
+
+  async isIPBanned(ip: string): Promise<boolean> {
+    return (await this.client.hexists('banned:ips', ip)) === 1;
+  }
+
+  async getBannedIPs(): Promise<Array<{ ip: string; reason: string; bannedBy: string; bannedAt: string }>> {
+    const all = await this.client.hgetall('banned:ips');
+    return Object.entries(all).map(([ip, data]) => {
+      const parsed = JSON.parse(data);
+      return { ip, ...parsed };
+    });
+  }
+
+  // ============ RATE LIMIT STATS ============
+
+  async incrementRateLimit(ip: string, window: number): Promise<number> {
+    const key = `ratelimit:${ip}`;
+    const count = await this.client.incr(key);
+    if (count === 1) await this.client.expire(key, window);
+    return count;
+  }
+
+  async getRateLimitCount(ip: string): Promise<number> {
+    const val = await this.client.get(`ratelimit:${ip}`);
+    return val ? parseInt(val) : 0;
+  }
+
+  async getRateLimitStats(): Promise<{ totalBlocked: number; activeWindows: number }> {
+    const blocked = await this.client.get('ratelimit:total_blocked') || '0';
+    const keys = await this.client.keys('ratelimit:*');
+    const activeWindows = keys.filter(k => k !== 'ratelimit:total_blocked').length;
+    return { totalBlocked: parseInt(blocked), activeWindows };
+  }
+
+  async incrementRateLimitBlocked(): Promise<void> {
+    await this.client.incr('ratelimit:total_blocked');
+  }
+
   async disconnect(): Promise<void> {
     await this.client.quit();
     await this.subscriber.quit();

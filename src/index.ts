@@ -40,6 +40,53 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.use(helmet());
+
+// ============ RATE LIMITING & IP BAN (HTTP) ============
+let redis: RedisClient;
+
+const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW || '60'); // secondes
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '100'); // requêtes par fenêtre
+
+function getClientIP(req: express.Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || '0.0.0.0';
+}
+
+// Middleware : bloquer les IP bannies
+app.use(async (req, res, next) => {
+  if (!redis) return next();
+  const ip = getClientIP(req);
+  try {
+    if (await redis.isIPBanned(ip)) {
+      logger.warn(`IP bannie bloquée: ${ip} — ${req.method} ${req.path}`);
+      return res.status(403).json({ error: 'Accès interdit' });
+    }
+  } catch {
+    // En cas d'erreur Redis, laisser passer
+  }
+  next();
+});
+
+// Middleware : rate limiting HTTP par IP
+app.use(async (req, res, next) => {
+  if (!redis) return next();
+  const ip = getClientIP(req);
+  try {
+    const count = await redis.incrementRateLimit(ip, RATE_LIMIT_WINDOW);
+    res.setHeader('X-RateLimit-Limit', String(RATE_LIMIT_MAX));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - count)));
+    if (count > RATE_LIMIT_MAX) {
+      await redis.incrementRateLimitBlocked();
+      logger.warn(`Rate limit HTTP dépassé: ${ip} (${count}/${RATE_LIMIT_MAX})`);
+      return res.status(429).json({ error: 'Trop de requêtes, réessayez plus tard' });
+    }
+  } catch {
+    // En cas d'erreur Redis, laisser passer
+  }
+  next();
+});
+
 // Ne pas parser le JSON sur /api/media/* (multipart/form-data) ni les uploads multipart vers les nodes
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/media')) return next();
@@ -121,6 +168,82 @@ app.all('/api/auth/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/users/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/users', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/rgpd/*', (req, res) => proxyRequest(USERS_URL, req, res));
+// ============ ADMIN : GESTION IP BANS (gateway direct) ============
+
+app.get('/api/admin/gateway/stats', async (req, res) => {
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
+  // Vérifier le rôle admin via le service users
+  try {
+    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
+    });
+    const userData = await safeJson(userRes) as any;
+    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
+  } catch {
+    return res.status(502).json({ error: 'Service indisponible' });
+  }
+  try {
+    const bannedIPs = await redis.getBannedIPs();
+    const rateLimitStats = await redis.getRateLimitStats();
+    res.json({
+      bannedIPs,
+      rateLimitStats,
+      config: { window: RATE_LIMIT_WINDOW, max: RATE_LIMIT_MAX },
+    });
+  } catch (error) {
+    logger.error('Erreur stats gateway:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.post('/api/admin/gateway/ban-ip', async (req, res) => {
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
+  try {
+    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
+    });
+    const userData = await safeJson(userRes) as any;
+    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
+  } catch {
+    return res.status(502).json({ error: 'Service indisponible' });
+  }
+  const { ip, reason } = req.body;
+  if (!ip || typeof ip !== 'string') return res.status(400).json({ error: 'IP requise' });
+  try {
+    await redis.banIP(ip.trim(), reason || 'Banni par un administrateur', userId);
+    logger.info(`IP bannie: ${ip} par ${userId} — raison: ${reason || 'non spécifiée'}`);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur ban IP:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/admin/gateway/ban-ip/:ip', async (req, res) => {
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
+  try {
+    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
+    });
+    const userData = await safeJson(userRes) as any;
+    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
+  } catch {
+    return res.status(502).json({ error: 'Service indisponible' });
+  }
+  const ip = decodeURIComponent(req.params.ip);
+  try {
+    await redis.unbanIP(ip);
+    logger.info(`IP débannie: ${ip} par ${userId}`);
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur unban IP:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.all('/api/admin/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/admin', (req, res) => proxyRequest(USERS_URL, req, res));
 
@@ -736,7 +859,7 @@ const io = new Server(httpServer, {
 });
 
 // Redis pour la synchronisation multi-instances
-const redis = new RedisClient({
+redis = new RedisClient({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
   password: process.env.REDIS_PASSWORD,
