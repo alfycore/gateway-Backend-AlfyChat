@@ -1185,6 +1185,16 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     conversations,
   });
 
+  // Vérifier si un appel est en attente pour cet utilisateur (arrivée tardive < 60s)
+  try {
+    const pendingCall = await redis.get(`pending_call:user:${userId}`);
+    if (pendingCall) {
+      const callData = JSON.parse(pendingCall);
+      socket.emit('CALL_INCOMING', callData);
+      logger.info(`Appel en attente re-émis à l'utilisateur tardif ${userId} (call ${callData?.payload?.id || '?'})`);
+    }
+  } catch { /* non bloquant */ }
+
   // Notifier les amis de la connexion
   broadcastPresenceUpdate(userId, 'online', friends);
 
@@ -1657,6 +1667,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           remoteSocket.emit('CALL_INCOMING', callIncomingPayload);
           logger.info(`CALL_INCOMING émis directement au socket ${remoteSocket.id} (user: ${(remoteSocket as any).userId})`);
         }
+        // Stocker en Redis pour les utilisateurs qui se connectent en retard (TTL 60s)
+        try {
+          await redis.set(
+            `pending_call:user:${data.recipientId}`,
+            JSON.stringify({ type: 'CALL_INCOMING', payload: callPayload, timestamp: new Date() }),
+            60
+          );
+        } catch { /* non bloquant */ }
       } else if (conversationId) {
         socket.to(`conversation:${conversationId}`).emit('CALL_INCOMING', {
           type: 'CALL_INCOMING',
@@ -1681,6 +1699,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CALL_ACCEPT', async (data) => {
     try {
       const call = await serviceProxy.calls.joinCall(data.callId, userId);
+      
+      // Supprimer l'appel en attente Redis (plus besoin de notifier cet utilisateur)
+      try { await redis.del(`pending_call:user:${userId}`); } catch { /* non bloquant */ }
       
       // Rejoindre la room AVANT de broadcast pour recevoir le signaling WebRTC
       socket.join(`call:${data.callId}`);
@@ -1709,6 +1730,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CALL_REJECT', async (data) => {
     try {
       await serviceProxy.calls.rejectCall(data.callId, userId);
+      
+      // Supprimer l'appel en attente Redis
+      try { await redis.del(`pending_call:user:${userId}`); } catch { /* non bloquant */ }
       
       io.to(`call:${data.callId}`).emit('CALL_REJECT', {
         type: 'CALL_REJECT',
