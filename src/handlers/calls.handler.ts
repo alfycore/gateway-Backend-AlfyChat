@@ -53,7 +53,16 @@ export function registerCallsHandlers(
       const call = await serviceProxy.calls.joinCall(data.callId, userId);
       
       socket.join(`call:${data.callId}`);
-      
+
+      // Notifier TOUS les participants existants qu'un nouveau pair a rejoint
+      // → chaque participant existant créera un PeerConnection vers ce nouvel arrivant
+      socket.to(`call:${data.callId}`).emit('CALL_PARTICIPANT_JOINED', {
+        type: 'CALL_PARTICIPANT_JOINED',
+        payload: { callId: data.callId, userId },
+        timestamp: new Date(),
+      });
+
+      // Confirmer à l'appelant que l'appel est accepté
       io.to(`call:${data.callId}`).emit('CALL_ACCEPT', {
         type: 'CALL_ACCEPT',
         payload: { callId: data.callId, userId },
