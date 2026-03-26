@@ -1685,8 +1685,16 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Rejoindre la room AVANT de broadcast pour recevoir le signaling WebRTC
       socket.join(`call:${data.callId}`);
       
-      // Notifier l'initiateur (exclure l'accepteur avec socket.to)
-      socket.to(`call:${data.callId}`).emit('CALL_ACCEPT', {
+      // Signaler aux participants EXISTANTS qu'un nouveau pair a rejoint
+      // → déclenche handleParticipantJoined côté initiateur qui crée l'offre WebRTC
+      socket.to(`call:${data.callId}`).emit('CALL_PARTICIPANT_JOINED', {
+        type: 'CALL_PARTICIPANT_JOINED',
+        payload: { callId: data.callId, userId },
+        timestamp: new Date(),
+      });
+      
+      // Confirmer l'acceptation à tous les participants (y compris l'accepteur)
+      io.to(`call:${data.callId}`).emit('CALL_ACCEPT', {
         type: 'CALL_ACCEPT',
         payload: { callId: data.callId, userId },
         timestamp: new Date(),
