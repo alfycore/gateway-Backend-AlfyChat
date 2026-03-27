@@ -47,10 +47,21 @@ let redis: RedisClient;
 const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW || '60'); // secondes
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '100'); // requêtes par fenêtre
 
+// Trusted reverse-proxy IPs (load balancer / nginx on same host or LAN)
+// Set TRUSTED_PROXIES env var as comma-separated CIDR list or exact IPs.
+// When empty, we always use the direct socket address.
+const TRUSTED_PROXIES = new Set(
+  (process.env.TRUSTED_PROXIES || '127.0.0.1,::1').split(',').map((s) => s.trim()).filter(Boolean)
+);
+
 function getClientIP(req: express.Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
-  return req.socket.remoteAddress || '0.0.0.0';
+  const remoteAddr = req.socket.remoteAddress || '0.0.0.0';
+  // Only trust X-Forwarded-For if the direct connection comes from a trusted proxy
+  if (TRUSTED_PROXIES.has(remoteAddr)) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
+  }
+  return remoteAddr;
 }
 
 // Middleware : bloquer les IP bannies
