@@ -293,15 +293,15 @@ app.get('/api/admin/monitoring/service/:name', async (req, res) => {
   }
 });
 
-/** GET /api/admin/monitoring/users/chart?period=hour|day|month */
+/** GET /api/admin/monitoring/users/chart?period=30min|10min|hour|day|month */
 app.get('/api/admin/monitoring/users/chart', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   const period = req.query.period as string;
-  if (period !== 'hour' && period !== 'day' && period !== 'month') {
-    return res.status(400).json({ error: 'period must be hour, day or month' });
+  if (!['30min', '10min', 'hour', 'day', 'month'].includes(period)) {
+    return res.status(400).json({ error: 'period must be 30min, 10min, hour, day or month' });
   }
   try {
-    const data = await monitoringDB.getUserStatsAggregated(period);
+    const data = await monitoringDB.getUserStatsAggregated(period as any);
     res.json({ period, data });
   } catch (err) {
     logger.error('Erreur /api/admin/monitoring/users/chart:', err);
