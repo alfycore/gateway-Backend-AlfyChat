@@ -190,6 +190,72 @@ class MonitoringDB {
     }
   }
 
+  /**
+   * Aggregated user stats by period.
+   * - 'hour'  → one point per hour, last 24 hours  (AVG connected_users per hour)
+   * - 'day'   → one point per day,  last 30 days   (AVG connected_users per day)
+   * - 'month' → one point per month, last 12 months (AVG connected_users per month)
+   */
+  async getUserStatsAggregated(period: 'hour' | 'day' | 'month'): Promise<{ label: string; avg: number; max: number; min: number }[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      let query: string;
+      let params: any[];
+
+      if (period === 'hour') {
+        // Last 24 hours, grouped by hour
+        query = `
+          SELECT
+            DATE_FORMAT(recorded_at, '%Y-%m-%d %H:00') AS label,
+            ROUND(AVG(connected_users))                AS avg,
+            MAX(connected_users)                       AS max,
+            MIN(connected_users)                       AS min
+          FROM user_stats
+          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+          GROUP BY DATE_FORMAT(recorded_at, '%Y-%m-%d %H:00')
+          ORDER BY label ASC`;
+        params = [];
+      } else if (period === 'day') {
+        // Last 30 days, grouped by calendar day
+        query = `
+          SELECT
+            DATE_FORMAT(recorded_at, '%Y-%m-%d') AS label,
+            ROUND(AVG(connected_users))           AS avg,
+            MAX(connected_users)                  AS max,
+            MIN(connected_users)                  AS min
+          FROM user_stats
+          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+          GROUP BY DATE_FORMAT(recorded_at, '%Y-%m-%d')
+          ORDER BY label ASC`;
+        params = [];
+      } else {
+        // Last 12 months, grouped by month
+        query = `
+          SELECT
+            DATE_FORMAT(recorded_at, '%Y-%m') AS label,
+            ROUND(AVG(connected_users))        AS avg,
+            MAX(connected_users)               AS max,
+            MIN(connected_users)               AS min
+          FROM user_stats
+          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
+          GROUP BY DATE_FORMAT(recorded_at, '%Y-%m')
+          ORDER BY label ASC`;
+        params = [];
+      }
+
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(query, params);
+      return (rows as any[]).map((r) => ({
+        label: r.label,
+        avg: Number(r.avg) || 0,
+        max: Number(r.max) || 0,
+        min: Number(r.min) || 0,
+      }));
+    } finally {
+      conn.release();
+    }
+  }
+
   /** Prune old monitoring data (older than N days) */
   async prune(days = 30): Promise<void> {
     if (!this.ready || !this.pool) return;
