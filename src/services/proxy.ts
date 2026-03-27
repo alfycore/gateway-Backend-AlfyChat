@@ -63,10 +63,10 @@ class UsersProxy {
     return fetchService(`${this.baseUrl}/users/${userId}`);
   }
 
-  async updateStatus(userId: string, status: string) {
+  async updateStatus(userId: string, status: string, customStatus?: string) {
     return fetchService(`${this.baseUrl}/users/${userId}/status`, {
       method: 'PATCH',
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, ...(customStatus !== undefined && { customStatus }) }),
     });
   }
 

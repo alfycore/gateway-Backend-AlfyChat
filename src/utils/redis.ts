@@ -154,6 +154,45 @@ export class RedisClient {
     await this.client.incr('ratelimit:total_blocked');
   }
 
+  // ============ PENDING DM PINGS ============
+
+  /**
+   * Incrémente le compteur de pings non-lus pour un utilisateur hors ligne.
+   * Stocké sous la clé hash `pending_pings:{userId}` avec champ = conversationId.
+   */
+  async addPendingPing(userId: string, conversationId: string, senderName: string): Promise<void> {
+    const key = `pending_pings:${userId}`;
+    await this.client.hincrby(key, conversationId, 1);
+    // Stocker aussi le nom du dernier expéditeur
+    await this.client.hset(`pending_pings_meta:${userId}`, conversationId, senderName);
+    // TTL de 30 jours
+    await this.client.expire(key, 30 * 24 * 60 * 60);
+    await this.client.expire(`pending_pings_meta:${userId}`, 30 * 24 * 60 * 60);
+  }
+
+  /**
+   * Récupère les pings en attente pour un utilisateur.
+   * Retourne { [conversationId]: { count, senderName } }
+   */
+  async getPendingPings(userId: string): Promise<Record<string, { count: number; senderName: string }>> {
+    const counts = await this.client.hgetall(`pending_pings:${userId}`);
+    const meta = await this.client.hgetall(`pending_pings_meta:${userId}`);
+    if (!counts) return {};
+    const result: Record<string, { count: number; senderName: string }> = {};
+    for (const [convId, count] of Object.entries(counts)) {
+      result[convId] = { count: parseInt(count), senderName: meta?.[convId] || '' };
+    }
+    return result;
+  }
+
+  /**
+   * Supprime tous les pings en attente d'un utilisateur (après qu'il s'est reconnecté).
+   */
+  async clearPendingPings(userId: string): Promise<void> {
+    await this.client.del(`pending_pings:${userId}`);
+    await this.client.del(`pending_pings_meta:${userId}`);
+  }
+
   async disconnect(): Promise<void> {
     await this.client.quit();
     await this.subscriber.quit();

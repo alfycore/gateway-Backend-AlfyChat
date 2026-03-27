@@ -1198,6 +1198,19 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Notifier les amis de la connexion
   broadcastPresenceUpdate(userId, 'online', friends);
 
+  // Envoyer les pings en attente (messages reçus hors ligne)
+  try {
+    const pendingPings = await redis.getPendingPings(userId);
+    if (Object.keys(pendingPings).length > 0) {
+      socket.emit('PENDING_PINGS', {
+        type: 'PENDING_PINGS',
+        payload: pendingPings,
+        timestamp: new Date(),
+      });
+      await redis.clearPendingPings(userId);
+    }
+  } catch { /* non bloquant */ }
+
   // ============ GESTIONNAIRES D'ÉVÉNEMENTS ============
 
   // Heartbeat
@@ -1291,6 +1304,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // (au cas où il n'aurait pas rejoint la room conversation)
       if (data.recipientId) {
         io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
+        // Si le destinataire est hors ligne, stocker un ping en attente
+        try {
+          const isOnline = await redis.isUserOnline(data.recipientId);
+          if (!isOnline) {
+            await redis.addPendingPing(
+              data.recipientId,
+              conversationId,
+              user.displayName || user.username,
+            );
+          }
+        } catch { /* non bloquant */ }
       }
 
       // Confirmation à l'expéditeur
@@ -2652,10 +2676,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Mise à jour de présence
   socket.on('PRESENCE_UPDATE', async (data) => {
     try {
-      await serviceProxy.users.updateStatus(userId, data.status);
+      await serviceProxy.users.updateStatus(userId, data.status, data.customStatus);
       
       const friends = await serviceProxy.friends.getFriends(userId);
-      broadcastPresenceUpdate(userId, data.status, friends);
+      broadcastPresenceUpdate(userId, data.status, friends, data.customStatus);
     } catch (error) {
       emitError(socket, 'PRESENCE_ERROR', error);
     }
@@ -3326,12 +3350,13 @@ function emitError(socket: Socket, type: string, error: unknown): void {
 async function broadcastPresenceUpdate(
   userId: string,
   status: string,
-  friends: Array<{ friendId: string }>
+  friends: Array<{ friendId: string }>,
+  customStatus?: string | null,
 ): Promise<void> {
   for (const friend of friends) {
     io.to(`user:${friend.friendId}`).emit('PRESENCE_UPDATE', {
       type: 'PRESENCE_UPDATE',
-      payload: { userId, status },
+      payload: { userId, status, customStatus: customStatus ?? null },
       timestamp: new Date(),
     });
   }
