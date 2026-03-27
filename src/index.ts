@@ -1302,9 +1302,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   });
 
-  // Alias pour message:send (compatibilité client)
-  socket.on('message:send', async (data) => {
-    console.log('📨 Gateway reçu message:send:', { userId, data });
+  // Alias pour message:send (compatibilité client) — livraison optimiste <2ms
+  socket.on('message:send', (data) => {
     try {
       // ── Rate limiting ──
       const now = Date.now();
@@ -1317,39 +1316,27 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       recent.push(now);
       messageRateLimit.set(userId, recent);
 
-      // Pour les DMs, construire le conversationId si recipientId est fourni
-      let conversationId = data.conversationId || data.channelId;
+      // ── Construire le conversationId ──
+      let conversationId: string = data.conversationId || data.channelId;
       if (!conversationId && data.recipientId) {
         const sortedIds = [userId, data.recipientId].sort();
         conversationId = `dm_${sortedIds[0]}_${sortedIds[1]}`;
-        console.log('🔑 Conversation ID généré:', conversationId);
       }
 
-      console.log('💾 Appel serviceProxy.messages.createMessage...');
-      const message = await serviceProxy.messages.createMessage({
-        conversationId,
-        content: data.content as string,
-        senderId: userId,
-        senderContent: data.senderContent as string | undefined,
-        e2eeType: data.e2eeType as number | undefined,
-        replyToId: data.replyToId as string | undefined,
-      });
-      
-      console.log('✅ Message créé:', message);
-      
-      // Créer une version avec les champs Signal pour le déchiffrement côté client
+      // ── ÉTAPE 1 : Générer l'ID côté gateway, construire le payload IMMÉDIATEMENT ──
+      const messageId = uuidv4();
       const messageForClient = {
-        id: (message as any).id,
-        conversationId: (message as any).conversationId,
-        senderId: (message as any).senderId,
+        id: messageId,
+        conversationId,
+        senderId: userId,
         content: data.content,
         senderContent: data.senderContent,
         e2eeType: data.e2eeType,
         recipientId: data.recipientId,
-        replyToId: (message as any).replyToId,
-        createdAt: (message as any).createdAt,
+        replyToId: data.replyToId,
+        createdAt: new Date().toISOString(),
         isEdited: false,
-        reactions: (message as any).reactions || [],
+        reactions: [],
         sender: {
           id: userId,
           username: user.username,
@@ -1357,48 +1344,61 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           avatarUrl: user.avatarUrl || null,
         },
       };
-      
-      // S'assurer que l'expéditeur est dans la room de conversation
+
+      // ── ÉTAPE 2 : Rejoindre la room et broadcaster AVANT l'écriture DB ──
       socket.join(`conversation:${conversationId}`);
-
-      // Diffuser aux participants de la room
       io.to(`conversation:${conversationId}`).emit('message:new', messageForClient);
-      console.log('📢 Message diffusé à conversation:', conversationId);
 
-      // Filet de sécurité DM : envoyer aussi directement au destinataire
-      // (au cas où il n'aurait pas rejoint la room conversation)
+      // Filet de sécurité DM : router aussi directement vers le destinataire
       if (data.recipientId) {
         io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
-        // Si le destinataire est hors ligne, stocker un ping en attente
-        try {
-          const isOnline = await redis.isUserOnline(data.recipientId);
-          if (!isOnline) {
-            await redis.addPendingPing(
-              data.recipientId,
-              conversationId,
-              user.displayName || user.username,
-            );
-          }
-        } catch { /* non bloquant */ }
       }
 
-      // Confirmation à l'expéditeur
+      // ── ÉTAPE 3 : Confirmer à l'expéditeur IMMÉDIATEMENT ──
       socket.emit('message:sent', { success: true, message: messageForClient });
 
-      // === SYSTÈME HYBRIDE DM: Traiter l'archivage si nécessaire ===
-      if ((message as any).archiveEvent) {
-        const archiveEvent = (message as any).archiveEvent;
-        console.log(`📦 Archivage DM déclenché: ${archiveEvent.totalArchived} MP à pousser vers peers`);
-        
-        // Pousser les messages archivés vers tous les participants de la conversation
-        io.to(`conversation:${conversationId}`).emit('DM_ARCHIVE_PUSH', {
-          type: 'DM_ARCHIVE_PUSH',
-          payload: archiveEvent,
-          timestamp: new Date(),
+      // ── ÉTAPE 4 : Écriture DB en arrière-plan (fire-and-forget) ──
+      serviceProxy.messages.createMessage({
+        id: messageId,
+        conversationId,
+        content: data.content as string,
+        senderId: userId,
+        senderContent: data.senderContent as string | undefined,
+        e2eeType: data.e2eeType as number | undefined,
+        replyToId: data.replyToId as string | undefined,
+      }).then((message: any) => {
+        // Archive DM si quota atteint
+        if (message?.archiveEvent) {
+          io.to(`conversation:${conversationId}`).emit('DM_ARCHIVE_PUSH', {
+            type: 'DM_ARCHIVE_PUSH',
+            payload: message.archiveEvent,
+            timestamp: new Date(),
+          });
+        }
+        // Ping hors ligne (non bloquant)
+        if (data.recipientId) {
+          redis.isUserOnline(data.recipientId as string)
+            .then((isOnline: boolean) => {
+              if (!isOnline) {
+                redis.addPendingPing(
+                  data.recipientId as string,
+                  conversationId,
+                  user.displayName || user.username,
+                ).catch(() => {});
+              }
+            }).catch(() => {});
+        }
+      }).catch((err: Error) => {
+        // La DB a échoué : notifier l'expéditeur pour afficher une erreur sur le message
+        console.error('❌ DB write failed for message:', messageId, err);
+        socket.emit('message:failed', {
+          messageId,
+          error: 'Échec de la sauvegarde — veuillez réessayer',
         });
-      }
+      });
+
     } catch (error) {
-      console.error('❌ Error sending message:', error);
+      console.error('❌ Error in message:send:', error);
       socket.emit('message:error', { error: error instanceof Error ? error.message : 'Unknown error' });
     }
   });

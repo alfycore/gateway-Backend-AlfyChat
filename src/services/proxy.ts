@@ -332,6 +332,26 @@ class CallsProxy {
       body: JSON.stringify({ userId }),
     });
   }
+
+  // ── Appels groupe via LiveKit SFU ──
+
+  async createGroupRoom(data: { channelId: string; participantId: string; participantName: string; type: string }) {
+    return fetchService<{ callId: string; roomName: string; token: string; wsUrl: string }>(
+      `${this.baseUrl}/calls/group/room`,
+      { method: 'POST', body: JSON.stringify(data) },
+    );
+  }
+
+  async getGroupCallToken(data: { callId: string; participantId: string; participantName: string }) {
+    return fetchService<{ token: string; roomName: string; wsUrl: string }>(
+      `${this.baseUrl}/calls/group/token`,
+      { method: 'POST', body: JSON.stringify(data) },
+    );
+  }
+
+  async endGroupCall(callId: string) {
+    return fetchService(`${this.baseUrl}/calls/group/${callId}/end`, { method: 'POST' });
+  }
 }
 
 // ============ SERVERS PROXY ============
