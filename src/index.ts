@@ -256,6 +256,43 @@ app.delete('/api/admin/gateway/ban-ip/:ip', async (req, res) => {
   }
 });
 
+/** GET /api/admin/monitoring — current status + last 24h stats */
+app.get('/api/admin/monitoring', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const [latestServices, userHistory, peakUsers] = await Promise.all([
+      monitoringDB.getLatestServiceStatus(),
+      monitoringDB.getUserStatsHistory(24),
+      monitoringDB.getPeakUsers(24),
+    ]);
+    res.json({
+      services: latestServices,
+      connectedUsers: {
+        current: connectedClients.size,
+        peak24h: peakUsers,
+        history: userHistory,
+      },
+      checkedAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('Erreur /api/admin/monitoring:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** GET /api/admin/monitoring/service/:name?hours=24 — history for a specific service */
+app.get('/api/admin/monitoring/service/:name', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const hours = Math.min(parseInt(String(req.query.hours) || '24'), 168); // max 7 days
+    const history = await monitoringDB.getServiceHistory(req.params.name, hours);
+    res.json({ service: req.params.name, hours, history });
+  } catch (err) {
+    logger.error('Erreur /api/admin/monitoring/service:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.all('/api/admin/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/admin', (req, res) => proxyRequest(USERS_URL, req, res));
 
@@ -3473,43 +3510,6 @@ async function requireAdmin(req: express.Request, res: express.Response): Promis
   }
   return userId;
 }
-
-/** GET /api/admin/monitoring — current status + last 24h stats */
-app.get('/api/admin/monitoring', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const [latestServices, userHistory, peakUsers] = await Promise.all([
-      monitoringDB.getLatestServiceStatus(),
-      monitoringDB.getUserStatsHistory(24),
-      monitoringDB.getPeakUsers(24),
-    ]);
-    res.json({
-      services: latestServices,
-      connectedUsers: {
-        current: connectedClients.size,
-        peak24h: peakUsers,
-        history: userHistory,
-      },
-      checkedAt: new Date(),
-    });
-  } catch (err) {
-    logger.error('Erreur /api/admin/monitoring:', err);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** GET /api/admin/monitoring/service/:name?hours=24 — history for a specific service */
-app.get('/api/admin/monitoring/service/:name', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const hours = Math.min(parseInt(String(req.query.hours) || '24'), 168); // max 7 days
-    const history = await monitoringDB.getServiceHistory(req.params.name, hours);
-    res.json({ service: req.params.name, hours, history });
-  } catch (err) {
-    logger.error('Erreur /api/admin/monitoring/service:', err);
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
 
 // ============ DÉMARRAGE ============
 
