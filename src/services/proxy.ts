@@ -103,6 +103,18 @@ class MessagesProxy {
     return fetchService<any[]>(`${this.baseUrl}/conversations?userId=${userId}`, { token });
   }
 
+  async isParticipant(conversationId: string, userId: string): Promise<boolean> {
+    try {
+      const result = await fetchService<{ isParticipant: boolean }>(
+        `${this.baseUrl}/conversations/${conversationId}/participants/${userId}/check`,
+        { method: 'GET' },
+      );
+      return (result as any)?.isParticipant === true;
+    } catch {
+      return false;
+    }
+  }
+
   async createMessage(data: { conversationId: string; senderId: string; content: string; senderContent?: string; e2eeType?: number; replyToId?: string }) {
     return fetchService(`${this.baseUrl}/messages`, {
       method: 'POST',
@@ -157,16 +169,18 @@ class MessagesProxy {
     });
   }
 
-  async addParticipant(conversationId: string, userId: string) {
+  async addParticipant(conversationId: string, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants`, {
       method: 'POST',
       body: JSON.stringify({ userId }),
+      token,
     });
   }
 
-  async removeParticipant(conversationId: string, userId: string) {
+  async removeParticipant(conversationId: string, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants/${userId}`, {
       method: 'DELETE',
+      token,
     });
   }
 

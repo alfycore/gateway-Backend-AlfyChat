@@ -1464,19 +1464,43 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // Rejoindre une conversation (DM ou channel)
-  socket.on('conversation:join', (data) => {
+  socket.on('conversation:join', async (data) => {
     const { conversationId, recipientId } = data;
-    
-    let roomId = conversationId;
-    if (!roomId && recipientId) {
+
+    let roomId: string | undefined;
+
+    if (!conversationId && recipientId) {
+      // Chemin DM sûr : le room ID est dérivé de userId + recipientId
       const sortedIds = [userId, recipientId].sort();
       roomId = `dm_${sortedIds[0]}_${sortedIds[1]}`;
+    } else if (conversationId) {
+      // Vérifier que l'utilisateur est bien participant avant de joindre
+      if ((conversationId as string).startsWith('dm_')) {
+        // DM déterministe — vérifier que userId fait partie du room ID
+        if (!(conversationId as string).includes(userId)) {
+          socket.emit('conversation:join:error', { error: 'Accès non autorisé' });
+          return;
+        }
+        roomId = conversationId;
+      } else {
+        // Conversation UUID — vérifier via le service messages
+        try {
+          const isParticipant = await serviceProxy.messages.isParticipant(conversationId, userId);
+          if (!isParticipant) {
+            socket.emit('conversation:join:error', { error: 'Accès non autorisé' });
+            return;
+          }
+        } catch {
+          socket.emit('conversation:join:error', { error: 'Impossible de vérifier l\'accès' });
+          return;
+        }
+        roomId = conversationId;
+      }
     }
-    
+
     if (roomId) {
       socket.join(`conversation:${roomId}`);
       socket.emit('conversation:joined', { conversationId: roomId });
-      console.log(`User ${userId} joined conversation ${roomId}`);
     }
   });
 
@@ -2851,7 +2875,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Ajouter des participants
       if (addParticipants?.length) {
         for (const pid of addParticipants) {
-          await serviceProxy.messages.addParticipant(groupId, pid);
+          await serviceProxy.messages.addParticipant(groupId, pid, token);
           // Notifier le nouveau membre
           io.to(`user:${pid}`).emit('GROUP_MEMBER_ADD', {
             type: 'GROUP_MEMBER_ADD',
@@ -2869,7 +2893,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Retirer des participants
       if (removeParticipants?.length) {
         for (const pid of removeParticipants) {
-          await serviceProxy.messages.removeParticipant(groupId, pid);
+          await serviceProxy.messages.removeParticipant(groupId, pid, token);
           // Notifier le membre retiré
           io.to(`user:${pid}`).emit('GROUP_MEMBER_REMOVE', {
             type: 'GROUP_MEMBER_REMOVE',
