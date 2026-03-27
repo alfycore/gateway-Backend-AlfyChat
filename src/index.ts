@@ -15,6 +15,7 @@ import { GatewayEvent, GatewayEventType, User } from './types/gateway';
 import { logger } from './utils/logger';
 import { RedisClient } from './utils/redis';
 import { ServiceProxy } from './services/proxy';
+import { monitoringDB } from './utils/monitoring-db';
 
 dotenv.config();
 
@@ -3391,13 +3392,144 @@ app.get('/stats', (req, res) => {
   });
 });
 
+// ============ MONITORING SYSTEM ============
+
+const MONITORED_SERVICES: { name: string; url: string }[] = [
+  { name: 'users',    url: `${process.env.USERS_SERVICE_URL    || 'http://localhost:3001'}/health` },
+  { name: 'messages', url: `${process.env.MESSAGES_SERVICE_URL || 'http://localhost:3002'}/health` },
+  { name: 'friends',  url: `${process.env.FRIENDS_SERVICE_URL  || 'http://localhost:3003'}/health` },
+  { name: 'calls',    url: `${process.env.CALLS_SERVICE_URL    || 'http://localhost:3004'}/health` },
+  { name: 'servers',  url: `${process.env.SERVERS_SERVICE_URL  || 'http://localhost:3005'}/health` },
+  { name: 'bots',     url: `${process.env.BOTS_SERVICE_URL     || 'http://localhost:3006'}/health` },
+  { name: 'media',    url: `${process.env.MEDIA_SERVICE_URL    || 'http://localhost:3007'}/health` },
+];
+
+const MONITORING_INTERVAL_MS = parseInt(process.env.MONITORING_INTERVAL || '60000'); // 60s default
+
+async function runMonitoringCycle(): Promise<void> {
+  const now = new Date();
+
+  // 1. Check each service health
+  const snapshots = await Promise.all(
+    MONITORED_SERVICES.map(async (svc) => {
+      const start = Date.now();
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const resp = await fetch(svc.url, { signal: controller.signal });
+        clearTimeout(timeout);
+        const ms = Date.now() - start;
+        const status = resp.ok ? 'up' : 'degraded';
+        return {
+          service: svc.name,
+          status: status as 'up' | 'degraded' | 'down',
+          responseTimeMs: ms,
+          statusCode: resp.status,
+          checkedAt: now,
+        };
+      } catch {
+        return {
+          service: svc.name,
+          status: 'down' as const,
+          responseTimeMs: null,
+          statusCode: null,
+          checkedAt: now,
+        };
+      }
+    }),
+  );
+
+  // 2. Add gateway itself
+  snapshots.push({
+    service: 'gateway',
+    status: 'up',
+    responseTimeMs: 0,
+    statusCode: 200,
+    checkedAt: now,
+  });
+
+  // 3. Save to DB
+  await monitoringDB.saveServiceSnapshot(snapshots);
+
+  // 4. Save connected user count
+  await monitoringDB.saveUserStats(connectedClients.size);
+
+  logger.info(`[Monitoring] Cycle terminé — ${connectedClients.size} users connectés — services: ${snapshots.map(s => `${s.service}:${s.status}`).join(', ')}`);
+}
+
+// Admin monitoring API — requires admin role
+async function requireAdmin(req: express.Request, res: express.Response): Promise<string | null> {
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  if (!userId) { res.status(401).json({ error: 'Non authentifié' }); return null; }
+  try {
+    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
+    });
+    const userData = await safeJson(userRes) as any;
+    if (!userData || userData.role !== 'admin') { res.status(403).json({ error: 'Accès refusé' }); return null; }
+  } catch {
+    res.status(502).json({ error: 'Service indisponible' });
+    return null;
+  }
+  return userId;
+}
+
+/** GET /api/admin/monitoring — current status + last 24h stats */
+app.get('/api/admin/monitoring', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const [latestServices, userHistory, peakUsers] = await Promise.all([
+      monitoringDB.getLatestServiceStatus(),
+      monitoringDB.getUserStatsHistory(24),
+      monitoringDB.getPeakUsers(24),
+    ]);
+    res.json({
+      services: latestServices,
+      connectedUsers: {
+        current: connectedClients.size,
+        peak24h: peakUsers,
+        history: userHistory,
+      },
+      checkedAt: new Date(),
+    });
+  } catch (err) {
+    logger.error('Erreur /api/admin/monitoring:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** GET /api/admin/monitoring/service/:name?hours=24 — history for a specific service */
+app.get('/api/admin/monitoring/service/:name', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const hours = Math.min(parseInt(String(req.query.hours) || '24'), 168); // max 7 days
+    const history = await monitoringDB.getServiceHistory(req.params.name, hours);
+    res.json({ service: req.params.name, hours, history });
+  } catch (err) {
+    logger.error('Erreur /api/admin/monitoring/service:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ============ DÉMARRAGE ============
 
 const PORT = process.env.PORT || 3000;
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   logger.info(`🚀 Gateway AlfyChat démarré sur le port ${PORT}`);
   logger.info(`📡 WebSocket prêt à recevoir des connexions`);
+
+  // Init monitoring DB and start collection loop
+  await monitoringDB.init();
+  // First cycle immediately, then every MONITORING_INTERVAL_MS
+  runMonitoringCycle().catch((err) => logger.error('Monitoring cycle error:', err));
+  setInterval(() => {
+    runMonitoringCycle().catch((err) => logger.error('Monitoring cycle error:', err));
+    // Prune data older than 30 days every 24h
+  }, MONITORING_INTERVAL_MS);
+  // Daily prune at startup + every 24h
+  monitoringDB.prune(30).catch(() => {});
+  setInterval(() => monitoringDB.prune(30).catch(() => {}), 24 * 60 * 60 * 1000);
 });
 
 // Gestion de l'arrêt gracieux

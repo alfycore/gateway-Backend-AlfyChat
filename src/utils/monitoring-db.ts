@@ -1,0 +1,218 @@
+// ==========================================
+// ALFYCHAT - MONITORING DATABASE MODULE
+// Persists service health & user stats in MySQL
+// ==========================================
+
+import mysql from 'mysql2/promise';
+import { logger } from './logger';
+
+export interface ServiceSnapshot {
+  service: string;
+  status: 'up' | 'down' | 'degraded';
+  responseTimeMs: number | null;
+  statusCode: number | null;
+  checkedAt: Date;
+}
+
+export interface UserStatsSnapshot {
+  connectedUsers: number;
+  recordedAt: Date;
+}
+
+export interface ServiceHistory {
+  id: number;
+  service: string;
+  status: string;
+  responseTimeMs: number | null;
+  statusCode: number | null;
+  checkedAt: string;
+}
+
+export interface UserStatsHistory {
+  id: number;
+  connectedUsers: number;
+  recordedAt: string;
+}
+
+class MonitoringDB {
+  private pool: mysql.Pool | null = null;
+  private ready = false;
+
+  async init(): Promise<void> {
+    try {
+      this.pool = mysql.createPool({
+        host: process.env.DB_HOST || 'localhost',
+        port: parseInt(process.env.DB_PORT || '3306'),
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASSWORD || '',
+        database: process.env.DB_NAME || 'alfyv2',
+        connectionLimit: 5,
+        connectTimeout: 10000,
+      });
+
+      await this.createTables();
+      this.ready = true;
+      logger.info('MonitoringDB: connecté et tables prêtes');
+    } catch (err) {
+      logger.error('MonitoringDB: erreur d\'initialisation', err);
+    }
+  }
+
+  private async createTables(): Promise<void> {
+    const conn = await this.pool!.getConnection();
+    try {
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS service_monitoring (
+          id         INT AUTO_INCREMENT PRIMARY KEY,
+          service    VARCHAR(64)  NOT NULL,
+          status     VARCHAR(16)  NOT NULL,
+          response_time_ms INT,
+          status_code INT,
+          checked_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_service_time (service, checked_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS user_stats (
+          id              INT AUTO_INCREMENT PRIMARY KEY,
+          connected_users INT NOT NULL DEFAULT 0,
+          recorded_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_recorded_at (recorded_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+    } finally {
+      conn.release();
+    }
+  }
+
+  async saveServiceSnapshot(snapshots: ServiceSnapshot[]): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      for (const s of snapshots) {
+        await conn.execute(
+          `INSERT INTO service_monitoring (service, status, response_time_ms, status_code, checked_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [s.service, s.status, s.responseTimeMs, s.statusCode, s.checkedAt],
+        );
+      }
+    } catch (err) {
+      logger.error('MonitoringDB: erreur saveServiceSnapshot', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  async saveUserStats(connectedUsers: number): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `INSERT INTO user_stats (connected_users, recorded_at) VALUES (?, NOW())`,
+        [connectedUsers],
+      );
+    } catch (err) {
+      logger.error('MonitoringDB: erreur saveUserStats', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Returns latest status per service */
+  async getLatestServiceStatus(): Promise<ServiceHistory[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(`
+        SELECT sm.*
+        FROM service_monitoring sm
+        INNER JOIN (
+          SELECT service, MAX(checked_at) AS max_time
+          FROM service_monitoring
+          GROUP BY service
+        ) latest ON sm.service = latest.service AND sm.checked_at = latest.max_time
+        ORDER BY sm.service;
+      `);
+      return rows as ServiceHistory[];
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Returns service history for the last N hours (default 24) */
+  async getServiceHistory(service: string, hours = 24): Promise<ServiceHistory[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT * FROM service_monitoring
+         WHERE service = ? AND checked_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+         ORDER BY checked_at ASC`,
+        [service, hours],
+      );
+      return rows as ServiceHistory[];
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Returns user stats for the last N hours (default 24) */
+  async getUserStatsHistory(hours = 24): Promise<UserStatsHistory[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT * FROM user_stats
+         WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)
+         ORDER BY recorded_at ASC`,
+        [hours],
+      );
+      return rows as UserStatsHistory[];
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Peak connected users in the last N hours */
+  async getPeakUsers(hours = 24): Promise<number> {
+    if (!this.ready || !this.pool) return 0;
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT MAX(connected_users) AS peak FROM user_stats
+         WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+        [hours],
+      );
+      return rows[0]?.peak ?? 0;
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Prune old monitoring data (older than N days) */
+  async prune(days = 30): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `DELETE FROM service_monitoring WHERE checked_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+        [days],
+      );
+      await conn.execute(
+        `DELETE FROM user_stats WHERE recorded_at < DATE_SUB(NOW(), INTERVAL ? DAY)`,
+        [days],
+      );
+    } catch (err) {
+      logger.error('MonitoringDB: erreur prune', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+}
+
+export const monitoringDB = new MonitoringDB();
