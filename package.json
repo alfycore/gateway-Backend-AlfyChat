@@ -5,9 +5,9 @@
   "main": "dist/index.js",
   "packageManager": "bun@1.2.0",
   "scripts": {
-    "build": "tsc",
+    "build": "npx --yes tsc",
     "dev": "bun --hot src/index.ts",
-    "start": "bun src/index.ts"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
