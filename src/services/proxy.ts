@@ -115,7 +115,7 @@ class MessagesProxy {
     }
   }
 
-  async createMessage(data: { conversationId: string; senderId: string; content: string; senderContent?: string; e2eeType?: number; replyToId?: string }) {
+  async createMessage(data: { id?: string; conversationId: string; senderId: string; content: string; senderContent?: string; e2eeType?: number; replyToId?: string }) {
     return fetchService(`${this.baseUrl}/messages`, {
       method: 'POST',
       body: JSON.stringify(data),
