@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "packageManager": "bun@1.2.0",
   "scripts": {
-    "build": "npx --yes tsc",
+    "build": "node node_modules/typescript/bin/tsc",
     "dev": "bun --hot src/index.ts",
     "start": "node dist/index.js"
   },
