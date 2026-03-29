@@ -109,13 +109,13 @@ app.use((req, res, next) => {
 });
 
 // ============ ROUTES API REST (PROXY) ============
-const USERS_URL = process.env.USERS_SERVICE_URL || 'http://localhost:3001';
-const MESSAGES_URL = process.env.MESSAGES_SERVICE_URL || 'http://localhost:3002';
-const FRIENDS_URL = process.env.FRIENDS_SERVICE_URL || 'http://localhost:3003';
-const CALLS_URL = process.env.CALLS_SERVICE_URL || 'http://localhost:3004';
-const SERVERS_URL = process.env.SERVERS_SERVICE_URL || 'http://localhost:3005';
-const BOTS_URL = process.env.BOTS_SERVICE_URL || 'http://localhost:3006';
-const MEDIA_URL = process.env.MEDIA_SERVICE_URL || 'http://localhost:3007';
+const USERS_URL = process.env.USERS_SERVICE_URL || 'https://users.alfychat.eu';
+const MESSAGES_URL = process.env.MESSAGES_SERVICE_URL || 'https://messages.alfychat.eu';
+const FRIENDS_URL = process.env.FRIENDS_SERVICE_URL || 'https://friends.s.backend.alfychat.app';
+const CALLS_URL = process.env.CALLS_SERVICE_URL || 'https://calls.s.backend.alfychat.app';
+const SERVERS_URL = process.env.SERVERS_SERVICE_URL || 'https://servers.s.backend.alfychat.app';
+const BOTS_URL = process.env.BOTS_SERVICE_URL || 'https://bots.s.backend.alfychat.app';
+const MEDIA_URL = process.env.MEDIA_SERVICE_URL || 'https://media.s.backend.alfychat.app';
 
 // Secret partagé pour les enregistrements internes de services
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret-dev';
