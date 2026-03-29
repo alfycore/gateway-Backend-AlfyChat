@@ -3821,7 +3821,7 @@ const MONITORING_INTERVAL_MS = parseInt(process.env.MONITORING_INTERVAL || '6000
 async function runMonitoringCycle(): Promise<void> {
   const now = new Date();
 
-  // 1. Check each service health
+  // 1. Check each service health (via /health, pour le statut up/down)
   const snapshots = await Promise.all(
     MONITORED_SERVICES.map(async (svc) => {
       const start = Date.now();
@@ -3851,7 +3851,37 @@ async function runMonitoringCycle(): Promise<void> {
     }),
   );
 
-  // 2. Add gateway itself
+  // 2. Poll /metrics de chaque instance enregistrée dans le registre
+  //    → met à jour CPU/RAM/req/debit en temps réel pour toutes les instances
+  const registeredInstances = serviceRegistry.getAll();
+  await Promise.all(
+    registeredInstances.map(async (instance) => {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4000);
+        const resp = await fetch(`${instance.endpoint}/metrics`, { signal: controller.signal });
+        clearTimeout(timeout);
+        if (!resp.ok) return;
+        const data = await resp.json() as any;
+        // Mettre à jour les métriques dans le registre si les données sont valides
+        if (typeof data.cpuUsage === 'number' && typeof data.ramUsage === 'number') {
+          serviceRegistry.heartbeat(instance.id, {
+            ramUsage: data.ramUsage ?? 0,
+            ramMax: data.ramMax ?? 0,
+            cpuUsage: data.cpuUsage ?? 0,
+            cpuMax: data.cpuMax ?? 100,
+            bandwidthUsage: data.bandwidthUsage ?? 0,
+            requestCount20min: data.requestCount20min ?? 0,
+            responseTimeMs: data.responseTimeMs,
+          });
+        }
+      } catch {
+        // Pas bloquant — le heartbeat push prend le relais si /metrics est indisponible
+      }
+    }),
+  );
+
+  // 3. Add gateway itself
   snapshots.push({
     service: 'gateway',
     status: 'up',
@@ -3860,13 +3890,13 @@ async function runMonitoringCycle(): Promise<void> {
     checkedAt: now,
   });
 
-  // 3. Save to DB
+  // 4. Save to DB
   await monitoringDB.saveServiceSnapshot(snapshots);
 
-  // 4. Save connected user count
+  // 5. Save connected user count
   await monitoringDB.saveUserStats(connectedClients.size);
 
-  logger.info(`[Monitoring] Cycle terminé — ${connectedClients.size} users connectés — services: ${snapshots.map(s => `${s.service}:${s.status}`).join(', ')}`);
+  logger.info(`[Monitoring] Cycle terminé — ${connectedClients.size} users connectés — services: ${snapshots.map(s => `${s.service}:${s.status}`).join(', ')} — instances polled: ${registeredInstances.length}`);
 }
 
 // Admin monitoring API — requires admin role
