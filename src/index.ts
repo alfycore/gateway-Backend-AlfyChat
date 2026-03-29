@@ -189,10 +189,10 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
 }
 
 // Routes Auth & Users
-app.all('/api/auth/*', (req, res) => proxyRequest(USERS_URL, req, res));
-app.all('/api/users/*', (req, res) => proxyRequest(USERS_URL, req, res));
-app.all('/api/users', (req, res) => proxyRequest(USERS_URL, req, res));
-app.all('/api/rgpd/*', (req, res) => proxyRequest(USERS_URL, req, res));
+app.all('/api/auth/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/users/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/users', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
 
 // ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
 
@@ -259,6 +259,41 @@ app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
   res.json({ success: true });
 });
 
+/**
+ * POST /api/internal/service/deregister
+ * Retire manuellement une instance du registre (ex : arrêt gracieux).
+ */
+app.post('/api/internal/service/deregister', express.json(), (req, res) => {
+  const { secret, id } = req.body ?? {};
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Secret invalide' });
+  }
+  if (!id) return res.status(400).json({ error: 'id requis' });
+  const removed = serviceRegistry.remove(String(id));
+  res.json({ success: removed });
+});
+
+/**
+ * GET /api/internal/service/list
+ * Retourne toutes les instances enregistrées avec leurs métriques et scores.
+ * Protégé par X-Internal-Secret header ou ?secret=... query param.
+ */
+app.get('/api/internal/service/list', (req, res) => {
+  const secret = (req.headers['x-internal-secret'] as string | undefined) ?? (req.query.secret as string | undefined);
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Secret invalide' });
+  }
+  const instances = serviceRegistry.getAll().map((inst) => ({
+    ...inst,
+    score: serviceRegistry.computeScore(inst),
+  }));
+  res.json({
+    count: instances.length,
+    healthy: instances.filter((i) => i.healthy).length,
+    instances,
+  });
+});
+
 // ============ ADMIN : GESTION IP BANS (gateway direct) ============
 
 app.get('/api/admin/gateway/stats', async (req, res) => {
@@ -266,7 +301,7 @@ app.get('/api/admin/gateway/stats', async (req, res) => {
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   // Vérifier le rôle admin via le service users
   try {
-    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
       headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
     });
     const userData = await safeJson(userRes) as any;
@@ -292,7 +327,7 @@ app.post('/api/admin/gateway/ban-ip', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   try {
-    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
       headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
     });
     const userData = await safeJson(userRes) as any;
@@ -316,7 +351,7 @@ app.delete('/api/admin/gateway/ban-ip/:ip', async (req, res) => {
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) return res.status(401).json({ error: 'Non authentifié' });
   try {
-    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
       headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
     });
     const userData = await safeJson(userRes) as any;
@@ -525,8 +560,8 @@ app.delete('/api/admin/services/:id', async (req, res) => {
   res.json({ success: true });
 });
 
-app.all('/api/admin/*', (req, res) => proxyRequest(USERS_URL, req, res));
-app.all('/api/admin', (req, res) => proxyRequest(USERS_URL, req, res));
+app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/admin', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
 
 // Routes Messages
 app.all('/api/messages/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
@@ -773,18 +808,18 @@ app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_UR
 
 // Routes Servers — proxy intelligent : redirige vers le server-node si connecté
 // Les routes « annuaire » vont toujours vers le microservice central :
-app.all('/api/servers/join', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/invite/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/invites/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/public/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/discover/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/badges/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/admin/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
+app.all('/api/servers/join', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/invite/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/invites/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/public/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/discover/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/badges/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/admin/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
 // GET /api/servers — liste des serveurs, enrichie avec les infos des nodes connectés
 app.get('/api/servers', async (req, res) => {
   try {
     const userId = extractUserIdFromJWT(req.headers.authorization);
-    const url = `${SERVERS_URL}/servers?userId=${userId || ''}`;
+    const url = `${getServiceUrl('servers', SERVERS_URL)}/servers?userId=${userId || ''}`;
     const response = await fetch(url, {
       method: 'GET',
       headers: {
@@ -827,13 +862,13 @@ app.get('/api/servers', async (req, res) => {
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
-app.post('/api/servers', (req, res) => proxyRequest(SERVERS_URL, req, res));
+app.post('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
 
 // Routes qui restent TOUJOURS vers le microservice même pour un serverId
-app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(SERVERS_URL, req, res));
-app.all('/api/servers/:serverId/domain/*', (req, res) => proxyRequest(SERVERS_URL, req, res));
+app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/:serverId/domain/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
 
 // Proxy dédié vers un server-node : réécriture d'URL automatique
 async function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.Request, res: express.Response) {
@@ -982,7 +1017,7 @@ app.post('/api/servers/:serverId/files', (req, res) => {
     return;
   }
   // Fallback sans node : vers le servers microservice
-  proxyMultipartToService(SERVERS_URL, `/servers/${serverId}/files${query}`, req, res);
+  proxyMultipartToService(getServiceUrl('servers', SERVERS_URL), `/servers/${serverId}/files${query}`, req, res);
 });
 
 // Serve fichiers uploadés (fallback sans node)
@@ -1005,7 +1040,7 @@ app.get('/api/servers/:serverId/files/:filename', async (req, res) => {
   }
   // Fallback vers le servers microservice
   try {
-    const response = await fetch(`${SERVERS_URL}/servers/${serverId}/files/${filename}`);
+    const response = await fetch(`${getServiceUrl('servers', SERVERS_URL)}/servers/${serverId}/files/${filename}`);
     if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
     const ct = response.headers.get('content-type');
     if (ct) res.setHeader('Content-Type', ct);
@@ -1033,7 +1068,7 @@ app.all('/api/servers/:serverId/*', (req, res) => {
   }
 
   // Aucun node connecté → microservice central
-  proxyRequest(SERVERS_URL, req, res);
+  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res);
 });
 
 // /api/servers/:serverId (sans sous-chemin) → /server sur le node
@@ -1046,11 +1081,11 @@ app.all('/api/servers/:serverId', (req, res) => {
     return;
   }
 
-  proxyRequest(SERVERS_URL, req, res);
+  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res);
 });
 
 // Fallback
-app.all('/api/servers', (req, res) => proxyRequest(SERVERS_URL, req, res));
+app.all('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
 
 // Routes Bots
 app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res));
@@ -3839,7 +3874,7 @@ async function requireAdmin(req: express.Request, res: express.Response): Promis
   const userId = extractUserIdFromJWT(req.headers.authorization);
   if (!userId) { res.status(401).json({ error: 'Non authentifié' }); return null; }
   try {
-    const userRes = await fetch(`${USERS_URL}/users/${userId}`, {
+    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
       headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
     });
     const userData = await safeJson(userRes) as any;
