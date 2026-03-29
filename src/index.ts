@@ -229,6 +229,15 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
     metrics: metrics ?? defaultMetrics,
   });
 
+  // Persist to DB (non-blocking)
+  monitoringDB.upsertServiceInstance({
+    id: String(id),
+    serviceType: String(serviceType),
+    endpoint: String(endpoint),
+    domain: String(domain),
+    location: String(location).toUpperCase(),
+  }).catch(() => {});
+
   res.json({ success: true, instance });
 });
 
@@ -270,6 +279,7 @@ app.post('/api/internal/service/deregister', express.json(), (req, res) => {
   }
   if (!id) return res.status(400).json({ error: 'id requis' });
   const removed = serviceRegistry.remove(String(id));
+  if (removed) monitoringDB.removeServiceInstance(String(id)).catch(() => {});
   res.json({ success: removed });
 });
 
@@ -549,14 +559,24 @@ app.post('/api/admin/services', async (req, res) => {
     location: String(location).toUpperCase(),
     metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100, bandwidthUsage: 0, requestCount20min: 0 },
   });
+  // Persist to DB (non-blocking)
+  monitoringDB.upsertServiceInstance({
+    id: String(id),
+    serviceType: String(serviceType),
+    endpoint: String(endpoint),
+    domain: String(domain),
+    location: String(location).toUpperCase(),
+  }).catch(() => {});
   res.status(201).json({ success: true, instance });
 });
 
 /** DELETE /api/admin/services/:id — retire une instance */
 app.delete('/api/admin/services/:id', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
-  const removed = serviceRegistry.remove(decodeURIComponent(req.params.id));
+  const decodedId = decodeURIComponent(req.params.id);
+  const removed = serviceRegistry.remove(decodedId);
   if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
+  monitoringDB.removeServiceInstance(decodedId).catch(() => {});
   res.json({ success: true });
 });
 
@@ -3921,11 +3941,27 @@ async function requireAdmin(req: express.Request, res: express.Response): Promis
 const PORT = process.env.PORT || 3000;
 
 /**
- * Pré-enregistre les instances par défaut de chaque service dans le registre,
- * en utilisant les URL définies dans les variables d'environnement du gateway.
- * Les services réels écraseront ces entrées dès leur premier heartbeat.
+ * Charge les instances de service depuis la DB MySQL et les enregistre dans le registre.
+ * Fallback sur les URL d'environnement si la DB n'est pas disponible.
  */
-function seedDefaultInstances(): void {
+async function loadInstancesFromDB(): Promise<void> {
+  const rows = await monitoringDB.loadServiceInstances();
+  if (rows.length > 0) {
+    for (const row of rows) {
+      serviceRegistry.register({
+        id: row.id,
+        serviceType: row.serviceType as ServiceType,
+        endpoint: row.endpoint,
+        domain: row.domain,
+        location: row.location,
+        metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 0, bandwidthUsage: 0, requestCount20min: 0 },
+      });
+    }
+    logger.info(`ServiceRegistry: ${rows.length} instances chargées depuis la DB`);
+    return;
+  }
+
+  // Fallback: aucune entrée en DB → utiliser les vars d'environnement
   const location = (process.env.DEFAULT_LOCATION || 'EU').toUpperCase();
   const defaults: Array<{ id: string; type: ServiceType; url: string }> = [
     { id: 'users-default',    type: 'users',    url: USERS_URL },
@@ -3940,28 +3976,25 @@ function seedDefaultInstances(): void {
   for (const d of defaults) {
     let domain = d.url;
     try { domain = new URL(d.url).host; } catch { /* url invalide, on garde tel quel */ }
-
     serviceRegistry.register({
       id: d.id,
       serviceType: d.type,
       endpoint: d.url,
       domain,
       location,
-      // Métriques vides → score = DEFAULT_SCORE (50) jusqu'au premier heartbeat réel
       metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 0, bandwidthUsage: 0, requestCount20min: 0 },
     });
   }
-
-  logger.info(`ServiceRegistry: ${defaults.length} instances par défaut initialisées depuis l'environnement du gateway`);
+  logger.info(`ServiceRegistry: ${defaults.length} instances initialisées depuis les vars d'environnement (fallback)`);
 }
 
 httpServer.listen(PORT, async () => {
-  seedDefaultInstances();
   logger.info(`🚀 Gateway AlfyChat démarré sur le port ${PORT}`);
   logger.info(`📡 WebSocket prêt à recevoir des connexions`);
 
   // Init monitoring DB and start collection loop
   await monitoringDB.init();
+  await loadInstancesFromDB();
   // First cycle immediately, then every MONITORING_INTERVAL_MS
   runMonitoringCycle().catch((err) => logger.error('Monitoring cycle error:', err));
   setInterval(() => {

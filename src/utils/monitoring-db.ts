@@ -84,6 +84,32 @@ class MonitoringDB {
   private async createTables(): Promise<void> {
     const conn = await this.pool!.getConnection();
     try {
+      // ── Instances de services (load balancer registry persistant) ──────────
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS service_instances (
+          id           VARCHAR(128) NOT NULL PRIMARY KEY,
+          service_type VARCHAR(32)  NOT NULL,
+          endpoint     VARCHAR(512) NOT NULL,
+          domain       VARCHAR(256) NOT NULL,
+          location     VARCHAR(32)  NOT NULL DEFAULT 'EU',
+          created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_service_type (service_type)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      // Pré-populer avec les instances de production si la table est vide
+      await conn.execute(`
+        INSERT IGNORE INTO service_instances (id, service_type, endpoint, domain, location) VALUES
+          ('users-default',    'users',    'https://users.alfychat.eu',              'users.alfychat.eu',              'EU'),
+          ('messages-default', 'messages', 'https://messages.alfychat.eu',           'messages.alfychat.eu',           'EU'),
+          ('friends-default',  'friends',  'https://friends.s.backend.alfychat.app', 'friends.s.backend.alfychat.app', 'EU'),
+          ('calls-default',    'calls',    'https://calls.s.backend.alfychat.app',   'calls.s.backend.alfychat.app',   'EU'),
+          ('servers-default',  'servers',  'https://servers.s.backend.alfychat.app', 'servers.s.backend.alfychat.app', 'EU'),
+          ('bots-default',     'bots',     'https://bots.s.backend.alfychat.app',    'bots.s.backend.alfychat.app',    'EU'),
+          ('media-default',    'media',    'https://media.s.backend.alfychat.app',   'media.s.backend.alfychat.app',   'EU')
+      `);
+
       await conn.execute(`
         CREATE TABLE IF NOT EXISTS service_monitoring (
           id         INT AUTO_INCREMENT PRIMARY KEY,
@@ -471,6 +497,61 @@ class MonitoringDB {
     } catch (err) {
       logger.error('MonitoringDB: erreur getServiceUptimeDaily', err);
       return [];
+    } finally {
+      conn.release();
+    }
+  }
+
+  // ── Service instances (registry persistant) ─────────────────────────────
+
+  /** Charge toutes les instances depuis la DB */
+  async loadServiceInstances(): Promise<{ id: string; serviceType: string; endpoint: string; domain: string; location: string }[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id, service_type AS serviceType, endpoint, domain, location FROM service_instances ORDER BY service_type, id`,
+      );
+      return rows as any[];
+    } catch (err) {
+      logger.error('MonitoringDB: erreur loadServiceInstances', err);
+      return [];
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Crée ou met à jour une instance */
+  async upsertServiceInstance(data: { id: string; serviceType: string; endpoint: string; domain: string; location: string }): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `INSERT INTO service_instances (id, service_type, endpoint, domain, location)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           service_type = VALUES(service_type),
+           endpoint     = VALUES(endpoint),
+           domain       = VALUES(domain),
+           location     = VALUES(location),
+           updated_at   = NOW()`,
+        [data.id, data.serviceType, data.endpoint, data.domain, data.location.toUpperCase()],
+      );
+    } catch (err) {
+      logger.error('MonitoringDB: erreur upsertServiceInstance', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Supprime une instance */
+  async removeServiceInstance(id: string): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(`DELETE FROM service_instances WHERE id = ?`, [id]);
+    } catch (err) {
+      logger.error('MonitoringDB: erreur removeServiceInstance', err);
     } finally {
       conn.release();
     }
