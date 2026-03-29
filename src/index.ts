@@ -452,7 +452,17 @@ app.get('/api/status', async (_req, res) => {
       }),
     );
 
-    res.json({ services: latestStatuses, incidents: activeIncidents, uptime: uptimeByService });
+    // Public-safe subset of service instances (no metrics, no internal endpoints)
+    const publicInstances = serviceRegistry.getAll().map((inst) => ({
+      serviceType: inst.serviceType,
+      domain: inst.domain,
+      location: inst.location,
+      healthy: inst.healthy,
+      lastHeartbeat: inst.lastHeartbeat,
+      score: serviceRegistry.computeScore(inst),
+    }));
+
+    res.json({ services: latestStatuses, incidents: activeIncidents, uptime: uptimeByService, instances: publicInstances });
   } catch (err) {
     logger.error('Erreur /api/status:', err);
     res.status(500).json({ error: 'Erreur serveur' });
