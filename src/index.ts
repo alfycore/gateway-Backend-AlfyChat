@@ -16,6 +16,7 @@ import { logger } from './utils/logger';
 import { RedisClient } from './utils/redis';
 import { ServiceProxy } from './services/proxy';
 import { monitoringDB } from './utils/monitoring-db';
+import { serviceRegistry, ServiceType } from './utils/service-registry';
 
 dotenv.config();
 
@@ -116,6 +117,18 @@ const SERVERS_URL = process.env.SERVERS_SERVICE_URL || 'http://localhost:3005';
 const BOTS_URL = process.env.BOTS_SERVICE_URL || 'http://localhost:3006';
 const MEDIA_URL = process.env.MEDIA_SERVICE_URL || 'http://localhost:3007';
 
+// Secret partagé pour les enregistrements internes de services
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret-dev';
+
+/**
+ * Retourne l'URL du meilleur nœud disponible pour un type de service.
+ * Si le registre ne contient aucune instance saine, on utilise l'URL de fallback (env var).
+ */
+function getServiceUrl(serviceType: ServiceType, fallback: string): string {
+  const best = serviceRegistry.selectBest(serviceType);
+  return best?.endpoint ?? fallback;
+}
+
 // Décoder le JWT depuis le header Authorization (sans lever d'erreur)
 function extractUserIdFromJWT(authHeader: string | undefined): string | null {
   if (!authHeader?.startsWith('Bearer ')) return null;
@@ -180,6 +193,72 @@ app.all('/api/auth/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/users/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/users', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/rgpd/*', (req, res) => proxyRequest(USERS_URL, req, res));
+
+// ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
+
+/**
+ * POST /api/internal/service/register
+ * Enregistre (ou met à jour) une instance de microservice dans le registre.
+ * Protégé par le secret partagé INTERNAL_SECRET.
+ *
+ * Body: { secret, id, serviceType, endpoint, domain, location, metrics }
+ */
+app.post('/api/internal/service/register', express.json(), (req, res) => {
+  const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
+
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Secret invalide' });
+  }
+
+  const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
+  if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
+    return res.status(400).json({ error: 'Paramètres manquants ou invalides (id, serviceType, endpoint, domain, location)' });
+  }
+
+  const defaultMetrics = {
+    ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100,
+    bandwidthUsage: 0, requestCount20min: 0,
+  };
+
+  const instance = serviceRegistry.register({
+    id: String(id),
+    serviceType: serviceType as ServiceType,
+    endpoint: String(endpoint),
+    domain: String(domain),
+    location: String(location).toUpperCase(),
+    metrics: metrics ?? defaultMetrics,
+  });
+
+  res.json({ success: true, instance });
+});
+
+/**
+ * POST /api/internal/service/heartbeat
+ * Met à jour les métriques d'une instance déjà enregistrée.
+ *
+ * Body: { secret, id, metrics }
+ */
+app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
+  const { secret, id, metrics } = req.body ?? {};
+
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Secret invalide' });
+  }
+
+  if (!id || !metrics) {
+    return res.status(400).json({ error: 'id et metrics requis' });
+  }
+
+  const updated = serviceRegistry.heartbeat(String(id), metrics);
+  if (!updated) {
+    // Instance inconnue : peut arriver au redémarrage du gateway ; renvoyer 404
+    // pour que le service se ré-enregistre
+    return res.status(404).json({ error: 'Instance inconnue, veuillez vous enregistrer d\'abord' });
+  }
+
+  res.json({ success: true });
+});
+
 // ============ ADMIN : GESTION IP BANS (gateway direct) ============
 
 app.get('/api/admin/gateway/stats', async (req, res) => {
@@ -397,18 +476,67 @@ app.delete('/api/admin/status/incidents/:id', async (req, res) => {
   }
 });
 
+// ── Admin: service registry management ───────────────────────────────────────
+
+/** GET /api/admin/services — liste toutes les instances connues */
+app.get('/api/admin/services', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const instances = serviceRegistry.getAll().map((i) => ({
+    ...i,
+    score: serviceRegistry.computeScore(i),
+  }));
+  res.json({ instances });
+});
+
+/** GET /api/admin/services/:type — instances d'un type donné */
+app.get('/api/admin/services/:type', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const instances = serviceRegistry.getInstances(req.params.type as ServiceType, true).map((i) => ({
+    ...i,
+    score: serviceRegistry.computeScore(i),
+  }));
+  res.json({ instances });
+});
+
+/** POST /api/admin/services — ajoute manuellement une instance (sans métriques) */
+app.post('/api/admin/services', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const { id, serviceType, endpoint, domain, location } = req.body ?? {};
+  const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
+  if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
+    return res.status(400).json({ error: 'id, serviceType, endpoint, domain, location requis' });
+  }
+  const instance = serviceRegistry.register({
+    id: String(id),
+    serviceType: serviceType as ServiceType,
+    endpoint: String(endpoint),
+    domain: String(domain),
+    location: String(location).toUpperCase(),
+    metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100, bandwidthUsage: 0, requestCount20min: 0 },
+  });
+  res.status(201).json({ success: true, instance });
+});
+
+/** DELETE /api/admin/services/:id — retire une instance */
+app.delete('/api/admin/services/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const removed = serviceRegistry.remove(decodeURIComponent(req.params.id));
+  if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
+  res.json({ success: true });
+});
+
 app.all('/api/admin/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/admin', (req, res) => proxyRequest(USERS_URL, req, res));
 
 // Routes Messages
-app.all('/api/messages/*', (req, res) => proxyRequest(MESSAGES_URL, req, res));
-app.all('/api/messages', (req, res) => proxyRequest(MESSAGES_URL, req, res));
-app.all('/api/conversations/*', (req, res) => proxyRequest(MESSAGES_URL, req, res));
-app.all('/api/conversations', (req, res) => proxyRequest(MESSAGES_URL, req, res));
+app.all('/api/messages/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/messages', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/conversations/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/conversations', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
 
 // Routes Archive DM (système hybride)
-app.all('/api/archive/*', (req, res) => proxyRequest(MESSAGES_URL, req, res));
-app.all('/api/archive', (req, res) => proxyRequest(MESSAGES_URL, req, res));
+app.all('/api/archive/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/archive', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
 
 // Routes Friends
 // Route spécifique : envoi demande d'ami via HTTP → proxy + notification WS au destinataire
@@ -636,12 +764,12 @@ app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
   }
 });
 
-app.all('/api/friends/*', (req, res) => proxyRequest(FRIENDS_URL, req, res));
-app.all('/api/friends', (req, res) => proxyRequest(FRIENDS_URL, req, res));
+app.all('/api/friends/*', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res));
+app.all('/api/friends', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res));
 
 // Routes Calls
-app.all('/api/calls/*', (req, res) => proxyRequest(CALLS_URL, req, res));
-app.all('/api/calls', (req, res) => proxyRequest(CALLS_URL, req, res));
+app.all('/api/calls/*', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res));
+app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res));
 
 // Routes Servers — proxy intelligent : redirige vers le server-node si connecté
 // Les routes « annuaire » vont toujours vers le microservice central :
@@ -925,23 +1053,28 @@ app.all('/api/servers/:serverId', (req, res) => {
 app.all('/api/servers', (req, res) => proxyRequest(SERVERS_URL, req, res));
 
 // Routes Bots
-app.all('/api/bots/*', (req, res) => proxyRequest(BOTS_URL, req, res));
-app.all('/api/bots', (req, res) => proxyRequest(BOTS_URL, req, res));
+app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res));
+app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res));
 
-// Routes Media — proxy multipart/form-data (pas JSON)
-app.all('/api/media/*', async (req, res) => {
+// ============ ROUTES MÉDIA — Routage géo-distribué ============
+//
+// Structure d'URL pour les médias :
+//   Upload  : POST /api/media/upload/:type?location=EU
+//   Download: GET  /api/media/:location/:serviceId/:folder/:filename
+//             ex.  GET /api/media/EU/media-eu-1/avatars/user123-abc.webp
+//
+// Si aucune instance n'est enregistrée dans le registre, fallback vers MEDIA_URL.
+
+/** Proxy brut multipart/JSON vers un endpoint media */
+async function proxyToMedia(targetEndpoint: string, mediaPath: string, req: express.Request, res: express.Response) {
   try {
-    const url = `${MEDIA_URL}${req.originalUrl.replace(/^\/api/, '')}`;
-
-    // Récupérer le body brut pour le transférer tel quel
+    const url = `${targetEndpoint}${mediaPath}`;
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', async () => {
       try {
         const body = Buffer.concat(chunks);
         const headers: Record<string, string> = {};
-
-        // Transférer les headers importants
         if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'] as string;
         if (req.headers.authorization) headers['authorization'] = req.headers.authorization;
         if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'] as string;
@@ -952,33 +1085,112 @@ app.all('/api/media/*', async (req, res) => {
           ...(req.method !== 'GET' && req.method !== 'HEAD' && { body }),
         });
 
-        const contentType = response.headers.get('content-type');
-        if (contentType && contentType.includes('application/json')) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
           const data = await response.json();
           res.status(response.status).json(data);
+        } else if (
+          contentType.startsWith('image/') ||
+          contentType.startsWith('video/') ||
+          contentType.startsWith('audio/') ||
+          contentType.startsWith('application/octet-stream')
+        ) {
+          const buffer = Buffer.from(await response.arrayBuffer());
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+          const cc = response.headers.get('cache-control');
+          if (cc) res.setHeader('Cache-Control', cc);
+          res.status(response.status).send(buffer);
         } else {
-          const text = await response.text();
-          res.status(response.status).send(text);
+          res.status(response.status).send(await response.text());
         }
-      } catch (error) {
-        logger.error('Erreur proxy media:', error);
+      } catch (err) {
+        logger.error('Erreur proxy média:', err);
         res.status(502).json({ error: 'Service média indisponible' });
       }
     });
-  } catch (error) {
-    logger.error('Erreur proxy media:', error);
+  } catch (err) {
+    logger.error('Erreur proxy média:', err);
+    res.status(502).json({ error: 'Service média indisponible' });
+  }
+}
+
+// ── Download : GET /api/media/:location/:serviceId/:folder/:filename ──────────
+//   Route spécifique avant le catch-all upload
+app.get('/api/media/:location/:serviceId/:folder/:filename', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+
+  const { location, serviceId, folder, filename } = req.params;
+
+  // 1. Chercher l'instance par serviceId dans le registre
+  let instance = serviceRegistry.getById(serviceId);
+
+  // 2. Fallback : chercher une instance saine dans la même région
+  if (!instance || !instance.healthy) {
+    const regional = serviceRegistry.selectBestByLocation('media', location);
+    if (regional) {
+      logger.warn(`MediaProxy: instance ${serviceId} introuvable/hors-ligne, fallback sur ${regional.id}`);
+      instance = regional;
+    }
+  }
+
+  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+  const mediaPath = `/uploads/${folder}/${filename}`;
+
+  try {
+    const response = await fetch(`${targetEndpoint}${mediaPath}`);
+    if (!response.ok) {
+      res.status(response.status).json({ error: 'Fichier non trouvé' });
+      return;
+    }
+    const contentType = response.headers.get('content-type');
+    const cacheControl = response.headers.get('cache-control');
+    if (contentType) res.setHeader('Content-Type', contentType);
+    if (cacheControl) res.setHeader('Cache-Control', cacheControl);
+    res.send(Buffer.from(await response.arrayBuffer()));
+  } catch (err) {
+    logger.error('Erreur download média:', err);
     res.status(502).json({ error: 'Service média indisponible' });
   }
 });
 
+// ── Upload : POST/PATCH /api/media/upload/* → meilleur serveur par localisation ──
+app.all('/api/media/upload/*', async (req, res) => {
+  // Localisation préférée : header X-Media-Location ou query ?location=EU
+  const preferredLocation = (req.headers['x-media-location'] as string | undefined)
+    ?? (req.query.location as string | undefined);
+
+  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation)
+    ?? null;
+  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+
+  // Réécrire l'URL vers /media/upload/:type (le préfixe /api est retiré)
+  const mediaPath = req.originalUrl.replace(/^\/api/, '');
+  proxyToMedia(targetEndpoint, mediaPath, req, res);
+});
+
+// ── Catch-all /api/media/* — redirige vers la meilleure instance ──────────────
+app.all('/api/media/*', async (req, res) => {
+  const preferredLocation = (req.headers['x-media-location'] as string | undefined)
+    ?? (req.query.location as string | undefined);
+  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
+  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+  const mediaPath = req.originalUrl.replace(/^\/api/, '');
+  proxyToMedia(targetEndpoint, mediaPath, req, res);
+});
+
 // Routes Uploads — proxy des fichiers statiques depuis le service média
+// (compatibilité avec les anciennes URLs /uploads/*)
 app.get('/uploads/*', async (req, res) => {
-  // CORP doit être présent sur toutes les réponses (succès ET erreur)
-  // pour éviter NS_ERROR_DOM_CORP_FAILED sur Firefox/Chrome avec COEP
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   try {
-    const url = `${MEDIA_URL}${req.originalUrl}`;
+    // Chercher une instance média quelconque saine
+    const instance = serviceRegistry.selectBest('media');
+    const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+    const url = `${targetEndpoint}${req.originalUrl}`;
     const response = await fetch(url);
 
     if (!response.ok) {
