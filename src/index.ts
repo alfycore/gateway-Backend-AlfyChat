@@ -309,6 +309,94 @@ app.get('/api/admin/monitoring/users/chart', async (req, res) => {
   }
 });
 
+// ── Public status endpoint ───────────────────────────────────────────────────
+
+/** GET /api/status — public: current service statuses + active incidents + 90-day uptime */
+app.get('/api/status', async (_req, res) => {
+  try {
+    const [latestStatuses, activeIncidents] = await Promise.all([
+      monitoringDB.getLatestServiceStatus(),
+      monitoringDB.getIncidents(false),
+    ]);
+
+    // Fetch 90-day uptime per service
+    const serviceNames = [...new Set(latestStatuses.map((s) => s.service))];
+    const uptimeByService: Record<string, import('./utils/monitoring-db').ServiceUptimeDay[]> = {};
+    await Promise.all(
+      serviceNames.map(async (name) => {
+        uptimeByService[name] = await monitoringDB.getServiceUptimeDaily(name, 90);
+      }),
+    );
+
+    res.json({ services: latestStatuses, incidents: activeIncidents, uptime: uptimeByService });
+  } catch (err) {
+    logger.error('Erreur /api/status:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ── Admin: incident CRUD ──────────────────────────────────────────────────────
+
+/** GET /api/admin/status/incidents?includeResolved=true */
+app.get('/api/admin/status/incidents', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const includeResolved = req.query.includeResolved === 'true';
+    const incidents = await monitoringDB.getIncidents(includeResolved);
+    res.json({ incidents });
+  } catch (err) {
+    logger.error('Erreur GET /api/admin/status/incidents:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** POST /api/admin/status/incidents */
+app.post('/api/admin/status/incidents', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const { title, message, severity, services, status } = req.body;
+    if (!title || !severity) return res.status(400).json({ error: 'title et severity requis' });
+    const createdBy = extractUserIdFromJWT(req.headers.authorization) ?? undefined;
+    const id = await monitoringDB.createIncident({ title, message, severity, services, status, createdBy });
+    if (!id) return res.status(500).json({ error: 'Erreur création incident' });
+    res.status(201).json({ id });
+  } catch (err) {
+    logger.error('Erreur POST /api/admin/status/incidents:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** PATCH /api/admin/status/incidents/:id */
+app.patch('/api/admin/status/incidents/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: 'ID invalide' });
+    const { title, message, severity, services, status } = req.body;
+    const ok = await monitoringDB.updateIncident(id, { title, message, severity, services, status });
+    if (!ok) return res.status(500).json({ error: 'Erreur mise à jour' });
+    res.json({ success: true });
+  } catch (err) {
+    logger.error('Erreur PATCH /api/admin/status/incidents:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** DELETE /api/admin/status/incidents/:id */
+app.delete('/api/admin/status/incidents/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: 'ID invalide' });
+    const ok = await monitoringDB.deleteIncident(id);
+    if (!ok) return res.status(500).json({ error: 'Erreur suppression' });
+    res.json({ success: true });
+  } catch (err) {
+    logger.error('Erreur DELETE /api/admin/status/incidents:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.all('/api/admin/*', (req, res) => proxyRequest(USERS_URL, req, res));
 app.all('/api/admin', (req, res) => proxyRequest(USERS_URL, req, res));
 

@@ -6,6 +6,29 @@
 import mysql from 'mysql2/promise';
 import { logger } from './logger';
 
+export type IncidentSeverity = 'info' | 'warning' | 'critical';
+export type IncidentStatus = 'investigating' | 'identified' | 'monitoring' | 'resolved';
+
+export interface Incident {
+  id: number;
+  title: string;
+  message: string | null;
+  severity: IncidentSeverity;
+  services: string | null; // JSON array string
+  status: IncidentStatus;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+}
+
+export interface ServiceUptimeDay {
+  date: string;        // YYYY-MM-DD
+  uptime_pct: number;  // 0–100
+  total_checks: number;
+  down_checks: number;
+}
+
 export interface ServiceSnapshot {
   service: string;
   status: 'up' | 'down' | 'degraded';
@@ -79,6 +102,23 @@ class MonitoringDB {
           connected_users INT NOT NULL DEFAULT 0,
           recorded_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
           INDEX idx_recorded_at (recorded_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS status_incidents (
+          id          INT AUTO_INCREMENT PRIMARY KEY,
+          title       VARCHAR(255) NOT NULL,
+          message     TEXT,
+          severity    ENUM('info','warning','critical') NOT NULL DEFAULT 'warning',
+          services    VARCHAR(500) DEFAULT NULL,
+          status      ENUM('investigating','identified','monitoring','resolved') NOT NULL DEFAULT 'investigating',
+          created_by  VARCHAR(64),
+          created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          resolved_at DATETIME DEFAULT NULL,
+          INDEX idx_status (status),
+          INDEX idx_created_at (created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
     } finally {
@@ -299,6 +339,138 @@ class MonitoringDB {
       );
     } catch (err) {
       logger.error('MonitoringDB: erreur prune', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  // ── Incidents ────────────────────────────────────────────────────────────
+
+  async getIncidents(includeResolved = false): Promise<Incident[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        includeResolved
+          ? `SELECT * FROM status_incidents ORDER BY created_at DESC LIMIT 100`
+          : `SELECT * FROM status_incidents WHERE status != 'resolved' ORDER BY created_at DESC`,
+      );
+      return rows as Incident[];
+    } catch (err) {
+      logger.error('MonitoringDB: erreur getIncidents', err);
+      return [];
+    } finally {
+      conn.release();
+    }
+  }
+
+  async createIncident(data: {
+    title: string;
+    message?: string;
+    severity: IncidentSeverity;
+    services?: string[];
+    status?: IncidentStatus;
+    createdBy?: string;
+  }): Promise<number | null> {
+    if (!this.ready || !this.pool) return null;
+    const conn = await this.pool.getConnection();
+    try {
+      const [result] = await conn.execute<mysql.ResultSetHeader>(
+        `INSERT INTO status_incidents (title, message, severity, services, status, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          data.title,
+          data.message ?? null,
+          data.severity,
+          data.services ? JSON.stringify(data.services) : null,
+          data.status ?? 'investigating',
+          data.createdBy ?? null,
+        ],
+      );
+      return result.insertId;
+    } catch (err) {
+      logger.error('MonitoringDB: erreur createIncident', err);
+      return null;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async updateIncident(id: number, data: {
+    title?: string;
+    message?: string;
+    severity?: IncidentSeverity;
+    services?: string[];
+    status?: IncidentStatus;
+  }): Promise<boolean> {
+    if (!this.ready || !this.pool) return false;
+    const conn = await this.pool.getConnection();
+    try {
+      const fields: string[] = [];
+      const values: any[] = [];
+      if (data.title !== undefined)    { fields.push('title = ?');    values.push(data.title); }
+      if (data.message !== undefined)  { fields.push('message = ?');  values.push(data.message); }
+      if (data.severity !== undefined) { fields.push('severity = ?'); values.push(data.severity); }
+      if (data.services !== undefined) { fields.push('services = ?'); values.push(JSON.stringify(data.services)); }
+      if (data.status !== undefined) {
+        fields.push('status = ?');
+        values.push(data.status);
+        if (data.status === 'resolved') fields.push('resolved_at = NOW()');
+        else                            fields.push('resolved_at = NULL');
+      }
+      if (!fields.length) return true;
+      values.push(id);
+      await conn.execute(`UPDATE status_incidents SET ${fields.join(', ')} WHERE id = ?`, values);
+      return true;
+    } catch (err) {
+      logger.error('MonitoringDB: erreur updateIncident', err);
+      return false;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async deleteIncident(id: number): Promise<boolean> {
+    if (!this.ready || !this.pool) return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(`DELETE FROM status_incidents WHERE id = ?`, [id]);
+      return true;
+    } catch (err) {
+      logger.error('MonitoringDB: erreur deleteIncident', err);
+      return false;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // ── Uptime history (daily buckets, last N days) ─────────────────────────
+
+  async getServiceUptimeDaily(service: string, days = 90): Promise<ServiceUptimeDay[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT
+           DATE(checked_at)                                         AS date,
+           COUNT(*)                                                 AS total_checks,
+           SUM(CASE WHEN status = 'down' THEN 1 ELSE 0 END)        AS down_checks,
+           ROUND(100.0 * SUM(CASE WHEN status != 'down' THEN 1 ELSE 0 END) / COUNT(*), 2) AS uptime_pct
+         FROM service_monitoring
+         WHERE service = ? AND checked_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+         GROUP BY DATE(checked_at)
+         ORDER BY date ASC`,
+        [service, days],
+      );
+      return (rows as any[]).map((r) => ({
+        date: r.date instanceof Date ? r.date.toISOString().slice(0, 10) : String(r.date),
+        uptime_pct: Number(r.uptime_pct) || 100,
+        total_checks: Number(r.total_checks) || 0,
+        down_checks: Number(r.down_checks) || 0,
+      }));
+    } catch (err) {
+      logger.error('MonitoringDB: erreur getServiceUptimeDaily', err);
+      return [];
     } finally {
       conn.release();
     }
