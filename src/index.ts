@@ -1115,7 +1115,7 @@ app.all('/api/servers/:serverId/*', (req, res) => {
   }
 
   // Aucun node connecté → microservice central
-  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res);
+  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL);
 });
 
 // /api/servers/:serverId (sans sous-chemin) → /server sur le node
@@ -1128,15 +1128,15 @@ app.all('/api/servers/:serverId', (req, res) => {
     return;
   }
 
-  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res);
+  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL);
 });
 
 // Fallback
-app.all('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
 
 // Routes Bots
-app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res));
-app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res));
+app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL));
+app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL));
 
 // ============ ROUTES MÉDIA — Routage géo-distribué ============
 //
