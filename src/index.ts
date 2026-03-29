@@ -3837,6 +3837,7 @@ app.get('/stats', (req, res) => {
 // ============ MONITORING SYSTEM ============
 
 const MONITORED_SERVICES: { name: string; url: string }[] = [
+  { name: 'website',  url: `${process.env.FRONTEND_URL         || 'https://alfychat.app'}` },
   { name: 'users',    url: `${process.env.USERS_SERVICE_URL    || 'http://localhost:3001'}/health` },
   { name: 'messages', url: `${process.env.MESSAGES_SERVICE_URL || 'http://localhost:3002'}/health` },
   { name: 'friends',  url: `${process.env.FRIENDS_SERVICE_URL  || 'http://localhost:3003'}/health` },
@@ -3911,11 +3912,15 @@ async function runMonitoringCycle(): Promise<void> {
     }),
   );
 
-  // 3. Add gateway itself
+  // 3. Add gateway itself (measure own /health response time)
+  const gwStart = Date.now();
+  try {
+    await fetch(`http://localhost:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
+  } catch { /* ignore */ }
   snapshots.push({
     service: 'gateway',
     status: 'up',
-    responseTimeMs: 0,
+    responseTimeMs: Date.now() - gwStart,
     statusCode: 200,
     checkedAt: now,
   });
