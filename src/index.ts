@@ -123,10 +123,15 @@ const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret
 /**
  * Retourne l'URL du meilleur nœud disponible pour un type de service.
  * Si le registre ne contient aucune instance saine, on utilise l'URL de fallback (env var).
+ * Un endpoint localhost ne sera jamais préféré à un fallback HTTPS externe.
  */
 function getServiceUrl(serviceType: ServiceType, fallback: string): string {
   const best = serviceRegistry.selectBest(serviceType);
-  return best?.endpoint ?? fallback;
+  if (!best) return fallback;
+  // Ne pas utiliser un endpoint localhost/127.0.0.1 quand le fallback est externe (HTTPS)
+  const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(best.endpoint);
+  if (isLocalEndpoint && fallback.startsWith('https://')) return fallback;
+  return best.endpoint;
 }
 
 // Décoder le JWT depuis le header Authorization (sans lever d'erreur)
@@ -142,22 +147,18 @@ function extractUserIdFromJWT(authHeader: string | undefined): string | null {
 }
 
 // Proxy HTTP vers les microservices
-async function proxyRequest(targetUrl: string, req: express.Request, res: express.Response) {
-  try {
-    const url = `${targetUrl}${req.originalUrl.replace(/^\/api/, '')}`;
+async function proxyRequest(targetUrl: string, req: express.Request, res: express.Response, fallbackUrl?: string) {
+  const SKIP_USERID_INJECT = ['/friends/request'];
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  const skipInject = SKIP_USERID_INJECT.some(path => req.originalUrl.replace(/^\/api/, '').startsWith(path));
+  let bodyToSend = req.body;
+  if (userId && req.method !== 'GET' && req.method !== 'HEAD' && !skipInject) {
+    bodyToSend = { ...req.body, userId, ownerId: userId };
+  }
 
-    // Injecter userId/ownerId dans le body pour les microservices qui en ont besoin
-    // Les valeurs JWT ont toujours la priorité sur le body client (sécurité)
-    // Exception : routes où userId dans le body représente une CIBLE (pas l'expéditeur)
-    const SKIP_USERID_INJECT = ['/friends/request'];
-    const userId = extractUserIdFromJWT(req.headers.authorization);
-    let bodyToSend = req.body;
-    const skipInject = SKIP_USERID_INJECT.some(path => req.originalUrl.replace(/^\/api/, '').startsWith(path));
-    if (userId && req.method !== 'GET' && req.method !== 'HEAD' && !skipInject) {
-      bodyToSend = { ...req.body, userId, ownerId: userId };
-    }
-
-    const response = await fetch(url, {
+  const doFetch = async (baseUrl: string) => {
+    const url = `${baseUrl}${req.originalUrl.replace(/^\/api/, '')}`;
+    return fetch(url, {
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
@@ -166,15 +167,15 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
       },
       ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
     });
+  };
 
-    // Vérifier si c'est du JSON valide
+  const sendResponse = async (response: Response) => {
     const contentType = response.headers.get('content-type');
     if (contentType && contentType.includes('application/json')) {
       const data = await safeJson(response);
       res.status(response.status).json(data ?? { error: 'Réponse vide' });
     } else {
       const text = await response.text();
-      // Si ce n'est pas du JSON mais que la réponse est vide (204 No Content, etc.)
       if (!text) {
         res.status(response.status).json({ success: response.ok });
       } else {
@@ -182,17 +183,33 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
         res.status(response.status).json({ error: 'Service non disponible' });
       }
     }
-  } catch (error) {
-    logger.error('Erreur proxy:', error);
+  };
+
+  try {
+    const response = await doFetch(targetUrl);
+    return sendResponse(response);
+  } catch (primaryError) {
+    // Si l'endpoint du registre est injoignable et qu'on a un fallback différent, réessayer
+    if (fallbackUrl && fallbackUrl !== targetUrl) {
+      logger.warn(`Proxy vers ${targetUrl} échoué, fallback vers ${fallbackUrl}`);
+      try {
+        const response = await doFetch(fallbackUrl);
+        return sendResponse(response);
+      } catch (fallbackError) {
+        logger.error(`Proxy fallback ${fallbackUrl} aussi échoué:`, fallbackError);
+      }
+    } else {
+      logger.error('Erreur proxy:', primaryError);
+    }
     res.status(502).json({ error: 'Service indisponible' });
   }
 }
 
 // Routes Auth & Users
-app.all('/api/auth/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
-app.all('/api/users/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
-app.all('/api/users', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
-app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/auth/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+app.all('/api/users/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+app.all('/api/users', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
 
 // ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
 
@@ -590,18 +607,18 @@ app.delete('/api/admin/services/:id', async (req, res) => {
   res.json({ success: true });
 });
 
-app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
-app.all('/api/admin', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res));
+app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+app.all('/api/admin', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
 
 // Routes Messages
-app.all('/api/messages/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
-app.all('/api/messages', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
-app.all('/api/conversations/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
-app.all('/api/conversations', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/messages/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+app.all('/api/messages', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+app.all('/api/conversations/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+app.all('/api/conversations', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 
 // Routes Archive DM (système hybride)
-app.all('/api/archive/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
-app.all('/api/archive', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res));
+app.all('/api/archive/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+app.all('/api/archive', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 
 // Routes Friends
 // Route spécifique : envoi demande d'ami via HTTP → proxy + notification WS au destinataire
@@ -829,22 +846,22 @@ app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
   }
 });
 
-app.all('/api/friends/*', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res));
-app.all('/api/friends', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res));
+app.all('/api/friends/*', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res, FRIENDS_URL));
+app.all('/api/friends', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res, FRIENDS_URL));
 
 // Routes Calls
-app.all('/api/calls/*', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res));
-app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res));
+app.all('/api/calls/*', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL));
+app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL));
 
 // Routes Servers — proxy intelligent : redirige vers le server-node si connecté
 // Les routes « annuaire » vont toujours vers le microservice central :
-app.all('/api/servers/join', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/invite/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/invites/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/public/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/discover/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/badges/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/admin/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/join', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/invite/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/invites/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/public/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/discover/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/badges/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/admin/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
 // GET /api/servers — liste des serveurs, enrichie avec les infos des nodes connectés
 app.get('/api/servers', async (req, res) => {
   try {
@@ -892,13 +909,13 @@ app.get('/api/servers', async (req, res) => {
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
-app.post('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.post('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
 
 // Routes qui restent TOUJOURS vers le microservice même pour un serverId
-app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
-app.all('/api/servers/:serverId/domain/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res));
+app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
+app.all('/api/servers/:serverId/domain/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
 
 // Proxy dédié vers un server-node : réécriture d'URL automatique
 async function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.Request, res: express.Response) {
