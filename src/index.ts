@@ -214,6 +214,12 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 // ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
 
 /**
+ * Blacklist des instances supprimées par un admin.
+ * Bloque les ré-enregistrements automatiques jusqu'au redémarrage du gateway.
+ */
+const bannedServiceIds = new Set<string>();
+
+/**
  * POST /api/internal/service/register
  * Enregistre (ou met à jour) une instance de microservice dans le registre.
  * Protégé par le secret partagé INTERNAL_SECRET.
@@ -232,6 +238,33 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
     return res.status(400).json({ error: 'Paramètres manquants ou invalides (id, serviceType, endpoint, domain, location)' });
   }
 
+  // Rejeter les instances supprimées par un admin (jusqu'au redémarrage)
+  if (bannedServiceIds.has(String(id))) {
+    return res.status(403).json({ error: 'Instance bannie — supprimée par un administrateur' });
+  }
+
+  // Auto-corriger les endpoints "localhost" quand l'appelant vient d'un IP externe.
+  // Si le service envoie endpoint=http://localhost:PORT mais que la requête arrive
+  // depuis un VPS distant, remplacer localhost par l'IP source réelle.
+  const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(String(endpoint));
+  const sourceIp = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
+    || req.socket?.remoteAddress || '';
+  const sourceIsExternal = sourceIp && sourceIp !== '127.0.0.1' && sourceIp !== '::1' && !sourceIp.startsWith('::ffff:127.');
+
+  let resolvedEndpoint = String(endpoint);
+  let resolvedDomain   = String(domain);
+
+  if (isLocalEndpoint && sourceIsExternal) {
+    // Garder le port mais remplacer localhost par l'IP source
+    const portMatch = String(endpoint).match(/:(\d+)\/?$/);
+    const port = portMatch ? portMatch[1] : '3000';
+    resolvedEndpoint = `http://${sourceIp}:${port}`;
+    resolvedDomain   = `${sourceIp}:${port}`;
+    logger.warn(
+      `ServiceRegistry: endpoint localhost corrigé → ${resolvedEndpoint} pour ${id} (source: ${sourceIp})`
+    );
+  }
+
   const defaultMetrics = {
     ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100,
     bandwidthUsage: 0, requestCount20min: 0,
@@ -240,8 +273,8 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
   const instance = serviceRegistry.register({
     id: String(id),
     serviceType: serviceType as ServiceType,
-    endpoint: String(endpoint),
-    domain: String(domain),
+    endpoint: resolvedEndpoint,
+    domain: resolvedDomain,
     location: String(location).toUpperCase(),
     metrics: metrics ?? defaultMetrics,
   });
@@ -250,8 +283,8 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
   monitoringDB.upsertServiceInstance({
     id: String(id),
     serviceType: String(serviceType),
-    endpoint: String(endpoint),
-    domain: String(domain),
+    endpoint: resolvedEndpoint,
+    domain: resolvedDomain,
     location: String(location).toUpperCase(),
   }).catch(() => {});
 
@@ -273,6 +306,11 @@ app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
 
   if (!id || !metrics) {
     return res.status(400).json({ error: 'id et metrics requis' });
+  }
+
+  // Rejeter le heartbeat des instances bannies par un admin
+  if (bannedServiceIds.has(String(id))) {
+    return res.status(403).json({ error: 'Instance bannie — supprimée par un administrateur' });
   }
 
   const updated = serviceRegistry.heartbeat(String(id), metrics);
@@ -597,12 +635,15 @@ app.post('/api/admin/services', async (req, res) => {
   res.status(201).json({ success: true, instance });
 });
 
-/** DELETE /api/admin/services/:id — retire une instance */
+/** DELETE /api/admin/services/:id — retire une instance et la bannit jusqu'au redémarrage */
 app.delete('/api/admin/services/:id', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   const decodedId = decodeURIComponent(req.params.id);
   const removed = serviceRegistry.remove(decodedId);
   if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
+  // Blacklister l'ID pour empêcher le service de se ré-enregistrer automatiquement
+  bannedServiceIds.add(decodedId);
+  logger.info(`ServiceRegistry: instance "${decodedId}" supprimée et bannie par un admin`);
   monitoringDB.removeServiceInstance(decodedId).catch(() => {});
   res.json({ success: true });
 });
