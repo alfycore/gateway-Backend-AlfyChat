@@ -720,6 +720,10 @@ app.all('/api/conversations', (req, res) => proxyRequest(getServiceUrl('messages
 app.all('/api/archive/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/archive', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 
+// Routes Notifications (persistance DB)
+app.all('/api/notifications/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+app.all('/api/notifications', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
+
 // Routes Friends
 // Route spécifique : envoi demande d'ami via HTTP → proxy + notification WS au destinataire
 app.post('/api/friends/request', async (req, res) => {
@@ -1745,15 +1749,35 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Notifier les amis de la connexion
   broadcastPresenceUpdate(userId, 'online', friends);
 
-  // Envoyer les pings en attente (messages reçus hors ligne)
+  // Envoyer les pings en attente (messages reçus hors ligne) — DB + Redis
   try {
-    const pendingPings = await redis.getPendingPings(userId);
-    if (Object.keys(pendingPings).length > 0) {
+    // 1. Notifications persistantes en DB (source de vérité)
+    let dbNotifications: Record<string, { count: number; senderName: string }> = {};
+    try {
+      dbNotifications = (await serviceProxy.messages.getNotifications(userId, token)) as Record<string, { count: number; senderName: string }>;
+    } catch { /* non bloquant */ }
+
+    // 2. Compat. Redis (fusionne avec DB)
+    const redisPings = await redis.getPendingPings(userId);
+    const merged: Record<string, { count: number; senderName: string }> = { ...redisPings };
+    for (const [convId, notif] of Object.entries(dbNotifications)) {
+      if (!merged[convId]) {
+        merged[convId] = notif;
+      } else {
+        merged[convId] = {
+          count: Math.max(merged[convId].count, notif.count),
+          senderName: notif.senderName || merged[convId].senderName,
+        };
+      }
+    }
+
+    if (Object.keys(merged).length > 0) {
       socket.emit('PENDING_PINGS', {
         type: 'PENDING_PINGS',
-        payload: pendingPings,
+        payload: merged,
         timestamp: new Date(),
       });
+      // Nettoyer Redis (la DB est purgée via PATCH /notifications/read côté client)
       await redis.clearPendingPings(userId);
     }
   } catch { /* non bloquant */ }
@@ -1857,15 +1881,23 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
             timestamp: new Date(),
           });
         }
-        // Ping hors ligne (non bloquant)
+        // Ping hors ligne (non bloquant) — stocké en DB ET Redis pour persistance
         if (data.recipientId) {
           redis.isUserOnline(data.recipientId as string)
             .then((isOnline: boolean) => {
               if (!isOnline) {
+                const senderName = user.displayName || user.username;
+                // Redis (compat. legacy)
                 redis.addPendingPing(
                   data.recipientId as string,
                   conversationId,
-                  user.displayName || user.username,
+                  senderName,
+                ).catch(() => {});
+                // DB (persistance durable)
+                serviceProxy.messages.saveNotification(
+                  data.recipientId as string,
+                  conversationId,
+                  senderName,
                 ).catch(() => {});
               }
             }).catch(() => {});
@@ -3613,23 +3645,28 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     connectedClients.delete(socket.id);
     
     try {
-      // Mettre à jour le statut hors ligne
-      await redis.setUserOffline(userId);
+      // Mettre à jour le statut hors ligne (seulement si plus aucun socket actif)
+      await redis.setUserOffline(userId, socket.id);
       await redis.deleteSession(userId, sessionId);
       
-      // Notifier les amis (avec gestion d'erreur)
-      try {
-        const friends = await serviceProxy.friends.getFriends(userId);
-        broadcastPresenceUpdate(userId, 'offline', friends);
-      } catch (friendsError) {
-        logger.warn(`Impossible de notifier les amis pour ${userId}:`, friendsError);
+      // Notifier les amis seulement si l'utilisateur est vraiment offline
+      const stillOnline = await redis.isUserOnline(userId);
+      if (!stillOnline) {
+        try {
+          const friends = await serviceProxy.friends.getFriends(userId);
+          broadcastPresenceUpdate(userId, 'offline', friends);
+        } catch (friendsError) {
+          logger.warn(`Impossible de notifier les amis pour ${userId}:`, friendsError);
+        }
       }
       
-      // Mettre à jour last_seen
-      try {
-        await serviceProxy.users.updateLastSeen(userId);
-      } catch (updateError) {
-        logger.warn(`Impossible de mettre à jour last_seen pour ${userId}:`, updateError);
+      // Mettre à jour last_seen seulement quand vraiment déconnecté
+      if (!stillOnline) {
+        try {
+          await serviceProxy.users.updateLastSeen(userId);
+        } catch (updateError) {
+          logger.warn(`Impossible de mettre à jour last_seen pour ${userId}:`, updateError);
+        }
       }
     } catch (error) {
       logger.error(`Erreur lors de la déconnexion de ${userId}:`, error);

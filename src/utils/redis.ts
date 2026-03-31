@@ -33,13 +33,18 @@ export class RedisClient {
   }
 
   async setUserOnline(userId: string, socketId: string): Promise<void> {
-    await this.client.hset('online:users', userId, socketId);
+    await this.client.sadd(`user:sockets:${userId}`, socketId);
     await this.client.sadd('online:list', userId);
+    await this.client.hset('online:users', userId, socketId);
   }
 
-  async setUserOffline(userId: string): Promise<void> {
-    await this.client.hdel('online:users', userId);
-    await this.client.srem('online:list', userId);
+  async setUserOffline(userId: string, socketId: string): Promise<void> {
+    await this.client.srem(`user:sockets:${userId}`, socketId);
+    const remaining = await this.client.scard(`user:sockets:${userId}`);
+    if (remaining === 0) {
+      await this.client.hdel('online:users', userId);
+      await this.client.srem('online:list', userId);
+    }
   }
 
   async isUserOnline(userId: string): Promise<boolean> {

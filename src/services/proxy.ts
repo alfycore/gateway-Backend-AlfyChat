@@ -231,6 +231,17 @@ class MessagesProxy {
       body: JSON.stringify({ messages }),
     });
   }
+
+  async saveNotification(userId: string, conversationId: string, senderName: string) {
+    return fetchService(`${this.baseUrl}/notifications`, {
+      method: 'POST',
+      body: JSON.stringify({ userId, conversationId, senderName }),
+    });
+  }
+
+  async getNotifications(userId: string, token: string) {
+    return fetchService(`${this.baseUrl}/notifications`, { token });
+  }
 }
 
 // ============ FRIENDS PROXY ============
