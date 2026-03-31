@@ -55,6 +55,36 @@ export class RedisClient {
     return this.client.hget('online:users', userId);
   }
 
+  /** Stores the full presence status (online/idle/dnd/invisible) for a user. */
+  async setUserStatus(userId: string, status: string, customStatus?: string | null): Promise<void> {
+    await this.client.hset('user:status', userId, status);
+    if (customStatus !== undefined) {
+      if (customStatus === null) {
+        await this.client.hdel('user:customstatus', userId);
+      } else {
+        await this.client.hset('user:customstatus', userId, customStatus);
+      }
+    }
+  }
+
+  /** Returns the stored presence status for a user, falling back to online/offline from Redis. */
+  async getUserStatus(userId: string): Promise<{ status: string; customStatus: string | null }> {
+    const isOnline = await this.isUserOnline(userId);
+    if (!isOnline) return { status: 'offline', customStatus: null };
+    const status = (await this.client.hget('user:status', userId)) || 'online';
+    const customStatus = (await this.client.hget('user:customstatus', userId)) ?? null;
+    return { status, customStatus };
+  }
+
+  /** Returns presence info for multiple users at once. */
+  async getBulkPresence(userIds: string[]): Promise<Array<{ userId: string; status: string; customStatus: string | null }>> {
+    if (userIds.length === 0) return [];
+    return Promise.all(userIds.map(async (userId) => {
+      const { status, customStatus } = await this.getUserStatus(userId);
+      return { userId, status, customStatus };
+    }));
+  }
+
   async setSession(userId: string, sessionId: string, data: object, ttl = 86400): Promise<void> {
     const key = `session:${userId}:${sessionId}`;
     await this.client.setex(key, ttl, JSON.stringify(data));

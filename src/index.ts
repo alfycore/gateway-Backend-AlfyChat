@@ -1746,6 +1746,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   } catch { /* non bloquant */ }
 
+  // Stocker le statut en ligne dans Redis
+  await redis.setUserStatus(userId, 'online');
+
   // Notifier les amis de la connexion
   broadcastPresenceUpdate(userId, 'online', friends);
 
@@ -2885,6 +2888,20 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   });
 
+  // ── Présence en masse (DM list, liste d'amis) ──
+  socket.on('GET_BULK_PRESENCE', async (data: { userIds: string[] }, callback) => {
+    try {
+      if (!Array.isArray(data?.userIds) || data.userIds.length === 0) {
+        if (typeof callback === 'function') callback({ presence: [] });
+        return;
+      }
+      const presence = await redis.getBulkPresence(data.userIds);
+      if (typeof callback === 'function') callback({ presence });
+    } catch (error) {
+      if (typeof callback === 'function') callback({ presence: [] });
+    }
+  });
+
   // ── Membres via node ──
   socket.on('MEMBER_LIST', async (data, callback) => {
     try {
@@ -3280,6 +3297,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('PRESENCE_UPDATE', async (data) => {
     try {
       await serviceProxy.users.updateStatus(userId, data.status, data.customStatus);
+      await redis.setUserStatus(userId, data.status, data.customStatus ?? null);
       
       const friends = await serviceProxy.friends.getFriends(userId);
       broadcastPresenceUpdate(userId, data.status, friends, data.customStatus);
