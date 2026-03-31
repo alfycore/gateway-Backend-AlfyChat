@@ -1634,6 +1634,7 @@ function leaveVoiceChannel(userId: string, socket: AuthenticatedSocket) {
 
 io.on('connection', async (socket: AuthenticatedSocket) => {
   const { userId, sessionId, user } = socket;
+  const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
   
   if (!userId || !sessionId || !user) {
     socket.disconnect();
