@@ -98,25 +98,44 @@ class MonitoringDB {
           INDEX idx_service_type (service_type)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
-      // Migration : ajouter la colonne enabled si elle n'existe pas
+      // Table de migrations pour n'appliquer chaque migration qu'une seule fois
       await conn.execute(`
-        ALTER TABLE service_instances ADD COLUMN IF NOT EXISTS enabled TINYINT(1) NOT NULL DEFAULT 1
-      `).catch(() => {});
-
-      // Pré-enregistrement des instances de production
-      // INSERT IGNORE : ne touche pas aux lignes existantes (preserve enabled/endpoint modifiés par un admin)
-      await conn.execute(`
-        INSERT IGNORE INTO service_instances (id, service_type, endpoint, domain, location, enabled) VALUES
-          ('users-default',    'users',    'https://users.alfychat.eu',              'users.alfychat.eu',              'EU', 1),
-          ('users-eu-1',       'users',    'https://1.users.alfychat.eu',            '1.users.alfychat.eu',            'EU', 1),
-          ('messages-default', 'messages', 'https://messages.alfychat.eu',           'messages.alfychat.eu',           'EU', 1),
-          ('messages-eu-1',    'messages', 'https://1.messages.alfychat.eu',         '1.messages.alfychat.eu',         'EU', 1),
-          ('friends-default',  'friends',  'https://friends.s.backend.alfychat.app', 'friends.s.backend.alfychat.app', 'EU', 1),
-          ('calls-default',    'calls',    'https://calls.s.backend.alfychat.app',   'calls.s.backend.alfychat.app',   'EU', 1),
-          ('servers-default',  'servers',  'https://servers.s.backend.alfychat.app', 'servers.s.backend.alfychat.app', 'EU', 1),
-          ('bots-default',     'bots',     'https://bots.s.backend.alfychat.app',    'bots.s.backend.alfychat.app',    'EU', 1),
-          ('media-default',    'media',    'https://media.s.backend.alfychat.app',   'media.s.backend.alfychat.app',   'EU', 1)
+        CREATE TABLE IF NOT EXISTS gateway_migrations (
+          id         VARCHAR(64) NOT NULL PRIMARY KEY,
+          applied_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
       `);
+
+      // Migration m001 : ajouter la colonne enabled
+      const [m001] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM gateway_migrations WHERE id = 'm001-enabled-column'`
+      );
+      if (!(m001 as any[]).length) {
+        await conn.execute(`ALTER TABLE service_instances ADD COLUMN IF NOT EXISTS enabled TINYINT(1) NOT NULL DEFAULT 1`).catch(() => {});
+        await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m001-enabled-column')`);
+      }
+
+      // Migration m002 : remise à zéro — purge les IPs/localhost et réinitialise avec les domaines officiels
+      const [m002] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM gateway_migrations WHERE id = 'm002-domain-only-reset'`
+      );
+      if (!(m002 as any[]).length) {
+        await conn.execute(`DELETE FROM service_instances`);
+        await conn.execute(`
+          INSERT INTO service_instances (id, service_type, endpoint, domain, location, enabled) VALUES
+            ('users-default',    'users',    'https://users.alfychat.eu',              'users.alfychat.eu',              'EU', 1),
+            ('users-eu-1',       'users',    'https://1.users.alfychat.eu',            '1.users.alfychat.eu',            'EU', 1),
+            ('messages-default', 'messages', 'https://messages.alfychat.eu',           'messages.alfychat.eu',           'EU', 1),
+            ('messages-eu-1',    'messages', 'https://1.messages.alfychat.eu',         '1.messages.alfychat.eu',         'EU', 1),
+            ('friends-default',  'friends',  'https://friends.s.backend.alfychat.app', 'friends.s.backend.alfychat.app', 'EU', 1),
+            ('calls-default',    'calls',    'https://calls.s.backend.alfychat.app',   'calls.s.backend.alfychat.app',   'EU', 1),
+            ('servers-default',  'servers',  'https://servers.s.backend.alfychat.app', 'servers.s.backend.alfychat.app', 'EU', 1),
+            ('bots-default',     'bots',     'https://bots.s.backend.alfychat.app',    'bots.s.backend.alfychat.app',    'EU', 1),
+            ('media-default',    'media',    'https://media.s.backend.alfychat.app',   'media.s.backend.alfychat.app',   'EU', 1)
+        `);
+        await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m002-domain-only-reset')`);
+        logger.info('MonitoringDB: migration m002 — table service_instances réinitialisée avec les domaines officiels');
+      }
 
       await conn.execute(`
         CREATE TABLE IF NOT EXISTS service_monitoring (

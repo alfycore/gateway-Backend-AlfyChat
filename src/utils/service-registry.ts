@@ -46,8 +46,9 @@ const CLEANUP_INTERVAL_MS = 30_000;
 // Score par défaut quand les métriques sont nulles (service neuf)
 const DEFAULT_SCORE = 50;
 
-// Regex pour détecter les endpoints locaux
+// Regex pour détecter les endpoints locaux ou à base d'IP brute (non autorisés en production)
 const LOCAL_ENDPOINT_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
+const IP_ENDPOINT_RE    = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
 
 class ServiceRegistry {
   private instances = new Map<string, ServiceInstance>();
@@ -80,7 +81,7 @@ class ServiceRegistry {
       healthy: true,
       // Conserver l'état enabled existant si non fourni (évite d'écraser un disable admin)
       enabled: data.enabled !== undefined ? data.enabled : (existing?.enabled ?? true),
-      isLocal: LOCAL_ENDPOINT_RE.test(data.endpoint),
+      isLocal: LOCAL_ENDPOINT_RE.test(data.endpoint) || IP_ENDPOINT_RE.test(data.endpoint),
     };
 
     this.instances.set(data.id, instance);

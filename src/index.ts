@@ -149,12 +149,14 @@ const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret
  * Si le registre ne contient aucune instance saine, on utilise l'URL de fallback (env var).
  * Un endpoint localhost ne sera jamais préféré à un fallback HTTPS externe.
  */
+const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
+
 function getServiceUrl(serviceType: ServiceType, fallback: string): string {
   const best = serviceRegistry.selectBest(serviceType);
   if (!best) return fallback;
-  // Ne pas utiliser un endpoint localhost/127.0.0.1 quand le fallback est externe (HTTPS)
+  // Refuser les endpoints localhost ou IP brute → utiliser le fallback domaine
   const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(best.endpoint);
-  if (isLocalEndpoint && fallback.startsWith('https://')) return fallback;
+  if (isLocalEndpoint || IP_ENDPOINT_RE.test(best.endpoint)) return fallback;
   return best.endpoint;
 }
 
@@ -280,27 +282,15 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
     return res.status(403).json({ error: 'Instance non autorisée — seul un administrateur peut ajouter de nouveaux services' });
   }
 
-  // Auto-corriger les endpoints "localhost" quand l'appelant vient d'un IP externe.
-  // Si le service envoie endpoint=http://localhost:PORT mais que la requête arrive
-  // depuis un VPS distant, remplacer localhost par l'IP source réelle.
-  const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(String(endpoint));
-  const sourceIp = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
-    || req.socket?.remoteAddress || '';
-  const sourceIsExternal = sourceIp && sourceIp !== '127.0.0.1' && sourceIp !== '::1' && !sourceIp.startsWith('::ffff:127.');
-
-  let resolvedEndpoint = String(endpoint);
-  let resolvedDomain   = String(domain);
-
-  if (isLocalEndpoint && sourceIsExternal) {
-    // Garder le port mais remplacer localhost par l'IP source
-    const portMatch = String(endpoint).match(/:(\d+)\/?$/);
-    const port = portMatch ? portMatch[1] : '3000';
-    resolvedEndpoint = `http://${sourceIp}:${port}`;
-    resolvedDomain   = `${sourceIp}:${port}`;
-    logger.warn(
-      `ServiceRegistry: endpoint localhost corrigé → ${resolvedEndpoint} pour ${id} (source: ${sourceIp})`
-    );
+  // Rejeter les endpoints avec une adresse IP (seuls les noms de domaine sont acceptés)
+  const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
+  if (IP_ENDPOINT_RE.test(String(endpoint))) {
+    logger.warn(`ServiceRegistry: endpoint IP refusé pour "${id}" — (${endpoint}) — utilisez un nom de domaine`);
+    return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine (ex: service.alfychat.eu)' });
   }
+
+  const resolvedEndpoint = String(endpoint);
+  const resolvedDomain   = String(domain);
 
   const defaultMetrics = {
     ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100,
@@ -417,7 +407,7 @@ app.get('/api/admin/gateway/stats', async (req, res) => {
     res.json({
       bannedIPs,
       rateLimitStats,
-      config: { window: RATE_LIMIT_WINDOW, max: RATE_LIMIT_MAX },
+      config: { window: RATE_LIMIT_WINDOW, anon: RATE_LIMIT_ANON, user: RATE_LIMIT_USER, admin: RATE_LIMIT_ADMIN },
     });
   } catch (error) {
     logger.error('Erreur stats gateway:', error);
@@ -652,6 +642,11 @@ app.post('/api/admin/services', async (req, res) => {
   const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
   if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
     return res.status(400).json({ error: 'id, serviceType, endpoint, domain, location requis' });
+  }
+  // Rejeter les endpoints IP
+  const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
+  if (IP_ENDPOINT_RE.test(String(endpoint))) {
+    return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine' });
   }
   const instance = serviceRegistry.register({
     id: String(id),
