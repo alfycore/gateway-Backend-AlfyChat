@@ -240,9 +240,15 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 /**
  * Blacklist des instances désactivées/supprimées par un admin.
  * Chargée depuis la DB au démarrage + mise à jour en temps réel.
- * Bloque les ré-enregistrements automatiques.
  */
 const bannedServiceIds = new Set<string>();
+
+/**
+ * Whitelist des IDs autorisés à s'enregistrer.
+ * Seuls les IDs pré-enregistrés par un admin (via DB ou POST /api/admin/services) sont acceptés.
+ * Un service inconnu ne peut PAS s'auto-enregistrer.
+ */
+const allowedServiceIds = new Set<string>();
 
 /**
  * POST /api/internal/service/register
@@ -263,9 +269,15 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
     return res.status(400).json({ error: 'Paramètres manquants ou invalides (id, serviceType, endpoint, domain, location)' });
   }
 
-  // Rejeter les instances supprimées par un admin (jusqu'au redémarrage)
+  // Rejeter les instances bannies/désactivées par un admin
   if (bannedServiceIds.has(String(id))) {
-    return res.status(403).json({ error: 'Instance bannie — supprimée par un administrateur' });
+    return res.status(403).json({ error: 'Instance désactivée — contactez un administrateur' });
+  }
+
+  // Rejeter les IDs non pré-enregistrés par un admin (whitelist)
+  if (allowedServiceIds.size > 0 && !allowedServiceIds.has(String(id))) {
+    logger.warn(`ServiceRegistry: tentative d'enregistrement non autorisée — ID "${id}" non connu (${endpoint})`);
+    return res.status(403).json({ error: 'Instance non autorisée — seul un administrateur peut ajouter de nouveaux services' });
   }
 
   // Auto-corriger les endpoints "localhost" quand l'appelant vient d'un IP externe.
@@ -655,6 +667,9 @@ app.post('/api/admin/services', async (req, res) => {
     endpoint: String(endpoint), domain: String(domain),
     location: String(location).toUpperCase(),
   }).catch(() => {});
+  // Ajouter à la whitelist et retirer des blacklists
+  allowedServiceIds.add(String(id));
+  bannedServiceIds.delete(String(id));
   res.status(201).json({ success: true, instance });
 });
 
@@ -691,6 +706,7 @@ app.delete('/api/admin/services/:id', async (req, res) => {
   const removed = serviceRegistry.remove(decodedId);
   if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
   bannedServiceIds.add(decodedId);
+  allowedServiceIds.delete(decodedId);  // Retirer de la whitelist → plus jamais de ré-enregistrement
   logger.info(`ServiceRegistry: instance "${decodedId}" supprimée et bannie par un admin`);
   monitoringDB.removeServiceInstance(decodedId).catch(() => {});
   res.json({ success: true });
@@ -4070,8 +4086,6 @@ async function loadInstancesFromDB(): Promise<void> {
   if (rows.length > 0) {
     let loaded = 0;
     for (const row of rows) {
-      // Les instances désactivées sont chargées dans le registre (pour que l'admin les voie)
-      // mais elles ne recevront pas de trafic (enabled=false → ignorées par selectBest)
       serviceRegistry.register({
         id: row.id,
         serviceType: row.serviceType as ServiceType,
@@ -4081,7 +4095,8 @@ async function loadInstancesFromDB(): Promise<void> {
         metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 0, bandwidthUsage: 0, requestCount20min: 0 },
         enabled: row.enabled,
       });
-      // Ajouter les instances désactivées dans la blacklist mémoire (bloque le ré-enregistrement)
+      // Whitelist : tous les IDs en DB sont autorisés à heartbeater
+      allowedServiceIds.add(row.id);
       if (!row.enabled) bannedServiceIds.add(row.id);
       else loaded++;
     }
