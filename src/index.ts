@@ -46,8 +46,11 @@ app.use(helmet());
 // ============ RATE LIMITING & IP BAN (HTTP) ============
 let redis: RedisClient;
 
-const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW || '60'); // secondes
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '100'); // requêtes par fenêtre
+// Limites par rôle (requêtes par seconde)
+const RATE_LIMIT_ANON  = parseInt(process.env.RATE_LIMIT_ANON  || '20');   // non connecté
+const RATE_LIMIT_USER  = parseInt(process.env.RATE_LIMIT_USER  || '150');  // connecté
+const RATE_LIMIT_ADMIN = parseInt(process.env.RATE_LIMIT_ADMIN || '500');  // admin/modérateur
+const RATE_LIMIT_WINDOW = 1; // fenêtre d'1 seconde
 
 // Trusted reverse-proxy IPs (load balancer / nginx on same host or LAN)
 // Set TRUSTED_PROXIES env var as comma-separated CIDR list or exact IPs.
@@ -81,17 +84,38 @@ app.use(async (req, res, next) => {
   next();
 });
 
-// Middleware : rate limiting HTTP par IP
+// Middleware : rate limiting HTTP modulaire (anon / user / admin)
 app.use(async (req, res, next) => {
   if (!redis) return next();
   const ip = getClientIP(req);
   try {
-    const count = await redis.incrementRateLimit(ip, RATE_LIMIT_WINDOW);
-    res.setHeader('X-RateLimit-Limit', String(RATE_LIMIT_MAX));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, RATE_LIMIT_MAX - count)));
-    if (count > RATE_LIMIT_MAX) {
+    // Extraire le rôle depuis le JWT (sans vérification stricte — juste pour le throttle)
+    let rateLimitMax = RATE_LIMIT_ANON;
+    let rateLimitKey = `ratelimit:anon:${ip}`;
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.substring(7);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
+        const userId = decoded.userId || decoded.id;
+        const role: string = decoded.role || 'user';
+        if (userId) {
+          if (role === 'admin' || role === 'moderator') {
+            rateLimitMax = RATE_LIMIT_ADMIN;
+            rateLimitKey = `ratelimit:admin:${userId}`;
+          } else {
+            rateLimitMax = RATE_LIMIT_USER;
+            rateLimitKey = `ratelimit:user:${userId}`;
+          }
+        }
+      } catch { /* token invalide → rester sur la limite anon */ }
+    }
+    const count = await redis.incrementRateLimitWithKey(rateLimitKey, RATE_LIMIT_WINDOW);
+    res.setHeader('X-RateLimit-Limit', String(rateLimitMax));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, rateLimitMax - count)));
+    if (count > rateLimitMax) {
       await redis.incrementRateLimitBlocked();
-      logger.warn(`Rate limit HTTP dépassé: ${ip} (${count}/${RATE_LIMIT_MAX})`);
+      logger.warn(`Rate limit HTTP dépassé: ${rateLimitKey} (${count}/${rateLimitMax})`);
       return res.status(429).json({ error: 'Trop de requêtes, réessayez plus tard' });
     }
   } catch {
@@ -214,8 +238,9 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 // ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
 
 /**
- * Blacklist des instances supprimées par un admin.
- * Bloque les ré-enregistrements automatiques jusqu'au redémarrage du gateway.
+ * Blacklist des instances désactivées/supprimées par un admin.
+ * Chargée depuis la DB au démarrage + mise à jour en temps réel.
+ * Bloque les ré-enregistrements automatiques.
  */
 const bannedServiceIds = new Set<string>();
 
@@ -588,7 +613,7 @@ app.delete('/api/admin/status/incidents/:id', async (req, res) => {
 
 // ── Admin: service registry management ───────────────────────────────────────
 
-/** GET /api/admin/services — liste toutes les instances connues */
+/** GET /api/admin/services — liste toutes les instances connues (y compris désactivées) */
 app.get('/api/admin/services', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   const instances = serviceRegistry.getAll().map((i) => ({
@@ -598,17 +623,17 @@ app.get('/api/admin/services', async (req, res) => {
   res.json({ instances });
 });
 
-/** GET /api/admin/services/:type — instances d'un type donné */
+/** GET /api/admin/services/:type — instances d'un type donné (y compris désactivées) */
 app.get('/api/admin/services/:type', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
-  const instances = serviceRegistry.getInstances(req.params.type as ServiceType, true).map((i) => ({
+  const instances = serviceRegistry.getInstances(req.params.type as ServiceType, true, true).map((i) => ({
     ...i,
     score: serviceRegistry.computeScore(i),
   }));
   res.json({ instances });
 });
 
-/** POST /api/admin/services — ajoute manuellement une instance (sans métriques) */
+/** POST /api/admin/services — ajoute manuellement une instance */
 app.post('/api/admin/services', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   const { id, serviceType, endpoint, domain, location } = req.body ?? {};
@@ -623,25 +648,48 @@ app.post('/api/admin/services', async (req, res) => {
     domain: String(domain),
     location: String(location).toUpperCase(),
     metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100, bandwidthUsage: 0, requestCount20min: 0 },
+    enabled: true,
   });
-  // Persist to DB (non-blocking)
   monitoringDB.upsertServiceInstance({
-    id: String(id),
-    serviceType: String(serviceType),
-    endpoint: String(endpoint),
-    domain: String(domain),
+    id: String(id), serviceType: String(serviceType),
+    endpoint: String(endpoint), domain: String(domain),
     location: String(location).toUpperCase(),
   }).catch(() => {});
   res.status(201).json({ success: true, instance });
 });
 
-/** DELETE /api/admin/services/:id — retire une instance et la bannit jusqu'au redémarrage */
+/**
+ * PATCH /api/admin/services/:id — active ou désactive une instance (persiste en DB).
+ * Body: { enabled: boolean }
+ * Ne bannit pas → le service peut continuer à heartbeater mais ne reçoit plus de trafic.
+ */
+app.patch('/api/admin/services/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const decodedId = decodeURIComponent(req.params.id);
+  const { enabled } = req.body ?? {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'Le champ "enabled" (boolean) est requis' });
+  }
+  const ok = serviceRegistry.setEnabled(decodedId, enabled);
+  if (!ok) return res.status(404).json({ error: 'Instance introuvable' });
+  // Persister l'état en DB
+  monitoringDB.setInstanceEnabled(decodedId, enabled).catch(() => {});
+  // Synchroniser la blacklist mémoire
+  if (enabled) bannedServiceIds.delete(decodedId);
+  else bannedServiceIds.add(decodedId);
+  logger.info(`Admin: instance "${decodedId}" ${enabled ? 'activée' : 'désactivée'}`);
+  res.json({ success: true, enabled });
+});
+
+/**
+ * DELETE /api/admin/services/:id — supprime définitivement une instance.
+ * Ban en mémoire (jusqu'au prochain redémarrage du gateway) + suppression DB.
+ */
 app.delete('/api/admin/services/:id', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   const decodedId = decodeURIComponent(req.params.id);
   const removed = serviceRegistry.remove(decodedId);
   if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
-  // Blacklister l'ID pour empêcher le service de se ré-enregistrer automatiquement
   bannedServiceIds.add(decodedId);
   logger.info(`ServiceRegistry: instance "${decodedId}" supprimée et bannie par un admin`);
   monitoringDB.removeServiceInstance(decodedId).catch(() => {});
@@ -4020,7 +4068,10 @@ const PORT = process.env.PORT || 3000;
 async function loadInstancesFromDB(): Promise<void> {
   const rows = await monitoringDB.loadServiceInstances();
   if (rows.length > 0) {
+    let loaded = 0;
     for (const row of rows) {
+      // Les instances désactivées sont chargées dans le registre (pour que l'admin les voie)
+      // mais elles ne recevront pas de trafic (enabled=false → ignorées par selectBest)
       serviceRegistry.register({
         id: row.id,
         serviceType: row.serviceType as ServiceType,
@@ -4028,9 +4079,13 @@ async function loadInstancesFromDB(): Promise<void> {
         domain: row.domain,
         location: row.location,
         metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 0, bandwidthUsage: 0, requestCount20min: 0 },
+        enabled: row.enabled,
       });
+      // Ajouter les instances désactivées dans la blacklist mémoire (bloque le ré-enregistrement)
+      if (!row.enabled) bannedServiceIds.add(row.id);
+      else loaded++;
     }
-    logger.info(`ServiceRegistry: ${rows.length} instances chargées depuis la DB`);
+    logger.info(`ServiceRegistry: ${loaded} instances actives + ${rows.length - loaded} désactivées chargées depuis la DB`);
     return;
   }
 

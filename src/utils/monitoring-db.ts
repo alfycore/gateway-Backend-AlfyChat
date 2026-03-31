@@ -92,11 +92,16 @@ class MonitoringDB {
           endpoint     VARCHAR(512) NOT NULL,
           domain       VARCHAR(256) NOT NULL,
           location     VARCHAR(32)  NOT NULL DEFAULT 'EU',
+          enabled      TINYINT(1)   NOT NULL DEFAULT 1,
           created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           INDEX idx_service_type (service_type)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
+      // Migration : ajouter la colonne enabled si elle n'existe pas
+      await conn.execute(`
+        ALTER TABLE service_instances ADD COLUMN IF NOT EXISTS enabled TINYINT(1) NOT NULL DEFAULT 1
+      `).catch(() => {});
 
       // Pré-populer avec les instances de production si la table est vide
       await conn.execute(`
@@ -504,15 +509,15 @@ class MonitoringDB {
 
   // ── Service instances (registry persistant) ─────────────────────────────
 
-  /** Charge toutes les instances depuis la DB */
-  async loadServiceInstances(): Promise<{ id: string; serviceType: string; endpoint: string; domain: string; location: string }[]> {
+  /** Charge toutes les instances depuis la DB (y compris désactivées pour que l'admin les voie) */
+  async loadServiceInstances(): Promise<{ id: string; serviceType: string; endpoint: string; domain: string; location: string; enabled: boolean }[]> {
     if (!this.ready || !this.pool) return [];
     const conn = await this.pool.getConnection();
     try {
       const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-        `SELECT id, service_type AS serviceType, endpoint, domain, location FROM service_instances ORDER BY service_type, id`,
+        `SELECT id, service_type AS serviceType, endpoint, domain, location, enabled FROM service_instances ORDER BY service_type, id`,
       );
-      return rows as any[];
+      return (rows as any[]).map(r => ({ ...r, enabled: Boolean(r.enabled ?? 1) }));
     } catch (err) {
       logger.error('MonitoringDB: erreur loadServiceInstances', err);
       return [];
@@ -521,14 +526,31 @@ class MonitoringDB {
     }
   }
 
-  /** Crée ou met à jour une instance */
+  /** Vérifie si une instance est désactivée (bloque le ré-enregistrement automatique) */
+  async isInstanceDisabled(id: string): Promise<boolean> {
+    if (!this.ready || !this.pool) return false;
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT enabled FROM service_instances WHERE id = ?`, [id],
+      );
+      if ((rows as any[]).length === 0) return false;
+      return !Boolean((rows as any[])[0].enabled);
+    } catch {
+      return false;
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Crée ou met à jour une instance (ne touche pas au champ enabled si la ligne existe déjà) */
   async upsertServiceInstance(data: { id: string; serviceType: string; endpoint: string; domain: string; location: string }): Promise<void> {
     if (!this.ready || !this.pool) return;
     const conn = await this.pool.getConnection();
     try {
       await conn.execute(
-        `INSERT INTO service_instances (id, service_type, endpoint, domain, location)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO service_instances (id, service_type, endpoint, domain, location, enabled)
+         VALUES (?, ?, ?, ?, ?, 1)
          ON DUPLICATE KEY UPDATE
            service_type = VALUES(service_type),
            endpoint     = VALUES(endpoint),
@@ -544,7 +566,23 @@ class MonitoringDB {
     }
   }
 
-  /** Supprime une instance */
+  /** Active ou désactive une instance (persiste l'état) */
+  async setInstanceEnabled(id: string, enabled: boolean): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `UPDATE service_instances SET enabled = ?, updated_at = NOW() WHERE id = ?`,
+        [enabled ? 1 : 0, id],
+      );
+    } catch (err) {
+      logger.error('MonitoringDB: erreur setInstanceEnabled', err);
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Supprime une instance définitivement */
   async removeServiceInstance(id: string): Promise<void> {
     if (!this.ready || !this.pool) return;
     const conn = await this.pool.getConnection();

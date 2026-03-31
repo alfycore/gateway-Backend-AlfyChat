@@ -138,6 +138,12 @@ export class RedisClient {
     return count;
   }
 
+  async incrementRateLimitWithKey(key: string, windowSeconds: number): Promise<number> {
+    const count = await this.client.incr(key);
+    if (count === 1) await this.client.expire(key, windowSeconds);
+    return count;
+  }
+
   async getRateLimitCount(ip: string): Promise<number> {
     const val = await this.client.get(`ratelimit:${ip}`);
     return val ? parseInt(val) : 0;

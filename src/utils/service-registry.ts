@@ -34,6 +34,8 @@ export interface ServiceInstance {
   registeredAt: Date;
   metrics: ServiceMetrics;
   healthy: boolean;
+  enabled: boolean;         // activé/désactivé par un admin (persiste en DB)
+  isLocal: boolean;         // endpoint localhost/127.0.0.1 (priorité basse)
 }
 
 // Instance sans heartbeat → unhealthy après 90s
@@ -44,13 +46,15 @@ const CLEANUP_INTERVAL_MS = 30_000;
 // Score par défaut quand les métriques sont nulles (service neuf)
 const DEFAULT_SCORE = 50;
 
+// Regex pour détecter les endpoints locaux
+const LOCAL_ENDPOINT_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
+
 class ServiceRegistry {
   private instances = new Map<string, ServiceInstance>();
   private cleanupTimer: NodeJS.Timeout;
 
   constructor() {
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
-    // Éviter que ce timer bloque la fermeture du process
     if (this.cleanupTimer.unref) this.cleanupTimer.unref();
   }
 
@@ -64,6 +68,7 @@ class ServiceRegistry {
     domain: string;
     location: string;
     metrics: ServiceMetrics;
+    enabled?: boolean;
   }): ServiceInstance {
     const existing = this.instances.get(data.id);
     const now = new Date();
@@ -73,11 +78,14 @@ class ServiceRegistry {
       lastHeartbeat: now,
       registeredAt: existing?.registeredAt ?? now,
       healthy: true,
+      // Conserver l'état enabled existant si non fourni (évite d'écraser un disable admin)
+      enabled: data.enabled !== undefined ? data.enabled : (existing?.enabled ?? true),
+      isLocal: LOCAL_ENDPOINT_RE.test(data.endpoint),
     };
 
     this.instances.set(data.id, instance);
     logger.info(
-      `ServiceRegistry: instance enregistrée — ${data.id} (${data.serviceType}) @ ${data.endpoint} [${data.location}]`,
+      `ServiceRegistry: instance enregistrée — ${data.id} (${data.serviceType}) @ ${data.endpoint} [${data.location}]${instance.isLocal ? ' [LOCAL]' : ''}${!instance.enabled ? ' [DÉSACTIVÉE]' : ''}`,
     );
     return instance;
   }
@@ -100,46 +108,68 @@ class ServiceRegistry {
     return deleted;
   }
 
+  /** Active ou désactive une instance (sans la supprimer) */
+  setEnabled(id: string, enabled: boolean): boolean {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    instance.enabled = enabled;
+    logger.info(`ServiceRegistry: instance ${id} ${enabled ? 'activée' : 'désactivée'}`);
+    return true;
+  }
+
   // ── Sélection ──────────────────────────────────────────────────────────────
 
-  /** Retourne toutes les instances saines d'un type de service */
-  getInstances(serviceType: ServiceType, includeUnhealthy = false): ServiceInstance[] {
+  /** Retourne toutes les instances d'un type de service */
+  getInstances(serviceType: ServiceType, includeUnhealthy = false, includeDisabled = false): ServiceInstance[] {
     return [...this.instances.values()].filter(
-      (i) => i.serviceType === serviceType && (includeUnhealthy || i.healthy),
+      (i) =>
+        i.serviceType === serviceType &&
+        (includeUnhealthy || i.healthy) &&
+        (includeDisabled || i.enabled),
     );
   }
 
-  /** Sélectionne la meilleure instance (score le plus élevé = moins chargée) */
+  /**
+   * Sélectionne la meilleure instance disponible.
+   * Préfère les instances non-localhost aux instances locales.
+   */
   selectBest(serviceType: ServiceType): ServiceInstance | null {
     const candidates = this.getInstances(serviceType);
     if (candidates.length === 0) return null;
-    return this.pickBestFrom(candidates);
+
+    const remote = candidates.filter((i) => !i.isLocal);
+    return this.pickBestFrom(remote.length > 0 ? remote : candidates);
   }
 
   /**
    * Sélectionne la meilleure instance en préférant une région donnée.
+   * Préfère les instances non-localhost.
    * Fallback sur toutes les régions si aucune instance disponible dans la région demandée.
    */
   selectBestByLocation(serviceType: ServiceType, preferredLocation?: string): ServiceInstance | null {
     const candidates = this.getInstances(serviceType);
     if (candidates.length === 0) return null;
 
+    // Toujours préférer les instances non-localhost
+    const remote = candidates.filter((i) => !i.isLocal);
+    const pool = remote.length > 0 ? remote : candidates;
+
     if (preferredLocation) {
-      const inRegion = candidates.filter(
+      const inRegion = pool.filter(
         (i) => i.location.toUpperCase() === preferredLocation.toUpperCase(),
       );
       if (inRegion.length > 0) return this.pickBestFrom(inRegion);
     }
 
-    return this.pickBestFrom(candidates);
+    return this.pickBestFrom(pool);
   }
 
-  /** Trouve une instance par son ID (toutes régions, même unhealthy) */
+  /** Trouve une instance par son ID (toutes régions, même unhealthy/disabled) */
   getById(id: string): ServiceInstance | undefined {
     return this.instances.get(id);
   }
 
-  /** Retourne toutes les instances connues */
+  /** Retourne toutes les instances connues (y compris désactivées, pour l'admin) */
   getAll(): ServiceInstance[] {
     return [...this.instances.values()];
   }
@@ -158,7 +188,6 @@ class ServiceRegistry {
 
     const cpuScore = cpuMax > 0 ? Math.max(0, 1 - cpuUsage / cpuMax) : 0.5;
     const ramScore = ramMax > 0 ? Math.max(0, 1 - ramUsage / ramMax) : 0.5;
-    // Normalise sur 2000 requêtes/20min comme maximum raisonnable
     const reqScore = Math.max(0, 1 - Math.min(requestCount20min, 2000) / 2000);
 
     return (cpuScore * 40 + ramScore * 30 + reqScore * 30);
