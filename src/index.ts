@@ -1859,9 +1859,21 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       socket.join(`conversation:${conversationId}`);
       io.to(`conversation:${conversationId}`).emit('message:new', messageForClient);
 
-      // Filet de sécurité DM : router aussi directement vers le destinataire
+      // Filet de sécurité DM : envoyer à user:B UNIQUEMENT si le destinataire
+      // n'est PAS déjà dans la conversation room (évite le doublon car l'utilisateur
+      // rejoint toutes ses rooms DM au connect).
       if (data.recipientId) {
-        io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
+        const convRoom = io.sockets.adapter.rooms.get(`conversation:${conversationId}`);
+        const recipientUserRoom = io.sockets.adapter.rooms.get(`user:${data.recipientId}`);
+        let recipientAlreadyInConvRoom = false;
+        if (convRoom && recipientUserRoom) {
+          for (const sid of recipientUserRoom) {
+            if (convRoom.has(sid)) { recipientAlreadyInConvRoom = true; break; }
+          }
+        }
+        if (!recipientAlreadyInConvRoom) {
+          io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
+        }
       }
 
       // ── ÉTAPE 3 : Confirmer à l'expéditeur IMMÉDIATEMENT ──
