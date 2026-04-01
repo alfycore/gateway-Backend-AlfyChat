@@ -100,7 +100,10 @@ class MessagesProxy {
   constructor(private baseUrl: string) {}
 
   async getConversations(userId: string, token?: string) {
-    return fetchService<any[]>(`${this.baseUrl}/conversations?userId=${userId}`, { token });
+    return fetchService<any[]>(`${this.baseUrl}/conversations`, {
+      headers: { 'x-user-id': userId },
+      ...(token ? { token } : {}),
+    });
   }
 
   async isParticipant(conversationId: string, userId: string): Promise<boolean> {
