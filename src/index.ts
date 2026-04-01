@@ -2915,6 +2915,36 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   });
 
+  // ── État vocal d'un serveur (snapshot) ──
+  socket.on('GET_VOICE_STATE', (data: { serverId: string }, callback) => {
+    try {
+      if (!data?.serverId || typeof callback !== 'function') {
+        if (typeof callback === 'function') callback({ channels: [] });
+        return;
+      }
+      // Return all channels that belong to this server
+      const channels: Array<{ channelId: string; participants: any[] }> = [];
+      voiceChannels.forEach((participants, channelId) => {
+        const parts = Array.from(participants.values());
+        if (parts.length > 0 && parts[0].serverId === data.serverId) {
+          channels.push({
+            channelId,
+            participants: parts.map(p => ({
+              userId: p.userId,
+              username: p.username,
+              avatarUrl: p.avatarUrl,
+              muted: p.muted,
+              deafened: p.deafened,
+            })),
+          });
+        }
+      });
+      callback({ channels });
+    } catch {
+      if (typeof callback === 'function') callback({ channels: [] });
+    }
+  });
+
   // ── Membres via node ──
   socket.on('MEMBER_LIST', async (data, callback) => {
     try {
@@ -3325,12 +3355,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('PROFILE_UPDATE', async (data) => {
     try {
       const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
-      const updatedUser = await serviceProxy.users.updateProfile(userId, data, token);
+      const result = await serviceProxy.users.updateProfile(userId, data, token);
+      const updatedUser = (result as any)?.data || { userId, ...data };
 
       // Mettre à jour l'objet user local
       Object.assign(socket as AuthenticatedSocket, { user: { ...user, ...data } });
 
-      // Notifier le client
+      // Notifier le client avec le profil complet
       socket.emit('PROFILE_UPDATE', {
         type: 'PROFILE_UPDATE',
         payload: updatedUser,
