@@ -1681,6 +1681,26 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     console.error('Error joining DM rooms:', error);
   }
 
+  // Joindre automatiquement toutes les conversations de groupe de l'utilisateur
+  try {
+    const groupConversations = await serviceProxy.messages.getConversations(userId);
+    if (groupConversations && Array.isArray(groupConversations)) {
+      for (const conv of groupConversations) {
+        const convId = conv.id || conv.conversationId;
+        if (convId && !String(convId).startsWith('dm_')) {
+          socket.join(`conversation:${convId}`);
+        }
+      }
+      const groupCount = groupConversations.filter((c: any) => {
+        const cid = c.id || c.conversationId;
+        return cid && !String(cid).startsWith('dm_');
+      }).length;
+      if (groupCount > 0) logger.info(`${user.username} auto-joined ${groupCount} group conversation rooms`);
+    }
+  } catch (error) {
+    console.error('Error joining group conversation rooms:', error);
+  }
+
   // Joindre automatiquement tous les serveurs dont l'utilisateur est membre
   try {
     const userServers = await serviceProxy.servers.getUserServers(userId);
