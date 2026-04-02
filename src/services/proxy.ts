@@ -69,7 +69,7 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
     const breaker = getBreaker(url);
     return await breaker.fire(() => withRetry(doRequest)) as T;
   } catch (error) {
-    logger.error(`Fetch error for ${url}:`, error);
+    logger.error({ err: error }, `Fetch error for ${url}`);
     throw error;
   }
 }
