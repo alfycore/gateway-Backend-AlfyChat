@@ -2,7 +2,41 @@
 // ALFYCHAT - PROXY VERS LES MICROSERVICES
 // ==========================================
 
+import CircuitBreaker from 'opossum';
 import { logger } from '../utils/logger';
+
+// ── Circuit breakers — un par hostname ──────────────────────────────────────
+const _breakers = new Map<string, CircuitBreaker>();
+
+function getBreaker(url: string): CircuitBreaker {
+  let host: string;
+  try { host = new URL(url).host; } catch { host = url; }
+  if (!_breakers.has(host)) {
+    const action = (fn: () => Promise<unknown>) => fn();
+    const breaker = new CircuitBreaker(action, {
+      timeout: 10_000,               // 10 s max par appel
+      errorThresholdPercentage: 50,  // ouvre après 50 % d'erreurs
+      resetTimeout: 30_000,          // demi-ouverture après 30 s
+      volumeThreshold: 5,            // évalue après 5 requêtes minimum
+    });
+    breaker.on('open',     () => logger.warn(`Circuit OUVERT: ${host}`));
+    breaker.on('halfOpen', () => logger.info(`Circuit HALF-OPEN: ${host}`));
+    breaker.on('close',    () => logger.info(`Circuit FERMÉ: ${host}`));
+    _breakers.set(host, breaker);
+  }
+  return _breakers.get(host)!;
+}
+
+// ── Retry exponentiel (2 tentatives, backoff x2) ────────────────────────────
+async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 300): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (retries <= 0) throw error;
+    await new Promise(r => setTimeout(r, delayMs));
+    return withRetry(fn, retries - 1, delayMs * 2);
+  }
+}
 
 interface ServiceUrls {
   users: string;
@@ -14,8 +48,9 @@ interface ServiceUrls {
 }
 
 async function fetchService<T = unknown>(url: string, options?: RequestInit & { token?: string }): Promise<T> {
-  try {
-    const { token, ...fetchOptions } = options || {};
+  const { token, ...fetchOptions } = options || {};
+
+  const doRequest = async (): Promise<T> => {
     const response = await fetch(url, {
       ...fetchOptions,
       headers: {
@@ -24,12 +59,15 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
         ...fetchOptions?.headers,
       },
     });
-
     if (!response.ok) {
       throw new Error(`Service error: ${response.status} ${response.statusText}`);
     }
-
     return response.json() as Promise<T>;
+  };
+
+  try {
+    const breaker = getBreaker(url);
+    return await breaker.fire(() => withRetry(doRequest)) as T;
   } catch (error) {
     logger.error(`Fetch error for ${url}:`, error);
     throw error;

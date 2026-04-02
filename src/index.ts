@@ -17,6 +17,8 @@ import { RedisClient } from './utils/redis';
 import { ServiceProxy } from './services/proxy';
 import { monitoringDB } from './utils/monitoring-db';
 import { serviceRegistry, ServiceType } from './utils/service-registry';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { RateLimiterRedis } from 'rate-limiter-flexible';
 
 dotenv.config();
 
@@ -52,6 +54,11 @@ const RATE_LIMIT_USER  = parseInt(process.env.RATE_LIMIT_USER  || '150');  // co
 const RATE_LIMIT_ADMIN = parseInt(process.env.RATE_LIMIT_ADMIN || '500');  // admin/modérateur
 const RATE_LIMIT_WINDOW = 1; // fenêtre d'1 seconde
 
+// Limiters rate-limiter-flexible (initialisés après connexion Redis)
+let _rlAnon:  RateLimiterRedis | null = null;
+let _rlUser:  RateLimiterRedis | null = null;
+let _rlAdmin: RateLimiterRedis | null = null;
+
 // Trusted reverse-proxy IPs (load balancer / nginx on same host or LAN)
 // Set TRUSTED_PROXIES env var as comma-separated CIDR list or exact IPs.
 // When empty, we always use the direct socket address.
@@ -84,44 +91,44 @@ app.use(async (req, res, next) => {
   next();
 });
 
-// Middleware : rate limiting HTTP modulaire (anon / user / admin)
+// Middleware : rate limiting HTTP modulaire (anon / user / admin) — rate-limiter-flexible
 app.use(async (req, res, next) => {
-  if (!redis) return next();
+  if (!_rlAnon) return next(); // attend l'init Redis
   const ip = getClientIP(req);
-  try {
-    // Extraire le rôle depuis le JWT (sans vérification stricte — juste pour le throttle)
-    let rateLimitMax = RATE_LIMIT_ANON;
-    let rateLimitKey = `ratelimit:anon:${ip}`;
-    const authHeader = req.headers.authorization;
-    if (authHeader?.startsWith('Bearer ')) {
-      try {
-        const token = authHeader.substring(7);
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
-        const userId = decoded.userId || decoded.id;
-        const role: string = decoded.role || 'user';
-        if (userId) {
-          if (role === 'admin' || role === 'moderator') {
-            rateLimitMax = RATE_LIMIT_ADMIN;
-            rateLimitKey = `ratelimit:admin:${userId}`;
-          } else {
-            rateLimitMax = RATE_LIMIT_USER;
-            rateLimitKey = `ratelimit:user:${userId}`;
-          }
+  let limiter = _rlAnon;
+  let limitMax = RATE_LIMIT_ANON;
+  let key = ip;
+  const authHeader = req.headers.authorization;
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const token = authHeader.substring(7);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
+      const userId = decoded.userId || decoded.id;
+      const role: string = decoded.role || 'user';
+      if (userId) {
+        key = userId;
+        if (role === 'admin' || role === 'moderator') {
+          limiter = _rlAdmin!;
+          limitMax = RATE_LIMIT_ADMIN;
+        } else {
+          limiter = _rlUser!;
+          limitMax = RATE_LIMIT_USER;
         }
-      } catch { /* token invalide → rester sur la limite anon */ }
-    }
-    const count = await redis.incrementRateLimitWithKey(rateLimitKey, RATE_LIMIT_WINDOW);
-    res.setHeader('X-RateLimit-Limit', String(rateLimitMax));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, rateLimitMax - count)));
-    if (count > rateLimitMax) {
-      await redis.incrementRateLimitBlocked();
-      logger.warn(`Rate limit HTTP dépassé: ${rateLimitKey} (${count}/${rateLimitMax})`);
-      return res.status(429).json({ error: 'Trop de requêtes, réessayez plus tard' });
-    }
-  } catch {
-    // En cas d'erreur Redis, laisser passer
+      }
+    } catch { /* token invalide → rester sur la limite anon */ }
   }
-  next();
+  try {
+    const result = await limiter.consume(key);
+    res.setHeader('X-RateLimit-Limit', String(limitMax));
+    res.setHeader('X-RateLimit-Remaining', String(result.remainingPoints));
+    next();
+  } catch (rateLimitRes: any) {
+    redis?.incrementRateLimitBlocked().catch(() => {});
+    logger.warn(`Rate limit HTTP dépassé: ${key}`);
+    const retryAfter = rateLimitRes?.msBeforeNext ? Math.ceil(rateLimitRes.msBeforeNext / 1000) : 1;
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Trop de requêtes, réessayez plus tard' });
+  }
 });
 
 // Ne pas parser le JSON sur /api/media/* (multipart/form-data) ni les uploads multipart vers les nodes
@@ -1415,6 +1422,18 @@ redis = new RedisClient({
   port: parseInt(process.env.REDIS_PORT || '6379'),
   password: process.env.REDIS_PASSWORD,
 });
+
+// Adaptateur Redis pour Socket.IO (scaling multi-instances)
+const _ioRedisPub = redis.getRawClient();
+const _ioRedisSub = _ioRedisPub.duplicate();
+io.adapter(createAdapter(_ioRedisPub, _ioRedisSub));
+logger.info('Socket.IO: Redis adapter initialisé (multi-instances)');
+
+// Initialisation des rate limiters (rate-limiter-flexible + Redis sliding window)
+_rlAnon  = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_anon',  points: RATE_LIMIT_ANON,  duration: RATE_LIMIT_WINDOW });
+_rlUser  = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_user',  points: RATE_LIMIT_USER,  duration: RATE_LIMIT_WINDOW });
+_rlAdmin = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_admin', points: RATE_LIMIT_ADMIN, duration: RATE_LIMIT_WINDOW });
+logger.info('Rate limiters initialisés (rate-limiter-flexible)');
 
 // Proxy vers les microservices
 const serviceProxy = new ServiceProxy({

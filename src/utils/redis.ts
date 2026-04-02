@@ -239,4 +239,9 @@ export class RedisClient {
     await this.subscriber.quit();
     await this.publisher.quit();
   }
+
+  /** Expose le client ioredis brut (nécessaire pour rate-limiter-flexible et redis-adapter). */
+  getRawClient(): Redis {
+    return this.client;
+  }
 }
