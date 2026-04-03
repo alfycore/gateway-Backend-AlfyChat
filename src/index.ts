@@ -1913,6 +1913,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         if (!recipientAlreadyInConvRoom) {
           io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
         }
+
+        // Filet de sécurité SENDER : envoyer à tous les autres appareils de l'expéditeur
+        // (ex: mobile connecté avec le même compte) s'ils ne sont pas déjà dans la room.
+        const senderUserRoom = io.sockets.adapter.rooms.get(`user:${userId}`);
+        if (senderUserRoom) {
+          for (const sid of senderUserRoom) {
+            if (sid !== socket.id && !convRoom?.has(sid)) {
+              io.to(sid).emit('message:new', messageForClient);
+            }
+          }
+        }
       }
 
       // ── ÉTAPE 3 : Confirmer à l'expéditeur IMMÉDIATEMENT ──
