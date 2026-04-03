@@ -29,7 +29,7 @@ export class RedisClient {
     this.publisher = new Redis(options);
 
     this.client.on('connect', () => logger.info('Redis client connecté'));
-    this.client.on('error', (err) => logger.error('Redis error:', err));
+    this.client.on('error', (err) => logger.error({ err: err }, 'Redis error:'));
   }
 
   async setUserOnline(userId: string, socketId: string): Promise<void> {

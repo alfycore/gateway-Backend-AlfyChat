@@ -212,7 +212,7 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
       if (!text) {
         res.status(response.status).json({ success: response.ok });
       } else {
-        logger.error(`Service ${targetUrl} retourne du non-JSON:`, text);
+        logger.error({ err: text }, `Service ${targetUrl} retourne du non-JSON:`);
         res.status(response.status).json({ error: 'Service non disponible' });
       }
     }
@@ -229,10 +229,10 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
         const response = await doFetch(fallbackUrl);
         return sendResponse(response);
       } catch (fallbackError) {
-        logger.error(`Proxy fallback ${fallbackUrl} aussi échoué:`, fallbackError);
+        logger.error({ err: fallbackError }, `Proxy fallback ${fallbackUrl} aussi échoué:`);
       }
     } else {
-      logger.error('Erreur proxy:', primaryError);
+      logger.error({ err: primaryError }, 'Erreur proxy:');
     }
     res.status(502).json({ error: 'Service indisponible' });
   }
@@ -417,7 +417,7 @@ app.get('/api/admin/gateway/stats', async (req, res) => {
       config: { window: RATE_LIMIT_WINDOW, anon: RATE_LIMIT_ANON, user: RATE_LIMIT_USER, admin: RATE_LIMIT_ADMIN },
     });
   } catch (error) {
-    logger.error('Erreur stats gateway:', error);
+    logger.error({ err: error }, 'Erreur stats gateway:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -441,7 +441,7 @@ app.post('/api/admin/gateway/ban-ip', async (req, res) => {
     logger.info(`IP bannie: ${ip} par ${userId} — raison: ${reason || 'non spécifiée'}`);
     res.json({ success: true });
   } catch (error) {
-    logger.error('Erreur ban IP:', error);
+    logger.error({ err: error }, 'Erreur ban IP:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -464,7 +464,7 @@ app.delete('/api/admin/gateway/ban-ip/:ip', async (req, res) => {
     logger.info(`IP débannie: ${ip} par ${userId}`);
     res.json({ success: true });
   } catch (error) {
-    logger.error('Erreur unban IP:', error);
+    logger.error({ err: error }, 'Erreur unban IP:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -488,7 +488,7 @@ app.get('/api/admin/monitoring', async (req, res) => {
       checkedAt: new Date(),
     });
   } catch (err) {
-    logger.error('Erreur /api/admin/monitoring:', err);
+    logger.error({ err: err }, 'Erreur /api/admin/monitoring:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -501,7 +501,7 @@ app.get('/api/admin/monitoring/service/:name', async (req, res) => {
     const history = await monitoringDB.getServiceHistory(req.params.name, hours);
     res.json({ service: req.params.name, hours, history });
   } catch (err) {
-    logger.error('Erreur /api/admin/monitoring/service:', err);
+    logger.error({ err: err }, 'Erreur /api/admin/monitoring/service:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -517,7 +517,7 @@ app.get('/api/admin/monitoring/users/chart', async (req, res) => {
     const data = await monitoringDB.getUserStatsAggregated(period as any);
     res.json({ period, data });
   } catch (err) {
-    logger.error('Erreur /api/admin/monitoring/users/chart:', err);
+    logger.error({ err: err }, 'Erreur /api/admin/monitoring/users/chart:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -553,7 +553,7 @@ app.get('/api/status', async (_req, res) => {
 
     res.json({ services: latestStatuses, incidents: activeIncidents, uptime: uptimeByService, instances: publicInstances });
   } catch (err) {
-    logger.error('Erreur /api/status:', err);
+    logger.error({ err: err }, 'Erreur /api/status:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -568,7 +568,7 @@ app.get('/api/admin/status/incidents', async (req, res) => {
     const incidents = await monitoringDB.getIncidents(includeResolved);
     res.json({ incidents });
   } catch (err) {
-    logger.error('Erreur GET /api/admin/status/incidents:', err);
+    logger.error({ err: err }, 'Erreur GET /api/admin/status/incidents:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -584,7 +584,7 @@ app.post('/api/admin/status/incidents', async (req, res) => {
     if (!id) return res.status(500).json({ error: 'Erreur création incident' });
     res.status(201).json({ id });
   } catch (err) {
-    logger.error('Erreur POST /api/admin/status/incidents:', err);
+    logger.error({ err: err }, 'Erreur POST /api/admin/status/incidents:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -600,7 +600,7 @@ app.patch('/api/admin/status/incidents/:id', async (req, res) => {
     if (!ok) return res.status(500).json({ error: 'Erreur mise à jour' });
     res.json({ success: true });
   } catch (err) {
-    logger.error('Erreur PATCH /api/admin/status/incidents:', err);
+    logger.error({ err: err }, 'Erreur PATCH /api/admin/status/incidents:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -615,7 +615,7 @@ app.delete('/api/admin/status/incidents/:id', async (req, res) => {
     if (!ok) return res.status(500).json({ error: 'Erreur suppression' });
     res.json({ success: true });
   } catch (err) {
-    logger.error('Erreur DELETE /api/admin/status/incidents:', err);
+    logger.error({ err: err }, 'Erreur DELETE /api/admin/status/incidents:');
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -757,7 +757,7 @@ app.post('/api/friends/request', async (req, res) => {
       });
     }
   } catch (error) {
-    logger.error('Erreur envoi demande ami:', error);
+    logger.error({ err: error }, 'Erreur envoi demande ami:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
@@ -785,7 +785,7 @@ app.post('/api/friends/requests/:requestId/accept', async (req, res) => {
       if (toUserId) io.to(`user:${toUserId}`).emit('FRIEND_ACCEPT', { type: 'FRIEND_ACCEPT', payload: data, timestamp: new Date() });
     }
   } catch (error) {
-    logger.error('Erreur accept ami:', error);
+    logger.error({ err: error }, 'Erreur accept ami:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
@@ -812,7 +812,7 @@ app.get('/api/friends', async (req, res) => {
     const data = await safeJson(response);
     res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
   } catch (error) {
-    logger.error('Erreur getFriends:', error);
+    logger.error({ err: error }, 'Erreur getFriends:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
@@ -836,7 +836,7 @@ app.get('/api/friends/requests', async (req, res) => {
       : (data ?? { error: 'Erreur service' });
     res.status(response.status).json(normalized);
   } catch (error) {
-    logger.error('Erreur getFriendRequests:', error);
+    logger.error({ err: error }, 'Erreur getFriendRequests:');
     res.status(502).json({ received: [], sent: [] });
   }
 });
@@ -856,7 +856,7 @@ app.get('/api/friends/blocked', async (req, res) => {
     const data = await safeJson(response);
     res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
   } catch (error) {
-    logger.error('Erreur getBlockedUsers:', error);
+    logger.error({ err: error }, 'Erreur getBlockedUsers:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
@@ -883,7 +883,7 @@ app.delete('/api/friends/:friendId', async (req, res) => {
     }
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
-    logger.error('Erreur removeFriend:', error);
+    logger.error({ err: error }, 'Erreur removeFriend:');
     res.status(502).json({ success: false, error: 'Service indisponible' });
   }
 });
@@ -906,7 +906,7 @@ app.post('/api/friends/:targetId/block', async (req, res) => {
     const data = await safeJson(response);
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
-    logger.error('Erreur blockUser:', error);
+    logger.error({ err: error }, 'Erreur blockUser:');
     res.status(502).json({ success: false, error: 'Service indisponible' });
   }
 });
@@ -929,7 +929,7 @@ app.post('/api/friends/:targetId/unblock', async (req, res) => {
     const data = await safeJson(response);
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
-    logger.error('Erreur unblockUser:', error);
+    logger.error({ err: error }, 'Erreur unblockUser:');
     res.status(502).json({ success: false, error: 'Service indisponible' });
   }
 });
@@ -952,7 +952,7 @@ app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
     const data = await safeJson(response) ?? {};
     res.status(response.status).json({ success: response.ok, ...(data as object) });
   } catch (error) {
-    logger.error('Erreur declineFriendRequest:', error);
+    logger.error({ err: error }, 'Erreur declineFriendRequest:');
     res.status(502).json({ success: false, error: 'Service indisponible' });
   }
 });
@@ -1016,7 +1016,7 @@ app.get('/api/servers', async (req, res) => {
 
     res.json(enriched);
   } catch (error) {
-    logger.error('Erreur proxy GET /api/servers:', error);
+    logger.error({ err: error }, 'Erreur proxy GET /api/servers:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
@@ -1065,7 +1065,7 @@ async function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.
       res.status(response.status).json({ error: 'Node non disponible' });
     }
   } catch (error) {
-    logger.error('Erreur proxy node:', error);
+    logger.error({ err: error }, 'Erreur proxy node:');
     res.status(502).json({ error: 'Server node indisponible' });
   }
 }
@@ -1105,12 +1105,12 @@ async function proxyToNodeMultipart(nodeEndpoint: string, nodePath: string, req:
           res.status(response.status).send(text);
         }
       } catch (error) {
-        logger.error('Erreur proxy node multipart:', error);
+        logger.error({ err: error }, 'Erreur proxy node multipart:');
         res.status(502).json({ error: 'Server node indisponible' });
       }
     });
   } catch (error) {
-    logger.error('Erreur proxy node multipart:', error);
+    logger.error({ err: error }, 'Erreur proxy node multipart:');
     res.status(502).json({ error: 'Server node indisponible' });
   }
 }
@@ -1154,12 +1154,12 @@ async function proxyMultipartToService(targetUrl: string, targetPath: string, re
         const data = await response.json() as any;
         res.status(response.status).json(data);
       } catch (err) {
-        logger.error('Erreur proxy multipart service:', err);
+        logger.error({ err: err }, 'Erreur proxy multipart service:');
         res.status(502).json({ error: 'Service indisponible' });
       }
     });
   } catch (err) {
-    logger.error('Erreur proxy multipart service:', err);
+    logger.error({ err: err }, 'Erreur proxy multipart service:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 }
@@ -1299,12 +1299,12 @@ async function proxyToMedia(targetEndpoint: string, mediaPath: string, req: expr
           res.status(response.status).send(await response.text());
         }
       } catch (err) {
-        logger.error('Erreur proxy média:', err);
+        logger.error({ err: err }, 'Erreur proxy média:');
         res.status(502).json({ error: 'Service média indisponible' });
       }
     });
   } catch (err) {
-    logger.error('Erreur proxy média:', err);
+    logger.error({ err: err }, 'Erreur proxy média:');
     res.status(502).json({ error: 'Service média indisponible' });
   }
 }
@@ -1344,7 +1344,7 @@ app.get('/api/media/:location/:serviceId/:folder/:filename', async (req, res) =>
     if (cacheControl) res.setHeader('Cache-Control', cacheControl);
     res.send(Buffer.from(await response.arrayBuffer()));
   } catch (err) {
-    logger.error('Erreur download média:', err);
+    logger.error({ err: err }, 'Erreur download média:');
     res.status(502).json({ error: 'Service média indisponible' });
   }
 });
@@ -1399,7 +1399,7 @@ app.get('/uploads/*', async (req, res) => {
     const buffer = Buffer.from(await response.arrayBuffer());
     res.send(buffer);
   } catch (error) {
-    logger.error('Erreur proxy uploads:', error);
+    logger.error({ err: error }, 'Erreur proxy uploads:');
     res.status(502).json({ error: 'Service média indisponible' });
   }
 });
@@ -1602,7 +1602,7 @@ async function checkServerPermission(
     // 6. Check required bits
     return (combinedPerms & requiredPerms) === requiredPerms;
   } catch (err) {
-    logger.warn('checkServerPermission error:', err);
+    logger.warn({ err: err }, 'checkServerPermission error:');
     return false;
   }
 }
@@ -2226,7 +2226,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         try {
           await serviceProxy.messages.cacheArchivedMessages(messages);
         } catch (e) {
-          logger.warn('Erreur cache messages archivés:', e);
+          logger.warn({ err: e }, 'Erreur cache messages archivés:');
         }
       }
 
@@ -2492,7 +2492,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       });
       logger.info(`${userId} rejoint la room call:${callId} après reconnexion`);
     } catch (error) {
-      logger.warn('CALL_REJOIN error:', error);
+      logger.warn({ err: error }, 'CALL_REJOIN error:');
     }
   });
 
@@ -3231,7 +3231,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       });
       logger.info(`SERVER_OWNER_JOINED broadcasted pour serveur ${serverId} par owner ${userId}`);
     } catch (error) {
-      logger.warn('SERVER_OWNER_JOINED error:', error);
+      logger.warn({ err: error }, 'SERVER_OWNER_JOINED error:');
     }
   });
 
@@ -3429,7 +3429,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           });
         }
       } catch (e) {
-        logger.warn('Erreur notification profil amis:', e);
+        logger.warn({ err: e }, 'Erreur notification profil amis:');
       }
     } catch (error) {
       emitError(socket, 'PROFILE_UPDATE_ERROR', error);
@@ -3768,7 +3768,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           const friends = await serviceProxy.friends.getFriends(userId);
           broadcastPresenceUpdate(userId, 'offline', friends);
         } catch (friendsError) {
-          logger.warn(`Impossible de notifier les amis pour ${userId}:`, friendsError);
+          logger.warn({ err: friendsError }, `Impossible de notifier les amis pour ${userId}:`);
         }
       }
       
@@ -3777,11 +3777,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         try {
           await serviceProxy.users.updateLastSeen(userId);
         } catch (updateError) {
-          logger.warn(`Impossible de mettre à jour last_seen pour ${userId}:`, updateError);
+          logger.warn({ err: updateError }, `Impossible de mettre à jour last_seen pour ${userId}:`);
         }
       }
     } catch (error) {
-      logger.error(`Erreur lors de la déconnexion de ${userId}:`, error);
+      logger.error({ err: error }, `Erreur lors de la déconnexion de ${userId}:`);
     }
   });
 });
@@ -3811,7 +3811,7 @@ serverNodesNs.use(async (socket, next) => {
     (socket as any).serverId = serverId;
     next();
   } catch (err: any) {
-    logger.error('Erreur authentification server-node:', err?.message || err);
+    logger.error({ err: err?.message || err }, 'Erreur authentification server-node:');
     next(new Error(`Authentification server-node échouée: ${err?.message || 'erreur inconnue'}`));
   }
 });
@@ -4283,9 +4283,9 @@ httpServer.listen(PORT, async () => {
   await monitoringDB.init();
   await loadInstancesFromDB();
   // First cycle immediately, then every MONITORING_INTERVAL_MS
-  runMonitoringCycle().catch((err) => logger.error('Monitoring cycle error:', err));
+  runMonitoringCycle().catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
   setInterval(() => {
-    runMonitoringCycle().catch((err) => logger.error('Monitoring cycle error:', err));
+    runMonitoringCycle().catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
     // Prune data older than 30 days every 24h
   }, MONITORING_INTERVAL_MS);
   // Daily prune at startup + every 24h

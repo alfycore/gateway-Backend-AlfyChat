@@ -191,7 +191,7 @@ class MonitoringDB {
         );
       }
     } catch (err) {
-      logger.error('MonitoringDB: erreur saveServiceSnapshot', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur saveServiceSnapshot');
     } finally {
       conn.release();
     }
@@ -206,7 +206,7 @@ class MonitoringDB {
         [connectedUsers],
       );
     } catch (err) {
-      logger.error('MonitoringDB: erreur saveUserStats', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur saveUserStats');
     } finally {
       conn.release();
     }
@@ -391,7 +391,7 @@ class MonitoringDB {
         [days],
       );
     } catch (err) {
-      logger.error('MonitoringDB: erreur prune', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur prune');
     } finally {
       conn.release();
     }
@@ -410,7 +410,7 @@ class MonitoringDB {
       );
       return rows as Incident[];
     } catch (err) {
-      logger.error('MonitoringDB: erreur getIncidents', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur getIncidents');
       return [];
     } finally {
       conn.release();
@@ -442,7 +442,7 @@ class MonitoringDB {
       );
       return result.insertId;
     } catch (err) {
-      logger.error('MonitoringDB: erreur createIncident', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur createIncident');
       return null;
     } finally {
       conn.release();
@@ -476,7 +476,7 @@ class MonitoringDB {
       await conn.execute(`UPDATE status_incidents SET ${fields.join(', ')} WHERE id = ?`, values);
       return true;
     } catch (err) {
-      logger.error('MonitoringDB: erreur updateIncident', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur updateIncident');
       return false;
     } finally {
       conn.release();
@@ -490,7 +490,7 @@ class MonitoringDB {
       await conn.execute(`DELETE FROM status_incidents WHERE id = ?`, [id]);
       return true;
     } catch (err) {
-      logger.error('MonitoringDB: erreur deleteIncident', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur deleteIncident');
       return false;
     } finally {
       conn.release();
@@ -522,7 +522,7 @@ class MonitoringDB {
         down_checks: Number(r.down_checks) || 0,
       }));
     } catch (err) {
-      logger.error('MonitoringDB: erreur getServiceUptimeDaily', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur getServiceUptimeDaily');
       return [];
     } finally {
       conn.release();
@@ -541,7 +541,7 @@ class MonitoringDB {
       );
       return (rows as any[]).map(r => ({ ...r, enabled: Boolean(r.enabled ?? 1) }));
     } catch (err) {
-      logger.error('MonitoringDB: erreur loadServiceInstances', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur loadServiceInstances');
       return [];
     } finally {
       conn.release();
@@ -582,7 +582,7 @@ class MonitoringDB {
         [data.id, data.serviceType, data.endpoint, data.domain, data.location.toUpperCase()],
       );
     } catch (err) {
-      logger.error('MonitoringDB: erreur upsertServiceInstance', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur upsertServiceInstance');
     } finally {
       conn.release();
     }
@@ -598,7 +598,7 @@ class MonitoringDB {
         [enabled ? 1 : 0, id],
       );
     } catch (err) {
-      logger.error('MonitoringDB: erreur setInstanceEnabled', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur setInstanceEnabled');
     } finally {
       conn.release();
     }
@@ -611,7 +611,7 @@ class MonitoringDB {
     try {
       await conn.execute(`DELETE FROM service_instances WHERE id = ?`, [id]);
     } catch (err) {
-      logger.error('MonitoringDB: erreur removeServiceInstance', err);
+      logger.error({ err: err }, 'MonitoringDB: erreur removeServiceInstance');
     } finally {
       conn.release();
     }
