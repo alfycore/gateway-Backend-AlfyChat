@@ -6,9 +6,9 @@ import CircuitBreaker from 'opossum';
 import { logger } from '../utils/logger';
 
 // ── Circuit breakers — un par hostname ──────────────────────────────────────
-const _breakers = new Map<string, CircuitBreaker>();
+const _breakers = new Map<string, InstanceType<typeof CircuitBreaker>>();
 
-function getBreaker(url: string): CircuitBreaker {
+function getBreaker(url: string): InstanceType<typeof CircuitBreaker> {
   let host: string;
   try { host = new URL(url).host; } catch { host = url; }
   if (!_breakers.has(host)) {

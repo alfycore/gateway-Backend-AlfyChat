@@ -77,7 +77,7 @@ class MonitoringDB {
       this.ready = true;
       logger.info('MonitoringDB: connecté et tables prêtes');
     } catch (err) {
-      logger.error('MonitoringDB: erreur d\'initialisation', err);
+      logger.error({ err }, 'MonitoringDB: erreur d\'initialisation');
     }
   }
 

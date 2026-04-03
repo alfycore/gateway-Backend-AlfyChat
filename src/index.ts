@@ -1485,7 +1485,7 @@ io.use(async (socket: AuthenticatedSocket, next) => {
     
     next();
   } catch (error) {
-    logger.error('Erreur d\'authentification WebSocket:', error);
+    logger.error({ err: error }, 'Erreur d\'authentification WebSocket:');
     next(new Error('Token invalide'));
   }
 });
@@ -3835,7 +3835,7 @@ serverNodesNs.on('connection', async (nodeSocket) => {
         inviteCode: result.inviteCode,
       });
     } catch (err) {
-      logger.error('Erreur lors de l\'auto-enregistrement du server-node:', err);
+      logger.error({ err }, 'Erreur lors de l\'auto-enregistrement du server-node:');
       nodeSocket.emit('REGISTER_ERROR', { message: 'Erreur interne du gateway' });
     }
     nodeSocket.disconnect();
