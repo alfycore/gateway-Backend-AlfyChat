@@ -425,8 +425,8 @@ class CallsProxy {
 class ServersProxy {
   constructor(private baseUrl: string) {}
 
-  async getUserServers(userId: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${userId}`);
+  async getUserServers(userId: string, token?: string) {
+    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${userId}`, token ? { token } : undefined);
   }
 
   async getServer(serverId: string) {

@@ -154,11 +154,15 @@ const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret
 /**
  * Retourne l'URL du meilleur nœud disponible pour un type de service.
  * Si le registre ne contient aucune instance saine, on utilise l'URL de fallback (env var).
- * Un endpoint localhost ne sera jamais préféré à un fallback HTTPS externe.
+ * En dev (NODE_ENV=development), on utilise directement le fallback (.env) sans passer par le registre.
+ * En prod, un endpoint localhost ne sera jamais préféré à un fallback HTTPS externe.
  */
 const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
+const IS_DEV = process.env.NODE_ENV === 'development';
 
 function getServiceUrl(serviceType: ServiceType, fallback: string): string {
+  // En dev, utiliser directement les URLs du .env (localhost)
+  if (IS_DEV) return fallback;
   const best = serviceRegistry.selectBest(serviceType);
   if (!best) return fallback;
   // Refuser les endpoints localhost ou IP brute → utiliser le fallback domaine
@@ -1722,7 +1726,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   // Joindre automatiquement tous les serveurs dont l'utilisateur est membre
   try {
-    const userServers = await serviceProxy.servers.getUserServers(userId);
+    const userServers = await serviceProxy.servers.getUserServers(userId, token);
     if (userServers && Array.isArray(userServers)) {
       for (const srv of userServers) {
         const sid = srv.id || srv.server_id;
