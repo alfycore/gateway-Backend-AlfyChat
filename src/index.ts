@@ -2482,6 +2482,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     });
   });
 
+  // Notifier les autres participants quand un utilisateur start/stop le partage d'écran
+  socket.on('CALL_SCREEN_SHARE', (data) => {
+    const { callId, active } = data as { callId: string; active: boolean };
+    if (!callId) return;
+    socket.to(`call:${callId}`).emit('CALL_SCREEN_SHARE', {
+      type: 'CALL_SCREEN_SHARE',
+      payload: { callId, fromUserId: userId, active },
+      timestamp: new Date(),
+    });
+  });
+
   // Reconnexion à un appel (après perte de connexion WebSocket)
   socket.on('CALL_REJOIN', (data) => {
     try {
@@ -4114,7 +4125,7 @@ const MONITORED_SERVICES: { name: string; url: string }[] = [
   { name: 'calls',    url: `${process.env.CALLS_SERVICE_URL    || 'http://localhost:3004'}/health` },
   { name: 'servers',  url: `${process.env.SERVERS_SERVICE_URL  || 'http://localhost:3005'}/health` },
   { name: 'bots',     url: `${process.env.BOTS_SERVICE_URL     || 'http://localhost:3006'}/health` },
-  { name: 'media',    url: `${process.env.MEDIA_SERVICE_URL    || 'http://localhost:3007'}/health` },
+  { name: 'media',    url: `${process.env.MEDIA_SERVICE_URL    || 'https://media.s.backend.alfychat.app'}/health` },
 ];
 
 const MONITORING_INTERVAL_MS = parseInt(process.env.MONITORING_INTERVAL || '60000'); // 60s default
