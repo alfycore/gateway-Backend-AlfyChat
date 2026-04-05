@@ -1413,6 +1413,32 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'gateway', timestamp: new Date() });
 });
 
+// Mobile socket diagnostic endpoint
+app.get('/api/socket/status', (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.replace('Bearer ', '');
+  let tokenValid = false;
+  let userId: string | null = null;
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'alfychat-super-secret-key-dev-2026') as { userId: string };
+      tokenValid = true;
+      userId = decoded.userId;
+    } catch {}
+  }
+
+  res.json({
+    status: 'ok',
+    socketIO: true,
+    transports: ['websocket', 'polling'],
+    tokenProvided: !!token,
+    tokenValid,
+    userId,
+    timestamp: new Date(),
+  });
+});
+
 // Socket.IO Server
 const io = new Server(httpServer, {
   cors: corsOptions,
