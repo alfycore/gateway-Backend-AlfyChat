@@ -486,8 +486,8 @@ class ServersProxy {
     });
   }
 
-  async updateChannel(channelId: string, updates: any, userId: string) {
-    return fetchService(`${this.baseUrl}/channels/${channelId}`, {
+  async updateChannel(serverId: string, channelId: string, updates: any, userId: string) {
+    return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
       method: 'PATCH',
       body: JSON.stringify({ ...updates, userId }),
     });
@@ -577,6 +577,26 @@ class ServersProxy {
 
   async getRoles(serverId: string) {
     return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/roles`);
+  }
+
+  async createRole(serverId: string, data: { name: string; color?: string; permissions?: any }) {
+    return fetchService(`${this.baseUrl}/servers/${serverId}/roles`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateRole(serverId: string, roleId: string, data: any) {
+    return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteRole(serverId: string, roleId: string) {
+    return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
+      method: 'DELETE',
+    });
   }
 
   // ============ INVITATIONS ============

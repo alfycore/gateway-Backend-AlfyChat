@@ -2778,7 +2778,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const { serverId, channelId, before, limit } = data;
       try {
-        const result = await forwardToNode(serverId, 'MSG_HISTORY', { channelId, before, limit });
+        const result = await forwardToNode(serverId, 'MSG_HISTORY', { channelId, before, limit, userId });
         if (typeof callback === 'function') callback(result);
         return;
       } catch (e: any) {
@@ -2824,7 +2824,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const { serverId } = data;
       try {
         const result = await forwardToNode(serverId, 'CHANNEL_CREATE', {
-          name: data.name, type: data.type || 'text', topic: data.topic, parentId: data.parentId,
+          name: data.name, type: data.type || 'text', topic: data.topic, parentId: data.parentId, userId,
         });
         // Le node broadcast CHANNEL_CREATE via NODE_BROADCAST
         // Aussi notifier via socket pour confirmation
@@ -2856,14 +2856,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const { serverId, channelId } = data;
       try {
         await forwardToNode(serverId, 'CHANNEL_UPDATE', {
-          channelId, name: data.name, topic: data.topic, position: data.position, type: data.type, parentId: data.parentId,
+          channelId, name: data.name, topic: data.topic, position: data.position, type: data.type, parentId: data.parentId, userId,
         });
         // Le node broadcast via NODE_BROADCAST
         return;
       } catch (e: any) {
         if (e.message !== 'NO_NODE') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
-      const channel = await serviceProxy.servers.updateChannel(channelId, data.updates || data, userId);
+      const channel = await serviceProxy.servers.updateChannel(serverId, channelId, data.updates || data, userId);
       io.to(`server:${serverId}`).emit('CHANNEL_UPDATE', {
         type: 'CHANNEL_UPDATE',
         payload: channel,
@@ -2878,7 +2878,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const { serverId, channelId } = data;
       try {
-        await forwardToNode(serverId, 'CHANNEL_DELETE', { channelId });
+        await forwardToNode(serverId, 'CHANNEL_DELETE', { channelId, userId });
         // Le node broadcast via NODE_BROADCAST
         return;
       } catch (e: any) {
@@ -2912,10 +2912,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         roleId: data.roleId,
         allow: data.allow,
         deny: data.deny,
+        userId,
       });
       if (typeof callback === 'function') callback(result);
     } catch (e: any) {
-      emitError(socket, 'CHANNEL_ERROR', e);
+      if (e.message !== 'NO_NODE') emitError(socket, 'CHANNEL_ERROR', e);
       if (typeof callback === 'function') callback({ error: e.message });
     }
   });
@@ -2942,16 +2943,30 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
-      const result = await forwardToNode(data.serverId, 'ROLE_CREATE', {
-        name: data.name, color: data.color, permissions: data.permissions, mentionable: data.mentionable,
-      });
-      if (result?.role) {
-        io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
-          type: 'ROLE_CREATE',
-          payload: { ...result.role, serverId: data.serverId },
-          timestamp: new Date(),
+      try {
+        const result = await forwardToNode(data.serverId, 'ROLE_CREATE', {
+          name: data.name, color: data.color, permissions: data.permissions, mentionable: data.mentionable, userId,
         });
+        if (result?.role) {
+          io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
+            type: 'ROLE_CREATE',
+            payload: { ...result.role, serverId: data.serverId },
+            timestamp: new Date(),
+          });
+        }
+        return;
+      } catch (e: any) {
+        if (e.message !== 'NO_NODE') { emitError(socket, 'ROLE_ERROR', e); return; }
       }
+      // Fallback microservice
+      const role = await serviceProxy.servers.createRole(data.serverId, {
+        name: data.name, color: data.color, permissions: data.permissions,
+      }) as Record<string, unknown>;
+      io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
+        type: 'ROLE_CREATE',
+        payload: { ...role, serverId: data.serverId },
+        timestamp: new Date(),
+      });
     } catch (error) {
       emitError(socket, 'ROLE_ERROR', error);
     }
@@ -2961,17 +2976,32 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
-      const result = await forwardToNode(data.serverId, 'ROLE_UPDATE', {
-        roleId: data.roleId, name: data.name, color: data.color,
-        permissions: data.permissions, position: data.position, mentionable: data.mentionable,
-      });
-      if (result?.role) {
-        io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
-          type: 'ROLE_UPDATE',
-          payload: { ...result.role, serverId: data.serverId },
-          timestamp: new Date(),
+      try {
+        const result = await forwardToNode(data.serverId, 'ROLE_UPDATE', {
+          roleId: data.roleId, name: data.name, color: data.color,
+          permissions: data.permissions, position: data.position, mentionable: data.mentionable, userId,
         });
+        if (result?.role) {
+          io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
+            type: 'ROLE_UPDATE',
+            payload: { ...result.role, serverId: data.serverId },
+            timestamp: new Date(),
+          });
+        }
+        return;
+      } catch (e: any) {
+        if (e.message !== 'NO_NODE') { emitError(socket, 'ROLE_ERROR', e); return; }
       }
+      // Fallback microservice
+      const updated = await serviceProxy.servers.updateRole(data.serverId, data.roleId, {
+        name: data.name, color: data.color, permissions: data.permissions,
+        position: data.position, mentionable: data.mentionable,
+      }) as Record<string, unknown>;
+      io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
+        type: 'ROLE_UPDATE',
+        payload: { ...updated, roleId: data.roleId, serverId: data.serverId },
+        timestamp: new Date(),
+      });
     } catch (error) {
       emitError(socket, 'ROLE_ERROR', error);
     }
@@ -2981,7 +3011,19 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
-      await forwardToNode(data.serverId, 'ROLE_DELETE', { roleId: data.roleId });
+      try {
+        await forwardToNode(data.serverId, 'ROLE_DELETE', { roleId: data.roleId, userId });
+        io.to(`server:${data.serverId}`).emit('ROLE_DELETE', {
+          type: 'ROLE_DELETE',
+          payload: { roleId: data.roleId, serverId: data.serverId },
+          timestamp: new Date(),
+        });
+        return;
+      } catch (e: any) {
+        if (e.message !== 'NO_NODE') { emitError(socket, 'ROLE_ERROR', e); return; }
+      }
+      // Fallback microservice
+      await serviceProxy.servers.deleteRole(data.serverId, data.roleId);
       io.to(`server:${data.serverId}`).emit('ROLE_DELETE', {
         type: 'ROLE_DELETE',
         payload: { roleId: data.roleId, serverId: data.serverId },
@@ -3189,8 +3231,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('MEMBER_KICK', async (data) => {
     try {
       const { serverId, targetUserId } = data;
+      // Permission check: KICK_MEMBERS required
+      const hasKickPerm = await checkServerPermission(userId, serverId, 0x400);
+      if (!hasKickPerm) { emitError(socket, 'MEMBER_ERROR', new Error('PERMISSION_DENIED')); return; }
       try {
-        await forwardToNode(serverId, 'MEMBER_KICK', { userId: targetUserId || data.userId });
+        await forwardToNode(serverId, 'MEMBER_KICK', { userId: targetUserId || data.userId, actorId: userId });
       } catch (e: any) {
         if (e.message !== 'NO_NODE') { emitError(socket, 'MEMBER_ERROR', e); return; }
         await serviceProxy.servers.kickMember(serverId, targetUserId || data.userId, userId);
@@ -3213,8 +3258,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('MEMBER_BAN', async (data) => {
     try {
       const { serverId, targetUserId, reason } = data;
+      // Permission check: BAN_MEMBERS required
+      const hasBanPerm = await checkServerPermission(userId, serverId, 0x800);
+      if (!hasBanPerm) { emitError(socket, 'MEMBER_ERROR', new Error('PERMISSION_DENIED')); return; }
       try {
-        await forwardToNode(serverId, 'MEMBER_BAN', { userId: targetUserId || data.userId, reason });
+        await forwardToNode(serverId, 'MEMBER_BAN', { userId: targetUserId || data.userId, reason, actorId: userId });
       } catch (e: any) {
         if (e.message !== 'NO_NODE') { emitError(socket, 'MEMBER_ERROR', e); return; }
         await serviceProxy.servers.banMember(serverId, targetUserId || data.userId, userId, reason);
