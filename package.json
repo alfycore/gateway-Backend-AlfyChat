@@ -1,0 +1,31 @@
+{
+  "name": "@alfychat/gateway",
+  "version": "1.0.0",
+  "description": "AlfyChat - Gateway WebSocket centralisé",
+  "main": "dist/index.js",
+  "packageManager": "bun",
+  "scripts": {
+    "build": "tsc",
+    "dev": "bun --hot src/index.ts",
+    "start": "bun dist/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.7.4",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.5",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.7",
+    "typescript": "^5.3.3"
+  }
+}
