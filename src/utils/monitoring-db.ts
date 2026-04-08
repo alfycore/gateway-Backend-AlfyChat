@@ -4,6 +4,7 @@
 // ==========================================
 
 import mysql from 'mysql2/promise';
+import { createHash } from 'node:crypto';
 import { logger } from './logger';
 
 export type IncidentSeverity = 'info' | 'warning' | 'critical';
@@ -113,6 +114,16 @@ class MonitoringDB {
       if (!(m001 as any[]).length) {
         await conn.execute(`ALTER TABLE service_instances ADD COLUMN IF NOT EXISTS enabled TINYINT(1) NOT NULL DEFAULT 1`).catch(() => {});
         await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m001-enabled-column')`);
+      }
+
+      // Migration m003 : ajouter la colonne service_key_hash (clé unique par service)
+      const [m003] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM gateway_migrations WHERE id = 'm003-service-key-hash'`
+      );
+      if (!(m003 as any[]).length) {
+        await conn.execute(`ALTER TABLE service_instances ADD COLUMN IF NOT EXISTS service_key_hash VARCHAR(64) NULL`).catch(() => {});
+        await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m003-service-key-hash')`);
+        logger.info('MonitoringDB: migration m003 — colonne service_key_hash ajoutée');
       }
 
       // Migration m002 : remise à zéro — purge les IPs/localhost et réinitialise avec les domaines officiels
@@ -532,14 +543,14 @@ class MonitoringDB {
   // ── Service instances (registry persistant) ─────────────────────────────
 
   /** Charge toutes les instances depuis la DB (y compris désactivées pour que l'admin les voie) */
-  async loadServiceInstances(): Promise<{ id: string; serviceType: string; endpoint: string; domain: string; location: string; enabled: boolean }[]> {
+  async loadServiceInstances(): Promise<{ id: string; serviceType: string; endpoint: string; domain: string; location: string; enabled: boolean; serviceKeyHash: string | null }[]> {
     if (!this.ready || !this.pool) return [];
     const conn = await this.pool.getConnection();
     try {
       const [rows] = await conn.execute<mysql.RowDataPacket[]>(
-        `SELECT id, service_type AS serviceType, endpoint, domain, location, enabled FROM service_instances ORDER BY service_type, id`,
+        `SELECT id, service_type AS serviceType, endpoint, domain, location, enabled, service_key_hash AS serviceKeyHash FROM service_instances ORDER BY service_type, id`,
       );
-      return (rows as any[]).map(r => ({ ...r, enabled: Boolean(r.enabled ?? 1) }));
+      return (rows as any[]).map(r => ({ ...r, enabled: Boolean(r.enabled ?? 1), serviceKeyHash: r.serviceKeyHash ?? null }));
     } catch (err) {
       logger.error({ err: err }, 'MonitoringDB: erreur loadServiceInstances');
       return [];
@@ -612,6 +623,23 @@ class MonitoringDB {
       await conn.execute(`DELETE FROM service_instances WHERE id = ?`, [id]);
     } catch (err) {
       logger.error({ err: err }, 'MonitoringDB: erreur removeServiceInstance');
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** Stocke le hash SHA-256 de la clé de service (ne stocke jamais la clé brute) */
+  async storeServiceKeyHash(id: string, rawKey: string): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const hash = createHash('sha256').update(rawKey).digest('hex');
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `UPDATE service_instances SET service_key_hash = ?, updated_at = NOW() WHERE id = ?`,
+        [hash, id],
+      );
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur storeServiceKeyHash');
     } finally {
       conn.release();
     }

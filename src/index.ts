@@ -10,6 +10,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import { randomBytes, createHash } from 'node:crypto';
 import dotenv from 'dotenv';
 import { GatewayEvent, GatewayEventType, User } from './types/gateway';
 import { logger } from './utils/logger';
@@ -21,6 +22,8 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import { RateLimiterRedis } from 'rate-limiter-flexible';
 
 dotenv.config();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'alfychat-super-secret-key-dev-2026';
 
 const app = express();
 const httpServer = createServer(app);
@@ -102,7 +105,7 @@ app.use(async (req, res, next) => {
   if (authHeader?.startsWith('Bearer ')) {
     try {
       const token = authHeader.substring(7);
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
+      const decoded = jwt.verify(token, JWT_SECRET) as any;
       const userId = decoded.userId || decoded.id;
       const role: string = decoded.role || 'user';
       if (userId) {
@@ -176,7 +179,7 @@ function extractUserIdFromJWT(authHeader: string | undefined): string | null {
   if (!authHeader?.startsWith('Bearer ')) return null;
   try {
     const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
     return decoded.userId || decoded.id || null;
   } catch {
     return null;
@@ -251,6 +254,32 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 // ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
 
 /**
+ * Clés par service : Map<serviceId, sha256(rawKey)>
+ * Chargée depuis la DB au démarrage, mise à jour lors de la création/rotation de clé.
+ */
+const serviceKeyHashes = new Map<string, string>();
+
+/** Génère une clé de service unique et retourne { rawKey, hash } */
+function generateServiceKey(): { rawKey: string; hash: string } {
+  const rawKey = 'sc_' + randomBytes(32).toString('base64url');
+  const hash   = createHash('sha256').update(rawKey).digest('hex');
+  return { rawKey, hash };
+}
+
+/** Vérifie la clé d'un service.
+ *  - Si une clé est enregistrée pour cet id → valide contre le hash.
+ *  - Sinon → fallback sur INTERNAL_SECRET (instances pré-existantes sans clé). */
+function validateServiceSecret(id: string, secret: string): boolean {
+  const storedHash = serviceKeyHashes.get(id);
+  if (storedHash) {
+    const provided = createHash('sha256').update(secret).digest('hex');
+    return provided === storedHash;
+  }
+  // Fallback pour les instances sans clé assignée
+  return secret === INTERNAL_SECRET;
+}
+
+/**
  * Blacklist des instances désactivées/supprimées par un admin.
  * Chargée depuis la DB au démarrage + mise à jour en temps réel.
  */
@@ -273,7 +302,7 @@ const allowedServiceIds = new Set<string>();
 app.post('/api/internal/service/register', express.json(), (req, res) => {
   const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
 
-  if (!secret || secret !== INTERNAL_SECRET) {
+  if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
     return res.status(401).json({ error: 'Secret invalide' });
   }
 
@@ -338,7 +367,7 @@ app.post('/api/internal/service/register', express.json(), (req, res) => {
 app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
   const { secret, id, metrics } = req.body ?? {};
 
-  if (!secret || secret !== INTERNAL_SECRET) {
+  if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
     return res.status(401).json({ error: 'Secret invalide' });
   }
 
@@ -673,10 +702,15 @@ app.post('/api/admin/services', async (req, res) => {
     endpoint: String(endpoint), domain: String(domain),
     location: String(location).toUpperCase(),
   }).catch(() => {});
+  // Générer une clé unique pour ce service
+  const { rawKey, hash } = generateServiceKey();
+  serviceKeyHashes.set(String(id), hash);
+  monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
   // Ajouter à la whitelist et retirer des blacklists
   allowedServiceIds.add(String(id));
   bannedServiceIds.delete(String(id));
-  res.status(201).json({ success: true, instance });
+  logger.info(`Admin: service "${id}" ajouté avec une clé unique`);
+  res.status(201).json({ success: true, instance, serviceKey: rawKey });
 });
 
 /**
@@ -716,6 +750,24 @@ app.delete('/api/admin/services/:id', async (req, res) => {
   logger.info(`ServiceRegistry: instance "${decodedId}" supprimée et bannie par un admin`);
   monitoringDB.removeServiceInstance(decodedId).catch(() => {});
   res.json({ success: true });
+});
+
+/**
+ * POST /api/admin/services/:id/rotate-key
+ * Régénère la clé de service pour une instance existante.
+ * Retourne la nouvelle clé (affichée une seule fois) — mettre à jour le .env du service.
+ */
+app.post('/api/admin/services/:id/rotate-key', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  const decodedId = decodeURIComponent(req.params.id);
+  if (!serviceRegistry.getAll().find(i => i.id === decodedId)) {
+    return res.status(404).json({ error: 'Instance introuvable' });
+  }
+  const { rawKey, hash } = generateServiceKey();
+  serviceKeyHashes.set(decodedId, hash);
+  monitoringDB.storeServiceKeyHash(decodedId, rawKey).catch(() => {});
+  logger.info(`Admin: clé régénérée pour le service "${decodedId}"`);
+  res.json({ success: true, serviceKey: rawKey });
 });
 
 app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
@@ -1422,7 +1474,7 @@ app.get('/api/socket/status', (req, res) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'alfychat-super-secret-key-dev-2026') as { userId: string };
+      const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
       tokenValid = true;
       userId = decoded.userId;
     } catch {}
@@ -1500,7 +1552,7 @@ io.use(async (socket: AuthenticatedSocket, next) => {
       return next(new Error('Token d\'authentification requis'));
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'alfychat-super-secret-key-dev-2026') as { userId: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
     
     // Vérifier l'utilisateur via le service users
     const user = await serviceProxy.users.getUser(decoded.userId) as User | null;
@@ -4330,6 +4382,7 @@ async function loadInstancesFromDB(): Promise<void> {
       });
       // Whitelist : tous les IDs en DB sont autorisés à heartbeater
       allowedServiceIds.add(row.id);
+      if (row.serviceKeyHash) serviceKeyHashes.set(row.id, row.serviceKeyHash);
       if (!row.enabled) bannedServiceIds.add(row.id);
       else loaded++;
     }
