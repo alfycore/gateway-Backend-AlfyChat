@@ -1868,11 +1868,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   } catch { /* non bloquant */ }
 
-  // Stocker le statut en ligne dans Redis
-  await redis.setUserStatus(userId, 'online');
+  // Stocker le statut en ligne dans Redis (conserver le statut choisi par l'utilisateur)
+  const previousStatus = user.status && user.status !== 'offline' ? user.status : 'online';
+  await redis.setUserStatus(userId, previousStatus, user.customStatus ?? null);
 
   // Notifier les amis de la connexion
-  broadcastPresenceUpdate(userId, 'online', friends);
+  broadcastPresenceUpdate(userId, previousStatus, friends, user.customStatus ?? null);
 
   // Envoyer les pings en attente (messages reçus hors ligne) — DB + Redis
   try {
