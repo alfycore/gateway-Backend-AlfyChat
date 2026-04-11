@@ -2169,10 +2169,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   // ── E2EE history recovery: relay request & response between DM participants ──
   // User A lost keys → asks User B to re-encrypt the conversation history
-  socket.on('e2ee:history-request', (data: { recipientId: string; conversationId: string }) => {
+  socket.on('e2ee:history-request', async (data: { recipientId: string; conversationId: string }) => {
     if (!data.recipientId || !data.conversationId) return;
     // Only allow requests for DM conversations where userId is a participant
     if (!data.conversationId.startsWith('dm_') || !data.conversationId.includes(userId)) return;
+    // Vérifier si le destinataire est connecté
+    const recipientSockets = await io.in(`user:${data.recipientId}`).fetchSockets();
+    if (recipientSockets.length === 0) {
+      // Destinataire hors ligne → notifier l'expéditeur immédiatement
+      socket.emit('e2ee:history-error', { reason: 'recipient_offline', conversationId: data.conversationId });
+      return;
+    }
     logger.info(`[E2EE] History request from ${userId} to ${data.recipientId} for ${data.conversationId}`);
     io.to(`user:${data.recipientId}`).emit('e2ee:history-request', {
       requesterId: userId,
