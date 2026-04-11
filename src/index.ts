@@ -139,7 +139,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/media')) return next();
   const ct = req.headers['content-type'] || '';
   if (ct.includes('multipart/form-data') && req.path.startsWith('/api/servers/')) return next();
-  express.json()(req, res, next);
+  express.json({ limit: '2mb' })(req, res, next);
 });
 
 // ============ ROUTES API REST (PROXY) ============
@@ -2165,6 +2165,37 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       socket.join(`conversation:${roomId}`);
       socket.emit('conversation:joined', { conversationId: roomId });
     }
+  });
+
+  // ── E2EE history recovery: relay request & response between DM participants ──
+  // User A lost keys → asks User B to re-encrypt the conversation history
+  socket.on('e2ee:history-request', (data: { recipientId: string; conversationId: string }) => {
+    if (!data.recipientId || !data.conversationId) return;
+    // Only allow requests for DM conversations where userId is a participant
+    if (!data.conversationId.startsWith('dm_') || !data.conversationId.includes(userId)) return;
+    logger.info(`[E2EE] History request from ${userId} to ${data.recipientId} for ${data.conversationId}`);
+    io.to(`user:${data.recipientId}`).emit('e2ee:history-request', {
+      requesterId: userId,
+      conversationId: data.conversationId,
+    });
+  });
+
+  // User B responds with re-encrypted messages
+  socket.on('e2ee:history-response', (data: {
+    requesterId: string;
+    conversationId: string;
+    messages: Array<{ id: string; content: string; senderId: string; createdAt: string }>;
+  }) => {
+    if (!data.requesterId || !data.conversationId || !data.messages) return;
+    if (!data.conversationId.startsWith('dm_') || !data.conversationId.includes(userId)) return;
+    // Cap at 500 messages per response to prevent abuse
+    const msgs = data.messages.slice(0, 500);
+    logger.info(`[E2EE] History response from ${userId} to ${data.requesterId}: ${msgs.length} messages`);
+    io.to(`user:${data.requesterId}`).emit('e2ee:history-response', {
+      responderId: userId,
+      conversationId: data.conversationId,
+      messages: msgs,
+    });
   });
 
   // Indicateur de frappe
