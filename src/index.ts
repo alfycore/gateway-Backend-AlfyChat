@@ -1908,6 +1908,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   } catch { /* non bloquant */ }
 
+  // Map des suppressions en attente : messageId → userId
+  // Utilisée quand l'utilisateur supprime un message avant que l'écriture DB soit terminée.
+  const pendingDeletions = new Map<string, string>();
+
   // ============ GESTIONNAIRES D'ÉVÉNEMENTS ============
 
   // Heartbeat
@@ -2022,6 +2026,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         e2eeType: data.e2eeType as number | undefined,
         replyToId: data.replyToId as string | undefined,
       }).then((message: any) => {
+        // Suppression différée : si l'utilisateur a supprimé ce message pendant l'écriture DB,
+        // relancer la suppression maintenant que le message est en base.
+        if (pendingDeletions.has(messageId)) {
+          const deleteUserId = pendingDeletions.get(messageId)!;
+          pendingDeletions.delete(messageId);
+          serviceProxy.messages.deleteMessage(messageId, deleteUserId).catch(() => {});
+        }
         // Archive DM si quota atteint
         if (message?.archiveEvent) {
           io.to(`conversation:${conversationId}`).emit('DM_ARCHIVE_PUSH', {
@@ -2115,15 +2126,16 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('message:delete', async (data: { messageId: string; conversationId?: string }) => {
     try {
       await serviceProxy.messages.deleteMessage(data.messageId, userId);
-      // Broadcast to conversation. If conversationId not provided, we still need
-      // to notify the sender — they can derive it client-side.
-      const room = data.conversationId ? `conversation:${data.conversationId}` : `user:${userId}`;
-      io.to(room).emit('message:deleted', { messageId: data.messageId });
-      // Also notify own socket in case they didn't join the conversation room
-      socket.emit('message:deleted', { messageId: data.messageId });
     } catch (error) {
-      console.error('❌ Error deleting message:', error);
+      // Le message n'est peut-être pas encore en base (écriture fire-and-forget en cours).
+      // On planifie la suppression pour quand l'écriture sera terminée.
+      pendingDeletions.set(data.messageId, userId);
+      console.warn('⚠️ Delete scheduled (message not in DB yet):', data.messageId);
     }
+    // Toujours émettre de façon optimiste — le client a déjà retiré le message localement.
+    const room = data.conversationId ? `conversation:${data.conversationId}` : `user:${userId}`;
+    io.to(room).emit('message:deleted', { messageId: data.messageId });
+    socket.emit('message:deleted', { messageId: data.messageId });
   });
 
   // Rejoindre une conversation (DM ou channel)
