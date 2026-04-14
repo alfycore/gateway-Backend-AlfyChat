@@ -5,6 +5,8 @@
 import CircuitBreaker from 'opossum';
 import { logger } from '../utils/logger';
 
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET || '';
+
 // ── Circuit breakers — un par hostname ──────────────────────────────────────
 const _breakers = new Map<string, InstanceType<typeof CircuitBreaker>>();
 
@@ -105,6 +107,7 @@ class UsersProxy {
     return fetchService(`${this.baseUrl}/users/${userId}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status, ...(customStatus !== undefined && { customStatus }) }),
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
     });
   }
 
@@ -112,6 +115,7 @@ class UsersProxy {
     try {
       return fetchService(`${this.baseUrl}/users/${userId}/last-seen`, {
         method: 'PATCH',
+        headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       });
     } catch (error) {
       logger.warn(`Impossible de mettre à jour last_seen pour ${userId}`);
@@ -433,8 +437,13 @@ class ServersProxy {
     return fetchService<any>(`${this.baseUrl}/servers/${serverId}`);
   }
 
-  async getServerChannels(serverId: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/channels`);
+  async getServerChannels(serverId: string, userId?: string) {
+    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/channels`, {
+      headers: {
+        ...(userId ? { 'x-user-id': userId } : {}),
+        'x-internal-secret': INTERNAL_SECRET,
+      },
+    });
   }
 
   async joinServer(serverId: string, userId: string) {

@@ -1114,7 +1114,7 @@ async function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.
       res.setHeader('Content-Type', contentType);
       const cacheControl = response.headers.get('cache-control');
       if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.status(response.status).send(buffer);
     } else {
@@ -1246,7 +1246,7 @@ app.get('/api/servers/:serverId/files/:filename', async (req, res) => {
       if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
       const ct = response.headers.get('content-type');
       if (ct) res.setHeader('Content-Type', ct);
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.send(Buffer.from(await response.arrayBuffer()));
     } catch { res.status(502).json({ error: 'Node indisponible' }); }
@@ -1258,7 +1258,7 @@ app.get('/api/servers/:serverId/files/:filename', async (req, res) => {
     if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
     const ct = response.headers.get('content-type');
     if (ct) res.setHeader('Content-Type', ct);
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     res.send(Buffer.from(await response.arrayBuffer()));
   } catch { res.status(502).json({ error: 'Service indisponible' }); }
@@ -1346,7 +1346,7 @@ async function proxyToMedia(targetEndpoint: string, mediaPath: string, req: expr
         ) {
           const buffer = Buffer.from(await response.arrayBuffer());
           res.setHeader('Content-Type', contentType);
-          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
           res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
           const cc = response.headers.get('cache-control');
           if (cc) res.setHeader('Cache-Control', cc);
@@ -1368,7 +1368,7 @@ async function proxyToMedia(targetEndpoint: string, mediaPath: string, req: expr
 // ── Download : GET /api/media/:location/:serviceId/:folder/:filename ──────────
 //   Route spécifique avant le catch-all upload
 app.get('/api/media/:location/:serviceId/:folder/:filename', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
   const { location, serviceId, folder, filename } = req.params;
@@ -1433,7 +1433,7 @@ app.all('/api/media/*', async (req, res) => {
 // Routes Uploads — proxy des fichiers statiques depuis le service média
 // (compatibilité avec les anciennes URLs /uploads/*)
 app.get('/uploads/*', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   try {
     // Chercher une instance média quelconque saine
@@ -4265,10 +4265,12 @@ async function broadcastPresenceUpdate(
   friends: Array<{ friendId: string }>,
   customStatus?: string | null,
 ): Promise<void> {
+  // Les amis voient 'offline' quand l'utilisateur est en mode invisible
+  const visibleStatus = status === 'invisible' ? 'offline' : status;
   for (const friend of friends) {
     io.to(`user:${friend.friendId}`).emit('PRESENCE_UPDATE', {
       type: 'PRESENCE_UPDATE',
-      payload: { userId, status, customStatus: customStatus ?? null },
+      payload: { userId, status: visibleStatus, customStatus: customStatus ?? null },
       timestamp: new Date(),
     });
   }
