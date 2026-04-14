@@ -10,33 +10,55 @@ import cors from 'cors';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
-import { randomBytes, createHash } from 'node:crypto';
-import dotenv from 'dotenv';
+import { randomBytes } from 'node:crypto';
 import { GatewayEvent, GatewayEventType, User } from './types/gateway';
 import { logger } from './utils/logger';
 import { RedisClient } from './utils/redis';
 import { ServiceProxy } from './services/proxy';
 import { monitoringDB } from './utils/monitoring-db';
 import { serviceRegistry, ServiceType } from './utils/service-registry';
+import {
+  validateProfile, validateGroupInput, validateServerInput, validateChannelInput,
+  validateRoleInput, validateMemberUpdate, validateMessageContent, validateInviteInput,
+  validateTags,
+} from './utils/validation';
+import {
+  JWT_SECRET, IS_PRODUCTION, IS_DEV, PORT, allowedOrigins,
+  USERS_URL, MESSAGES_URL, FRIENDS_URL, CALLS_URL, SERVERS_URL, BOTS_URL, MEDIA_URL,
+  SERVERHOSTING_URL, SUBSCRIPTIONS_URL, INTERNAL_SECRET,
+  RATE_LIMIT_ANON, RATE_LIMIT_USER, RATE_LIMIT_ADMIN, RATE_LIMIT_WINDOW,
+  RATE_LIMIT_AUTH_POINTS, RATE_LIMIT_AUTH_WINDOW, AUTH_BRUTEFORCE_PATHS,
+  TRUSTED_PROXIES, IP_ENDPOINT_RE,
+} from './config/env';
+import {
+  getClientIP, extractUserIdFromJWT, safeJson, getServiceUrl, rewriteNodePath,
+} from './http/helpers';
+import {
+  proxyRequest, proxyToNode, proxyToNodeMultipart, proxyMultipartToService, proxyToMedia,
+} from './http/proxy';
+import {
+  serviceKeyHashes, bannedServiceIds, allowedServiceIds,
+  generateServiceKey, validateServiceSecret,
+} from './state/service-keys';
+import { requireAdmin } from './monitoring/admin-guard';
+import { runMonitoringCycle, MONITORING_INTERVAL_MS } from './monitoring/cycle';
+import { connectedClients, connectedNodes, voiceChannels, userVoiceChannel } from './state/connections';
+import type { VoiceParticipant } from './state/connections';
+import { isDmBlocked, invalidateBlockCache } from './state/block-cache';
+import { messageRateLimit, MSG_RATE_WINDOW, MSG_RATE_MAX, serverJoinRateLimit, checkServerJoinRate } from './state/rate-limit';
+import { runtime } from './state/runtime';
+import { forwardToNode, getNodeSocket } from './services/forward';
+import { registerInternalRoutes } from './http/internal.routes';
+import { registerAdminRoutes } from './http/admin.routes';
+import { registerFriendsRoutes } from './http/friends.routes';
+import { registerServersRoutes } from './http/servers.routes';
+import { registerMediaRoutes } from './http/media.routes';
+import { registerHealthRoutes } from './http/health.routes';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RateLimiterRedis } from 'rate-limiter-flexible';
 
-dotenv.config();
-
-if (!process.env.JWT_SECRET) {
-  throw new Error('JWT_SECRET manquant — définissez-le dans .env (openssl rand -hex 64). Refus de démarrer avec un secret par défaut.');
-}
-const JWT_SECRET = process.env.JWT_SECRET;
-
 const app = express();
 const httpServer = createServer(app);
-
-// Configuration CORS
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:4000')
-  .split(',')
-  .map((o) => o.trim());
-
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 const corsOptions = {
   origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
@@ -78,44 +100,14 @@ app.use(helmet({
 // ============ RATE LIMITING & IP BAN (HTTP) ============
 let redis: RedisClient;
 
-// Limites par rôle (requêtes par seconde)
-const RATE_LIMIT_ANON  = parseInt(process.env.RATE_LIMIT_ANON  || '20');   // non connecté
-const RATE_LIMIT_USER  = parseInt(process.env.RATE_LIMIT_USER  || '150');  // connecté
-const RATE_LIMIT_ADMIN = parseInt(process.env.RATE_LIMIT_ADMIN || '500');  // admin/modérateur
-const RATE_LIMIT_WINDOW = 1; // fenêtre d'1 seconde
-
 // Limiters rate-limiter-flexible (initialisés après connexion Redis)
 let _rlAnon:  RateLimiterRedis | null = null;
 let _rlUser:  RateLimiterRedis | null = null;
 let _rlAdmin: RateLimiterRedis | null = null;
 // Brute-force protection : login / register / 2FA / reset-password — 10 tentatives / 15 min / IP
 let _rlAuth:  RateLimiterRedis | null = null;
-const RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '10');
-const RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '900'); // 15 min
-const AUTH_BRUTEFORCE_PATHS = [
-  '/api/auth/login',
-  '/api/auth/register',
-  '/api/auth/verify-2fa',
-  '/api/auth/forgot-password',
-  '/api/auth/reset-password',
-];
 
-// Trusted reverse-proxy IPs (load balancer / nginx on same host or LAN)
-// Set TRUSTED_PROXIES env var as comma-separated CIDR list or exact IPs.
-// When empty, we always use the direct socket address.
-const TRUSTED_PROXIES = new Set(
-  (process.env.TRUSTED_PROXIES || '127.0.0.1,::1').split(',').map((s) => s.trim()).filter(Boolean)
-);
 
-function getClientIP(req: express.Request): string {
-  const remoteAddr = req.socket.remoteAddress || '0.0.0.0';
-  // Only trust X-Forwarded-For if the direct connection comes from a trusted proxy
-  if (TRUSTED_PROXIES.has(remoteAddr)) {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
-  }
-  return remoteAddr;
-}
 
 // Middleware : bloquer les IP bannies
 app.use(async (req, res, next) => {
@@ -181,107 +173,6 @@ app.use((req, res, next) => {
 });
 
 // ============ ROUTES API REST (PROXY) ============
-const USERS_URL = process.env.USERS_SERVICE_URL || 'https://users.alfychat.eu';
-const MESSAGES_URL = process.env.MESSAGES_SERVICE_URL || 'https://messages.alfychat.eu';
-const FRIENDS_URL = process.env.FRIENDS_SERVICE_URL || 'https://friends.s.backend.alfychat.app';
-const CALLS_URL = process.env.CALLS_SERVICE_URL || 'https://calls.s.backend.alfychat.app';
-const SERVERS_URL = process.env.SERVERS_SERVICE_URL || 'https://servers.s.backend.alfychat.app';
-const BOTS_URL = process.env.BOTS_SERVICE_URL || 'https://bots.s.backend.alfychat.app';
-const MEDIA_URL = process.env.MEDIA_SERVICE_URL || 'https://media.s.backend.alfychat.app';
-
-// Secret partagé pour les enregistrements internes de services
-const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret-dev';
-
-/**
- * Retourne l'URL du meilleur nœud disponible pour un type de service.
- * Si le registre ne contient aucune instance saine, on utilise l'URL de fallback (env var).
- * En dev (NODE_ENV=development), on utilise directement le fallback (.env) sans passer par le registre.
- * En prod, un endpoint localhost ne sera jamais préféré à un fallback HTTPS externe.
- */
-const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
-const IS_DEV = process.env.NODE_ENV === 'development';
-
-function getServiceUrl(serviceType: ServiceType, fallback: string): string {
-  // En dev, utiliser directement les URLs du .env (localhost)
-  if (IS_DEV) return fallback;
-  const best = serviceRegistry.selectBest(serviceType);
-  if (!best) return fallback;
-  // Refuser les endpoints localhost ou IP brute → utiliser le fallback domaine
-  const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(best.endpoint);
-  if (isLocalEndpoint || IP_ENDPOINT_RE.test(best.endpoint)) return fallback;
-  return best.endpoint;
-}
-
-// Décoder le JWT depuis le header Authorization (sans lever d'erreur)
-function extractUserIdFromJWT(authHeader: string | undefined): string | null {
-  if (!authHeader?.startsWith('Bearer ')) return null;
-  try {
-    const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
-    return decoded.userId || decoded.id || null;
-  } catch {
-    return null;
-  }
-}
-
-// Proxy HTTP vers les microservices
-async function proxyRequest(targetUrl: string, req: express.Request, res: express.Response, fallbackUrl?: string) {
-  const SKIP_USERID_INJECT = ['/friends/request'];
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  const skipInject = SKIP_USERID_INJECT.some(path => req.originalUrl.replace(/^\/api/, '').startsWith(path));
-  let bodyToSend = req.body;
-  if (userId && req.method !== 'GET' && req.method !== 'HEAD' && !skipInject) {
-    bodyToSend = { ...req.body, userId, ownerId: userId };
-  }
-
-  const doFetch = async (baseUrl: string) => {
-    const url = `${baseUrl}${req.originalUrl.replace(/^\/api/, '')}`;
-    return fetch(url, {
-      method: req.method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        ...(userId && { 'X-User-Id': userId }),
-      },
-      ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
-    });
-  };
-
-  const sendResponse = async (response: Response) => {
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
-      const data = await safeJson(response);
-      res.status(response.status).json(data ?? { error: 'Réponse vide' });
-    } else {
-      const text = await response.text();
-      if (!text) {
-        res.status(response.status).json({ success: response.ok });
-      } else {
-        logger.error({ err: text }, `Service ${targetUrl} retourne du non-JSON:`);
-        res.status(response.status).json({ error: 'Service non disponible' });
-      }
-    }
-  };
-
-  try {
-    const response = await doFetch(targetUrl);
-    return sendResponse(response);
-  } catch (primaryError) {
-    // Si l'endpoint du registre est injoignable et qu'on a un fallback différent, réessayer
-    if (fallbackUrl && fallbackUrl !== targetUrl) {
-      logger.warn(`Proxy vers ${targetUrl} échoué, fallback vers ${fallbackUrl}`);
-      try {
-        const response = await doFetch(fallbackUrl);
-        return sendResponse(response);
-      } catch (fallbackError) {
-        logger.error({ err: fallbackError }, `Proxy fallback ${fallbackUrl} aussi échoué:`);
-      }
-    } else {
-      logger.error({ err: primaryError }, 'Erreur proxy:');
-    }
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-}
 
 // ⚠️  Rate limit brute-force dédié sur les endpoints sensibles d'authentification.
 // Clé = IP (les attaques viennent rarement d'un compte authentifié).
@@ -309,1247 +200,40 @@ app.all('/api/users/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_
 app.all('/api/users', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
 app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
 
-// ============ INTERNAL : ENREGISTREMENT & HEARTBEAT DES SERVICES ============
+// ============ ROUTE MODULES ============
+registerInternalRoutes(app);
 
-/**
- * Clés par service : Map<serviceId, sha256(rawKey)>
- * Chargée depuis la DB au démarrage, mise à jour lors de la création/rotation de clé.
- */
-const serviceKeyHashes = new Map<string, string>();
-
-/** Génère une clé de service unique et retourne { rawKey, hash } */
-function generateServiceKey(): { rawKey: string; hash: string } {
-  const rawKey = 'sc_' + randomBytes(32).toString('base64url');
-  const hash   = createHash('sha256').update(rawKey).digest('hex');
-  return { rawKey, hash };
-}
-
-/** Vérifie la clé d'un service.
- *  - Si une clé est enregistrée pour cet id → valide contre le hash.
- *  - Sinon → fallback sur INTERNAL_SECRET (instances pré-existantes sans clé). */
-function validateServiceSecret(id: string, secret: string): boolean {
-  const storedHash = serviceKeyHashes.get(id);
-  if (storedHash) {
-    const provided = createHash('sha256').update(secret).digest('hex');
-    return provided === storedHash;
-  }
-  // Fallback pour les instances sans clé assignée
-  return secret === INTERNAL_SECRET;
-}
-
-/**
- * Blacklist des instances désactivées/supprimées par un admin.
- * Chargée depuis la DB au démarrage + mise à jour en temps réel.
- */
-const bannedServiceIds = new Set<string>();
-
-/**
- * Whitelist des IDs autorisés à s'enregistrer.
- * Seuls les IDs pré-enregistrés par un admin (via DB ou POST /api/admin/services) sont acceptés.
- * Un service inconnu ne peut PAS s'auto-enregistrer.
- */
-const allowedServiceIds = new Set<string>();
-
-/**
- * POST /api/internal/service/register
- * Enregistre (ou met à jour) une instance de microservice dans le registre.
- * Protégé par le secret partagé INTERNAL_SECRET.
- *
- * Body: { secret, id, serviceType, endpoint, domain, location, metrics }
- */
-app.post('/api/internal/service/register', express.json(), (req, res) => {
-  const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
-
-  if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
-    return res.status(401).json({ error: 'Secret invalide' });
-  }
-
-  const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
-  if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
-    return res.status(400).json({ error: 'Paramètres manquants ou invalides (id, serviceType, endpoint, domain, location)' });
-  }
-
-  // Rejeter les instances bannies/désactivées par un admin
-  if (bannedServiceIds.has(String(id))) {
-    return res.status(403).json({ error: 'Instance désactivée — contactez un administrateur' });
-  }
-
-  // Rejeter les IDs non pré-enregistrés par un admin (whitelist)
-  if (allowedServiceIds.size > 0 && !allowedServiceIds.has(String(id))) {
-    logger.warn(`ServiceRegistry: tentative d'enregistrement non autorisée — ID "${id}" non connu (${endpoint})`);
-    return res.status(403).json({ error: 'Instance non autorisée — seul un administrateur peut ajouter de nouveaux services' });
-  }
-
-  // Rejeter les endpoints avec une adresse IP (seuls les noms de domaine sont acceptés)
-  const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
-  if (IP_ENDPOINT_RE.test(String(endpoint))) {
-    logger.warn(`ServiceRegistry: endpoint IP refusé pour "${id}" — (${endpoint}) — utilisez un nom de domaine`);
-    return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine (ex: service.alfychat.eu)' });
-  }
-
-  const resolvedEndpoint = String(endpoint);
-  const resolvedDomain   = String(domain);
-
-  const defaultMetrics = {
-    ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100,
-    bandwidthUsage: 0, requestCount20min: 0,
-  };
-
-  const instance = serviceRegistry.register({
-    id: String(id),
-    serviceType: serviceType as ServiceType,
-    endpoint: resolvedEndpoint,
-    domain: resolvedDomain,
-    location: String(location).toUpperCase(),
-    metrics: metrics ?? defaultMetrics,
-  });
-
-  // Persist to DB (non-blocking)
-  monitoringDB.upsertServiceInstance({
-    id: String(id),
-    serviceType: String(serviceType),
-    endpoint: resolvedEndpoint,
-    domain: resolvedDomain,
-    location: String(location).toUpperCase(),
-  }).catch(() => {});
-
-  res.json({ success: true, instance });
-});
-
-/**
- * POST /api/internal/service/heartbeat
- * Met à jour les métriques d'une instance déjà enregistrée.
- *
- * Body: { secret, id, metrics }
- */
-app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
-  const { secret, id, metrics } = req.body ?? {};
-
-  if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
-    return res.status(401).json({ error: 'Secret invalide' });
-  }
-
-  if (!id || !metrics) {
-    return res.status(400).json({ error: 'id et metrics requis' });
-  }
-
-  // Rejeter le heartbeat des instances bannies par un admin
-  if (bannedServiceIds.has(String(id))) {
-    return res.status(403).json({ error: 'Instance bannie — supprimée par un administrateur' });
-  }
-
-  const updated = serviceRegistry.heartbeat(String(id), metrics);
-  if (!updated) {
-    // Instance inconnue : peut arriver au redémarrage du gateway ; renvoyer 404
-    // pour que le service se ré-enregistre
-    return res.status(404).json({ error: 'Instance inconnue, veuillez vous enregistrer d\'abord' });
-  }
-
-  res.json({ success: true });
-});
-
-/**
- * POST /api/internal/service/deregister
- * Retire manuellement une instance du registre (ex : arrêt gracieux).
- */
-app.post('/api/internal/service/deregister', express.json(), (req, res) => {
-  const { secret, id } = req.body ?? {};
-  if (!secret || secret !== INTERNAL_SECRET) {
-    return res.status(401).json({ error: 'Secret invalide' });
-  }
-  if (!id) return res.status(400).json({ error: 'id requis' });
-  const removed = serviceRegistry.remove(String(id));
-  if (removed) monitoringDB.removeServiceInstance(String(id)).catch(() => {});
-  res.json({ success: removed });
-});
-
-/**
- * GET /api/internal/service/list
- * Retourne toutes les instances enregistrées avec leurs métriques et scores.
- * Protégé par X-Internal-Secret header ou ?secret=... query param.
- */
-app.get('/api/internal/service/list', (req, res) => {
-  const secret = (req.headers['x-internal-secret'] as string | undefined) ?? (req.query.secret as string | undefined);
-  if (!secret || secret !== INTERNAL_SECRET) {
-    return res.status(401).json({ error: 'Secret invalide' });
-  }
-  const instances = serviceRegistry.getAll().map((inst) => ({
-    ...inst,
-    score: serviceRegistry.computeScore(inst),
-  }));
-  res.json({
-    count: instances.length,
-    healthy: instances.filter((i) => i.healthy).length,
-    instances,
-  });
-});
-
-// ============ ADMIN : GESTION IP BANS (gateway direct) ============
-
-app.get('/api/admin/gateway/stats', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  // Vérifier le rôle admin via le service users
-  try {
-    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
-      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
-    });
-    const userData = await safeJson(userRes) as any;
-    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
-  } catch {
-    return res.status(502).json({ error: 'Service indisponible' });
-  }
-  try {
-    const bannedIPs = await redis.getBannedIPs();
-    const rateLimitStats = await redis.getRateLimitStats();
-    res.json({
-      bannedIPs,
-      rateLimitStats,
-      config: { window: RATE_LIMIT_WINDOW, anon: RATE_LIMIT_ANON, user: RATE_LIMIT_USER, admin: RATE_LIMIT_ADMIN },
-    });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur stats gateway:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.post('/api/admin/gateway/ban-ip', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  try {
-    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
-      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
-    });
-    const userData = await safeJson(userRes) as any;
-    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
-  } catch {
-    return res.status(502).json({ error: 'Service indisponible' });
-  }
-  const { ip, reason } = req.body;
-  if (!ip || typeof ip !== 'string') return res.status(400).json({ error: 'IP requise' });
-  try {
-    await redis.banIP(ip.trim(), reason || 'Banni par un administrateur', userId);
-    logger.info(`IP bannie: ${ip} par ${userId} — raison: ${reason || 'non spécifiée'}`);
-    res.json({ success: true });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur ban IP:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.delete('/api/admin/gateway/ban-ip/:ip', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  try {
-    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
-      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
-    });
-    const userData = await safeJson(userRes) as any;
-    if (!userData || userData.role !== 'admin') return res.status(403).json({ error: 'Accès refusé' });
-  } catch {
-    return res.status(502).json({ error: 'Service indisponible' });
-  }
-  const ip = decodeURIComponent(req.params.ip);
-  try {
-    await redis.unbanIP(ip);
-    logger.info(`IP débannie: ${ip} par ${userId}`);
-    res.json({ success: true });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur unban IP:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** GET /api/admin/monitoring — current status + last 24h stats */
-app.get('/api/admin/monitoring', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const [latestServices, userHistory, peakUsers] = await Promise.all([
-      monitoringDB.getLatestServiceStatus(),
-      monitoringDB.getUserStatsHistory(24),
-      monitoringDB.getPeakUsers(24),
-    ]);
-    res.json({
-      services: latestServices,
-      connectedUsers: {
-        current: connectedClients.size,
-        peak24h: peakUsers,
-        history: userHistory,
-      },
-      checkedAt: new Date(),
-    });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur /api/admin/monitoring:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** GET /api/admin/monitoring/service/:name?hours=24 — history for a specific service */
-app.get('/api/admin/monitoring/service/:name', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const hours = Math.min(parseInt(String(req.query.hours) || '24'), 168); // max 7 days
-    const history = await monitoringDB.getServiceHistory(req.params.name, hours);
-    res.json({ service: req.params.name, hours, history });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur /api/admin/monitoring/service:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** GET /api/admin/monitoring/users/chart?period=30min|10min|hour|day|month */
-app.get('/api/admin/monitoring/users/chart', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const period = req.query.period as string;
-  if (!['30min', '10min', 'hour', 'day', 'month'].includes(period)) {
-    return res.status(400).json({ error: 'period must be 30min, 10min, hour, day or month' });
-  }
-  try {
-    const data = await monitoringDB.getUserStatsAggregated(period as any);
-    res.json({ period, data });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur /api/admin/monitoring/users/chart:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-// ── Public status endpoint ───────────────────────────────────────────────────
-
-/** GET /api/status — public: current service statuses + active incidents + 90-day uptime */
-app.get('/api/status', async (_req, res) => {
-  try {
-    const [latestStatuses, activeIncidents] = await Promise.all([
-      monitoringDB.getLatestServiceStatus(),
-      monitoringDB.getIncidents(false),
-    ]);
-
-    // Fetch 90-day uptime per service
-    const serviceNames = [...new Set(latestStatuses.map((s) => s.service))];
-    const uptimeByService: Record<string, import('./utils/monitoring-db').ServiceUptimeDay[]> = {};
-    await Promise.all(
-      serviceNames.map(async (name) => {
-        uptimeByService[name] = await monitoringDB.getServiceUptimeDaily(name, 90);
-      }),
-    );
-
-    // Public-safe subset of service instances (no metrics, no internal endpoints)
-    const publicInstances = serviceRegistry.getAll().map((inst) => ({
-      serviceType: inst.serviceType,
-      domain: inst.domain,
-      location: inst.location,
-      healthy: inst.healthy,
-      lastHeartbeat: inst.lastHeartbeat,
-      score: serviceRegistry.computeScore(inst),
-    }));
-
-    res.json({ services: latestStatuses, incidents: activeIncidents, uptime: uptimeByService, instances: publicInstances });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur /api/status:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-// ── Admin: incident CRUD ──────────────────────────────────────────────────────
-
-/** GET /api/admin/status/incidents?includeResolved=true */
-app.get('/api/admin/status/incidents', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const includeResolved = req.query.includeResolved === 'true';
-    const incidents = await monitoringDB.getIncidents(includeResolved);
-    res.json({ incidents });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur GET /api/admin/status/incidents:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** POST /api/admin/status/incidents */
-app.post('/api/admin/status/incidents', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const { title, message, severity, services, status } = req.body;
-    if (!title || !severity) return res.status(400).json({ error: 'title et severity requis' });
-    const createdBy = extractUserIdFromJWT(req.headers.authorization) ?? undefined;
-    const id = await monitoringDB.createIncident({ title, message, severity, services, status, createdBy });
-    if (!id) return res.status(500).json({ error: 'Erreur création incident' });
-    res.status(201).json({ id });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur POST /api/admin/status/incidents:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** PATCH /api/admin/status/incidents/:id */
-app.patch('/api/admin/status/incidents/:id', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: 'ID invalide' });
-    const { title, message, severity, services, status } = req.body;
-    const ok = await monitoringDB.updateIncident(id, { title, message, severity, services, status });
-    if (!ok) return res.status(500).json({ error: 'Erreur mise à jour' });
-    res.json({ success: true });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur PATCH /api/admin/status/incidents:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-/** DELETE /api/admin/status/incidents/:id */
-app.delete('/api/admin/status/incidents/:id', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  try {
-    const id = parseInt(req.params.id);
-    if (isNaN(id)) return res.status(400).json({ error: 'ID invalide' });
-    const ok = await monitoringDB.deleteIncident(id);
-    if (!ok) return res.status(500).json({ error: 'Erreur suppression' });
-    res.json({ success: true });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur DELETE /api/admin/status/incidents:');
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-// ── Admin: service registry management ───────────────────────────────────────
-
-/** GET /api/admin/services — liste toutes les instances connues (y compris désactivées) */
-app.get('/api/admin/services', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const instances = serviceRegistry.getAll().map((i) => ({
-    ...i,
-    score: serviceRegistry.computeScore(i),
-  }));
-  res.json({ instances });
-});
-
-/** GET /api/admin/services/:type — instances d'un type donné (y compris désactivées) */
-app.get('/api/admin/services/:type', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const instances = serviceRegistry.getInstances(req.params.type as ServiceType, true, true).map((i) => ({
-    ...i,
-    score: serviceRegistry.computeScore(i),
-  }));
-  res.json({ instances });
-});
-
-/** POST /api/admin/services — ajoute manuellement une instance */
-app.post('/api/admin/services', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const { id, serviceType, endpoint, domain, location } = req.body ?? {};
-  const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
-  if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
-    return res.status(400).json({ error: 'id, serviceType, endpoint, domain, location requis' });
-  }
-  // Rejeter les endpoints IP
-  const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
-  if (IP_ENDPOINT_RE.test(String(endpoint))) {
-    return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine' });
-  }
-  const instance = serviceRegistry.register({
-    id: String(id),
-    serviceType: serviceType as ServiceType,
-    endpoint: String(endpoint),
-    domain: String(domain),
-    location: String(location).toUpperCase(),
-    metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100, bandwidthUsage: 0, requestCount20min: 0 },
-    enabled: true,
-  });
-  monitoringDB.upsertServiceInstance({
-    id: String(id), serviceType: String(serviceType),
-    endpoint: String(endpoint), domain: String(domain),
-    location: String(location).toUpperCase(),
-  }).catch(() => {});
-  // Générer une clé unique pour ce service
-  const { rawKey, hash } = generateServiceKey();
-  serviceKeyHashes.set(String(id), hash);
-  monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
-  // Ajouter à la whitelist et retirer des blacklists
-  allowedServiceIds.add(String(id));
-  bannedServiceIds.delete(String(id));
-  logger.info(`Admin: service "${id}" ajouté avec une clé unique`);
-  res.status(201).json({ success: true, instance, serviceKey: rawKey });
-});
-
-/**
- * PATCH /api/admin/services/:id — active ou désactive une instance (persiste en DB).
- * Body: { enabled: boolean }
- * Ne bannit pas → le service peut continuer à heartbeater mais ne reçoit plus de trafic.
- */
-app.patch('/api/admin/services/:id', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const decodedId = decodeURIComponent(req.params.id);
-  const { enabled } = req.body ?? {};
-  if (typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'Le champ "enabled" (boolean) est requis' });
-  }
-  const ok = serviceRegistry.setEnabled(decodedId, enabled);
-  if (!ok) return res.status(404).json({ error: 'Instance introuvable' });
-  // Persister l'état en DB
-  monitoringDB.setInstanceEnabled(decodedId, enabled).catch(() => {});
-  // Synchroniser la blacklist mémoire
-  if (enabled) bannedServiceIds.delete(decodedId);
-  else bannedServiceIds.add(decodedId);
-  logger.info(`Admin: instance "${decodedId}" ${enabled ? 'activée' : 'désactivée'}`);
-  res.json({ success: true, enabled });
-});
-
-/**
- * DELETE /api/admin/services/:id — supprime définitivement une instance.
- * Ban en mémoire (jusqu'au prochain redémarrage du gateway) + suppression DB.
- */
-app.delete('/api/admin/services/:id', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const decodedId = decodeURIComponent(req.params.id);
-  const removed = serviceRegistry.remove(decodedId);
-  if (!removed) return res.status(404).json({ error: 'Instance introuvable' });
-  bannedServiceIds.add(decodedId);
-  allowedServiceIds.delete(decodedId);  // Retirer de la whitelist → plus jamais de ré-enregistrement
-  logger.info(`ServiceRegistry: instance "${decodedId}" supprimée et bannie par un admin`);
-  monitoringDB.removeServiceInstance(decodedId).catch(() => {});
-  res.json({ success: true });
-});
-
-/**
- * POST /api/admin/services/:id/rotate-key
- * Régénère la clé de service pour une instance existante.
- * Retourne la nouvelle clé (affichée une seule fois) — mettre à jour le .env du service.
- */
-app.post('/api/admin/services/:id/rotate-key', async (req, res) => {
-  if (!await requireAdmin(req, res)) return;
-  const decodedId = decodeURIComponent(req.params.id);
-  if (!serviceRegistry.getAll().find(i => i.id === decodedId)) {
-    return res.status(404).json({ error: 'Instance introuvable' });
-  }
-  const { rawKey, hash } = generateServiceKey();
-  serviceKeyHashes.set(decodedId, hash);
-  monitoringDB.storeServiceKeyHash(decodedId, rawKey).catch(() => {});
-  logger.info(`Admin: clé régénérée pour le service "${decodedId}"`);
-  res.json({ success: true, serviceKey: rawKey });
-});
-
-app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
-app.all('/api/admin', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+registerAdminRoutes(app);
 
 // Routes Messages
 app.all('/api/messages/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/messages', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/conversations/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/conversations', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
-
-// Routes Archive DM (système hybride)
 app.all('/api/archive/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/archive', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
-
-// Routes Notifications (persistance DB)
 app.all('/api/notifications/*', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
 app.all('/api/notifications', (req, res) => proxyRequest(getServiceUrl('messages', MESSAGES_URL), req, res, MESSAGES_URL));
-
-// Routes Friends
-// Route spécifique : envoi demande d'ami via HTTP → proxy + notification WS au destinataire
-app.post('/api/friends/request', async (req, res) => {
-  const fromUserId = extractUserIdFromJWT(req.headers.authorization);
-  try {
-    const url = `${FRIENDS_URL}/friends/request`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        ...(fromUserId && { 'X-User-Id': fromUserId }),
-      },
-      body: JSON.stringify(req.body),
-    });
-    const data = await response.json() as any;
-    res.status(response.status).json(data);
-    // Notifier le destinataire via WS si succès
-    if (response.ok && data.toUserId) {
-      io.to(`user:${data.toUserId}`).emit('FRIEND_REQUEST', {
-        type: 'FRIEND_REQUEST',
-        payload: { id: data.id, fromUserId, toUserId: data.toUserId },
-        timestamp: new Date(),
-      });
-    }
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur envoi demande ami:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-});
-// Route spécifique : acceptation demande d'ami → proxy + notification WS aux deux utilisateurs
-app.post('/api/friends/requests/:requestId/accept', async (req, res) => {
-  const acceptorUserId = extractUserIdFromJWT(req.headers.authorization);
-  const { requestId } = req.params;
-  try {
-    const url = `${FRIENDS_URL}/friends/requests/${requestId}/accept`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        ...(acceptorUserId && { 'X-User-Id': acceptorUserId }),
-      },
-      body: JSON.stringify({ ...req.body, userId: acceptorUserId }),
-    });
-    const data = await response.json() as any;
-    res.status(response.status).json(data);
-    if (response.ok) {
-      const fromUserId = data.user_id || data.userId;
-      const toUserId = data.friend_id || data.friendId;
-      if (fromUserId) io.to(`user:${fromUserId}`).emit('FRIEND_ACCEPT', { type: 'FRIEND_ACCEPT', payload: data, timestamp: new Date() });
-      if (toUserId) io.to(`user:${toUserId}`).emit('FRIEND_ACCEPT', { type: 'FRIEND_ACCEPT', payload: data, timestamp: new Date() });
-    }
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur accept ami:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-});
-
-// Helper : parse JSON sans planter si la réponse n'est pas du JSON
-async function safeJson(response: Response): Promise<any> {
-  const text = await response.text();
-  if (!text) return null;
-  try { return JSON.parse(text); } catch { return null; }
-}
-
-// GET /api/friends → GET /friends/
-app.get('/api/friends', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/`, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-    });
-    const data = await safeJson(response);
-    res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur getFriends:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-});
-
-// GET /api/friends/requests → GET /friends/requests
-app.get('/api/friends/requests', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/requests`, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-    });
-    const data = await safeJson(response);
-    // Le frontend attend { received: [], sent: [] }
-    const normalized = response.ok
-      ? (Array.isArray(data) ? { received: data, sent: [] } : (data ?? { received: [], sent: [] }))
-      : (data ?? { error: 'Erreur service' });
-    res.status(response.status).json(normalized);
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur getFriendRequests:');
-    res.status(502).json({ received: [], sent: [] });
-  }
-});
-
-// GET /api/friends/blocked → GET /friends/blocked
-app.get('/api/friends/blocked', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/blocked`, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-    });
-    const data = await safeJson(response);
-    res.status(response.status).json(response.ok ? (data ?? []) : (data ?? { error: 'Erreur service' }));
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur getBlockedUsers:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-});
-
-// DELETE /api/friends/:friendId → DELETE /friends/:friendId
-app.delete('/api/friends/:friendId', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  const { friendId } = req.params;
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/${friendId}`, {
-      method: 'DELETE',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-      body: JSON.stringify({ userId }),
-    });
-    const data = await safeJson(response);
-    if (response.ok) {
-      io.to(`user:${userId}`).emit('FRIEND_REMOVE', { type: 'FRIEND_REMOVE', payload: { friendId }, timestamp: new Date() });
-      io.to(`user:${friendId}`).emit('FRIEND_REMOVE', { type: 'FRIEND_REMOVE', payload: { friendId: userId }, timestamp: new Date() });
-    }
-    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur removeFriend:');
-    res.status(502).json({ success: false, error: 'Service indisponible' });
-  }
-});
-
-// POST /api/friends/:targetId/block → POST /friends/:targetId/block
-app.post('/api/friends/:targetId/block', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  const { targetId } = req.params;
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/block`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-      body: JSON.stringify({ userId, blockedUserId: targetId }),
-    });
-    const data = await safeJson(response);
-    if (response.ok) invalidateBlockCache(userId, targetId);
-    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur blockUser:');
-    res.status(502).json({ success: false, error: 'Service indisponible' });
-  }
-});
-
-// POST /api/friends/:targetId/unblock → POST /friends/:targetId/unblock
-app.post('/api/friends/:targetId/unblock', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  const { targetId } = req.params;
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/unblock`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-      body: JSON.stringify({ userId }),
-    });
-    const data = await safeJson(response);
-    if (response.ok) invalidateBlockCache(userId, targetId);
-    res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur unblockUser:');
-    res.status(502).json({ success: false, error: 'Service indisponible' });
-  }
-});
-
-// Décline d'une demande d'ami  
-app.post('/api/friends/requests/:requestId/decline', async (req, res) => {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) return res.status(401).json({ error: 'Non authentifié' });
-  const { requestId } = req.params;
-  try {
-    const response = await fetch(`${FRIENDS_URL}/friends/requests/${requestId}/decline`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        'X-User-Id': userId,
-      },
-      body: JSON.stringify({ userId }),
-    });
-    const data = await safeJson(response) ?? {};
-    res.status(response.status).json({ success: response.ok, ...(data as object) });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur declineFriendRequest:');
-    res.status(502).json({ success: false, error: 'Service indisponible' });
-  }
-});
-
-app.all('/api/friends/*', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res, FRIENDS_URL));
-app.all('/api/friends', (req, res) => proxyRequest(getServiceUrl('friends', FRIENDS_URL), req, res, FRIENDS_URL));
+registerFriendsRoutes(app);
 
 // Routes Calls
 app.all('/api/calls/*', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL));
 app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL));
-
-// Routes Servers — proxy intelligent : redirige vers le server-node si connecté
-// Les routes « annuaire » vont toujours vers le microservice central :
-app.all('/api/servers/join', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/invite/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/invites/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/public/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/discover/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/badges/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/admin/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-// GET /api/servers — liste des serveurs, enrichie avec les infos des nodes connectés
-app.get('/api/servers', async (req, res) => {
-  try {
-    const userId = extractUserIdFromJWT(req.headers.authorization);
-    const url = `${getServiceUrl('servers', SERVERS_URL)}/servers?userId=${userId || ''}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        ...(userId && { 'X-User-Id': userId }),
-      },
-    });
-
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({ error: 'Service indisponible' }));
-      return res.status(response.status).json(data);
-    }
-
-    const servers = await response.json();
-    if (!Array.isArray(servers)) return res.json(servers);
-
-    // Enrichir chaque serveur avec les infos du node connecté (icon, banner, etc.)
-    const enriched = await Promise.all(
-      servers.map(async (server: any) => {
-        try {
-          const nodeInfo = await forwardToNode(server.id, 'SERVER_INFO', {});
-          if (nodeInfo) {
-            // Les données du node ont la priorité
-            if (nodeInfo.iconUrl) server.iconUrl = nodeInfo.iconUrl;
-            if (nodeInfo.bannerUrl) server.bannerUrl = nodeInfo.bannerUrl;
-            if (nodeInfo.name) server.name = nodeInfo.name;
-            if (nodeInfo.description) server.description = nodeInfo.description;
-          }
-        } catch {
-          // Pas de node connecté → on garde les données du microservice
-        }
-        return server;
-      })
-    );
-
-    res.json(enriched);
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur proxy GET /api/servers:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-});
-app.post('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-
-// Routes qui restent TOUJOURS vers le microservice même pour un serverId
-app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-app.all('/api/servers/:serverId/domain/*', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-
-// Proxy dédié vers un server-node : réécriture d'URL automatique
-async function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.Request, res: express.Response) {
-  try {
-    const url = `${nodeEndpoint}${nodePath}`;
-    const userId = extractUserIdFromJWT(req.headers.authorization);
-    let bodyToSend = req.body;
-    if (userId && req.method !== 'GET' && req.method !== 'HEAD') {
-      bodyToSend = { ...req.body, userId, ownerId: userId };
-    }
-
-    const response = await fetch(url, {
-      method: req.method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
-        ...(userId && { 'X-User-Id': userId }),
-      },
-      ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
-    });
-
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
-      const data = await response.json();
-      res.status(response.status).json(data);
-    } else if (contentType && (contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/') || contentType.startsWith('application/octet-stream') || contentType.startsWith('application/pdf'))) {
-      // Fichier binaire (image, video, etc.) — transférer en tant que buffer
-      const buffer = Buffer.from(await response.arrayBuffer());
-      res.setHeader('Content-Type', contentType);
-      const cacheControl = response.headers.get('cache-control');
-      if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      res.status(response.status).send(buffer);
-    } else {
-      res.status(response.status).json({ error: 'Node non disponible' });
-    }
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur proxy node:');
-    res.status(502).json({ error: 'Server node indisponible' });
-  }
-}
-
-// Proxy multipart/form-data vers un server-node (fichiers, images)
-async function proxyToNodeMultipart(nodeEndpoint: string, nodePath: string, req: express.Request, res: express.Response) {
-  try {
-    const url = `${nodeEndpoint}${nodePath}`;
-    const userId = extractUserIdFromJWT(req.headers.authorization);
-
-    // Ajouter userId en query si non présent
-    const separator = url.includes('?') ? '&' : '?';
-    const finalUrl = userId ? `${url}${separator}senderId=${userId}` : url;
-
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', async () => {
-      try {
-        const body = Buffer.concat(chunks);
-        const headers: Record<string, string> = {};
-        if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'] as string;
-        if (req.headers.authorization) headers['authorization'] = req.headers.authorization;
-        if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'] as string;
-
-        const response = await fetch(finalUrl, {
-          method: req.method,
-          headers,
-          body,
-        });
-
-        const contentType = response.headers.get('content-type');
-        if (contentType && contentType.includes('application/json')) {
-          const data = await response.json();
-          res.status(response.status).json(data);
-        } else {
-          const text = await response.text();
-          res.status(response.status).send(text);
-        }
-      } catch (error) {
-        logger.error({ err: error }, 'Erreur proxy node multipart:');
-        res.status(502).json({ error: 'Server node indisponible' });
-      }
-    });
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur proxy node multipart:');
-    res.status(502).json({ error: 'Server node indisponible' });
-  }
-}
-
-// Réécriture d'URL : /api/servers/:id/X → /X (pour le node)
-function rewriteNodePath(req: express.Request, serverId: string): string {
-  const fullPath = req.originalUrl.split('?')[0];
-  const query = req.originalUrl.includes('?') ? '?' + req.originalUrl.split('?')[1] : '';
-  const prefix = `/api/servers/${serverId}`;
-  let subPath = fullPath.startsWith(prefix) ? fullPath.slice(prefix.length) : fullPath;
-
-  // /channels/:chId/messages?... → /messages?channelId=:chId&...
-  const msgMatch = subPath.match(/^\/channels\/([^/]+)\/messages$/);
-  if (msgMatch) {
-    const channelId = msgMatch[1];
-    const sep = query ? query + '&' : '?';
-    return `/messages${sep}channelId=${channelId}`;
-  }
-
-  return (subPath || '/') + query;
-}
-
-// Proxy multipart brut vers un microservice (fallback upload sans node)
-async function proxyMultipartToService(targetUrl: string, targetPath: string, req: express.Request, res: express.Response) {
-  try {
-    const userId = extractUserIdFromJWT(req.headers.authorization);
-    const sep = targetPath.includes('?') ? '&' : '?';
-    const finalUrl = userId ? `${targetUrl}${targetPath}${sep}senderId=${userId}` : `${targetUrl}${targetPath}`;
-
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', async () => {
-      try {
-        const body = Buffer.concat(chunks);
-        const headers: Record<string, string> = {};
-        if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'] as string;
-        if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'] as string;
-        if (req.headers.authorization) headers['authorization'] = req.headers.authorization;
-
-        const response = await fetch(finalUrl, { method: 'POST', headers, body });
-        const data = await response.json() as any;
-        res.status(response.status).json(data);
-      } catch (err) {
-        logger.error({ err: err }, 'Erreur proxy multipart service:');
-        res.status(502).json({ error: 'Service indisponible' });
-      }
-    });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur proxy multipart service:');
-    res.status(502).json({ error: 'Service indisponible' });
-  }
-}
-
-// Route spécifique upload fichiers serveur (avant le catch-all /:serverId/*)
-app.post('/api/servers/:serverId/files', (req, res) => {
-  const { serverId } = req.params;
-  const node = connectedNodes.get(serverId);
-  const query = req.originalUrl.includes('?') ? '?' + req.originalUrl.split('?')[1] : '';
-
-  if (node?.endpoint) {
-    proxyToNodeMultipart(node.endpoint, `/files${query}`, req, res);
-    return;
-  }
-  // Fallback sans node : vers le servers microservice
-  proxyMultipartToService(getServiceUrl('servers', SERVERS_URL), `/servers/${serverId}/files${query}`, req, res);
-});
-
-// Serve fichiers uploadés (fallback sans node)
-app.get('/api/servers/:serverId/files/:filename', async (req, res) => {
-  const { serverId, filename } = req.params;
-  const node = connectedNodes.get(serverId);
-
-  if (node?.endpoint) {
-    // Proxy vers le node
-    try {
-      const response = await fetch(`${node.endpoint}/files/${filename}`);
-      if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
-      const ct = response.headers.get('content-type');
-      if (ct) res.setHeader('Content-Type', ct);
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      res.send(Buffer.from(await response.arrayBuffer()));
-    } catch { res.status(502).json({ error: 'Node indisponible' }); }
-    return;
-  }
-  // Fallback vers le servers microservice
-  try {
-    const response = await fetch(`${getServiceUrl('servers', SERVERS_URL)}/servers/${serverId}/files/${filename}`);
-    if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
-    const ct = response.headers.get('content-type');
-    if (ct) res.setHeader('Content-Type', ct);
-    res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.send(Buffer.from(await response.arrayBuffer()));
-  } catch { res.status(502).json({ error: 'Service indisponible' }); }
-});
-
-// Routes serveur-spécifiques : /api/servers/:serverId/...
-app.all('/api/servers/:serverId/*', (req, res) => {
-  const { serverId } = req.params;
-  const node = connectedNodes.get(serverId);
-
-  if (node?.endpoint) {
-    const contentType = req.headers['content-type'] || '';
-    // Multipart/form-data → proxy brut (fichiers)
-    if (contentType.includes('multipart/form-data')) {
-      proxyToNodeMultipart(node.endpoint, rewriteNodePath(req, serverId), req, res);
-      return;
-    }
-    const nodePath = rewriteNodePath(req, serverId);
-    proxyToNode(node.endpoint, nodePath, req, res);
-    return;
-  }
-
-  // Aucun node connecté → microservice central
-  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL);
-});
-
-// /api/servers/:serverId (sans sous-chemin) → /server sur le node
-app.all('/api/servers/:serverId', (req, res) => {
-  const { serverId } = req.params;
-  const node = connectedNodes.get(serverId);
-
-  if (node?.endpoint) {
-    proxyToNode(node.endpoint, '/server', req, res);
-    return;
-  }
-
-  proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL);
-});
-
-// Fallback
-app.all('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
-
+registerServersRoutes(app);
 // Routes Bots
 app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL));
 app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL));
-
-// ============ ROUTES MÉDIA — Routage géo-distribué ============
-//
-// Structure d'URL pour les médias :
-//   Upload  : POST /api/media/upload/:type?location=EU
-//   Download: GET  /api/media/:location/:serviceId/:folder/:filename
-//             ex.  GET /api/media/EU/media-eu-1/avatars/user123-abc.webp
-//
-// Si aucune instance n'est enregistrée dans le registre, fallback vers MEDIA_URL.
-
-/** Proxy brut multipart/JSON vers un endpoint media */
-async function proxyToMedia(targetEndpoint: string, mediaPath: string, req: express.Request, res: express.Response) {
-  try {
-    const url = `${targetEndpoint}${mediaPath}`;
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', async () => {
-      try {
-        const body = Buffer.concat(chunks);
-        const headers: Record<string, string> = {};
-        if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'] as string;
-        if (req.headers.authorization) headers['authorization'] = req.headers.authorization;
-        if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'] as string;
-
-        const response = await fetch(url, {
-          method: req.method,
-          headers,
-          ...(req.method !== 'GET' && req.method !== 'HEAD' && { body }),
-        });
-
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const data = await response.json();
-          res.status(response.status).json(data);
-        } else if (
-          contentType.startsWith('image/') ||
-          contentType.startsWith('video/') ||
-          contentType.startsWith('audio/') ||
-          contentType.startsWith('application/octet-stream')
-        ) {
-          const buffer = Buffer.from(await response.arrayBuffer());
-          res.setHeader('Content-Type', contentType);
-          res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-          res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-          const cc = response.headers.get('cache-control');
-          if (cc) res.setHeader('Cache-Control', cc);
-          res.status(response.status).send(buffer);
-        } else {
-          res.status(response.status).send(await response.text());
-        }
-      } catch (err) {
-        logger.error({ err: err }, 'Erreur proxy média:');
-        res.status(502).json({ error: 'Service média indisponible' });
-      }
-    });
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur proxy média:');
-    res.status(502).json({ error: 'Service média indisponible' });
-  }
-}
-
-// ── Download : GET /api/media/:location/:serviceId/:folder/:filename ──────────
-//   Route spécifique avant le catch-all upload
-app.get('/api/media/:location/:serviceId/:folder/:filename', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-
-  const { location, serviceId, folder, filename } = req.params;
-
-  // 1. Chercher l'instance par serviceId dans le registre
-  let instance = serviceRegistry.getById(serviceId);
-
-  // 2. Fallback : chercher une instance saine dans la même région
-  if (!instance || !instance.healthy) {
-    const regional = serviceRegistry.selectBestByLocation('media', location);
-    if (regional) {
-      logger.warn(`MediaProxy: instance ${serviceId} introuvable/hors-ligne, fallback sur ${regional.id}`);
-      instance = regional;
-    }
-  }
-
-  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
-  const mediaPath = `/uploads/${folder}/${filename}`;
-
-  try {
-    const response = await fetch(`${targetEndpoint}${mediaPath}`);
-    if (!response.ok) {
-      res.status(response.status).json({ error: 'Fichier non trouvé' });
-      return;
-    }
-    const contentType = response.headers.get('content-type');
-    const cacheControl = response.headers.get('cache-control');
-    if (contentType) res.setHeader('Content-Type', contentType);
-    if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-    res.send(Buffer.from(await response.arrayBuffer()));
-  } catch (err) {
-    logger.error({ err: err }, 'Erreur download média:');
-    res.status(502).json({ error: 'Service média indisponible' });
-  }
-});
-
-// ── Upload : POST/PATCH /api/media/upload/* → meilleur serveur par localisation ──
-app.all('/api/media/upload/*', async (req, res) => {
-  // Localisation préférée : header X-Media-Location ou query ?location=EU
-  const preferredLocation = (req.headers['x-media-location'] as string | undefined)
-    ?? (req.query.location as string | undefined);
-
-  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation)
-    ?? null;
-  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
-
-  // Réécrire l'URL vers /media/upload/:type (le préfixe /api est retiré)
-  const mediaPath = req.originalUrl.replace(/^\/api/, '');
-  proxyToMedia(targetEndpoint, mediaPath, req, res);
-});
-
-// ── Catch-all /api/media/* — redirige vers la meilleure instance ──────────────
-app.all('/api/media/*', async (req, res) => {
-  const preferredLocation = (req.headers['x-media-location'] as string | undefined)
-    ?? (req.query.location as string | undefined);
-  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
-  const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
-  const mediaPath = req.originalUrl.replace(/^\/api/, '');
-  proxyToMedia(targetEndpoint, mediaPath, req, res);
-});
-
-// Routes Uploads — proxy des fichiers statiques depuis le service média
-// (compatibilité avec les anciennes URLs /uploads/*)
-app.get('/uploads/*', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  try {
-    // Chercher une instance média quelconque saine
-    const instance = serviceRegistry.selectBest('media');
-    const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
-    const url = `${targetEndpoint}${req.originalUrl}`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      res.status(response.status).json({ error: 'Fichier non trouvé' });
-      return;
-    }
-
-    const contentType = response.headers.get('content-type');
-    const cacheControl = response.headers.get('cache-control');
-    if (contentType) res.setHeader('Content-Type', contentType);
-    if (cacheControl) res.setHeader('Cache-Control', cacheControl);
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    res.send(buffer);
-  } catch (error) {
-    logger.error({ err: error }, 'Erreur proxy uploads:');
-    res.status(502).json({ error: 'Service média indisponible' });
-  }
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'gateway', timestamp: new Date() });
-});
-
-// Mobile socket diagnostic endpoint
-app.get('/api/socket/status', (req, res) => {
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.replace('Bearer ', '');
-  let tokenValid = false;
-  let userId: string | null = null;
-
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
-      tokenValid = true;
-      userId = decoded.userId;
-    } catch {}
-  }
-
-  res.json({
-    status: 'ok',
-    socketIO: true,
-    transports: ['websocket', 'polling'],
-    tokenProvided: !!token,
-    tokenValid,
-    userId,
-    timestamp: new Date(),
-  });
-});
+// Routes Hébergement serveurs (ServerHosting)
+app.all('/api/subscriptions/webhooks/*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+app.all('/api/hosting/*', (req, res) => proxyRequest(SERVERHOSTING_URL, req, res));
+app.all('/api/hosting', (req, res) => proxyRequest(SERVERHOSTING_URL, req, res));
+// Routes Abonnements & Paiements
+app.all('/api/subscriptions/plans*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+app.all('/api/subscriptions/checkout/*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+app.all('/api/subscriptions/*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+app.all('/api/subscriptions', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+registerMediaRoutes(app);
+registerHealthRoutes(app);
 
 // Socket.IO Server
 const io = new Server(httpServer, {
@@ -1564,6 +248,10 @@ redis = new RedisClient({
   port: parseInt(process.env.REDIS_PORT || '6379'),
   password: process.env.REDIS_PASSWORD,
 });
+
+// Populate runtime context so extracted modules can access io / redis
+runtime.io = io;
+runtime.redis = redis;
 
 // Adaptateur Redis pour Socket.IO (scaling multi-instances)
 const _ioRedisPub = redis.getRawClient();
@@ -1594,13 +282,6 @@ interface AuthenticatedSocket extends Socket {
   userId?: string;
   sessionId?: string;
   user?: User;
-}
-
-interface ConnectedClient {
-  socketId: string;
-  userId: string;
-  sessionId: string;
-  connectedAt: Date;
 }
 
 // ============ MIDDLEWARE D'AUTHENTIFICATION ============
@@ -1634,117 +315,6 @@ io.use(async (socket: AuthenticatedSocket, next) => {
 });
 
 // ============ GESTION DES CONNEXIONS ============
-
-const connectedClients = new Map<string, ConnectedClient>();
-
-// ── Message rate limiting ──
-// userId → array of timestamps (last N messages)
-const messageRateLimit = new Map<string, number[]>();
-const MSG_RATE_WINDOW = 10000; // 10 seconds
-const MSG_RATE_MAX = 10;       // max 10 messages per window (1 msg/sec moyen, autorise bursts)
-
-// Rate limit SERVER_JOIN / SERVER_LEAVE (anti spam de messages système "X a rejoint")
-const serverJoinRateLimit = new Map<string, number[]>();
-const JOIN_RATE_WINDOW = 60000; // 60 seconds
-const JOIN_RATE_MAX = 5;        // max 5 join/leave per minute par user
-
-function checkServerJoinRate(userId: string): boolean {
-  const now = Date.now();
-  const timestamps = serverJoinRateLimit.get(userId) || [];
-  const recent = timestamps.filter(t => now - t < JOIN_RATE_WINDOW);
-  if (recent.length >= JOIN_RATE_MAX) return false;
-  recent.push(now);
-  serverJoinRateLimit.set(userId, recent);
-  return true;
-}
-
-// ── Cache block-status ──
-// Clé = `${userA}:${userB}` (toujours trié alphabétiquement pour éviter les doublons)
-// Valeur = { aBlockedB, bBlockedA, expiresAt }
-// Vidé sur FRIEND_BLOCK / FRIEND_UNBLOCK pour invalidation immédiate.
-interface BlockCacheEntry { aBlockedB: boolean; bBlockedA: boolean; expiresAt: number; }
-const blockStatusCache = new Map<string, BlockCacheEntry>();
-const BLOCK_CACHE_TTL = 60_000; // 60 s
-
-function blockCacheKey(u1: string, u2: string): { key: string; swapped: boolean } {
-  const swapped = u1 > u2;
-  return { key: swapped ? `${u2}:${u1}` : `${u1}:${u2}`, swapped };
-}
-
-async function isDmBlocked(senderId: string, recipientId: string): Promise<boolean> {
-  const { key, swapped } = blockCacheKey(senderId, recipientId);
-  const now = Date.now();
-  const cached = blockStatusCache.get(key);
-  if (cached && cached.expiresAt > now) {
-    // Si l'une ou l'autre direction bloque, on refuse le DM
-    return cached.aBlockedB || cached.bBlockedA;
-  }
-  try {
-    const res = await fetch(`${FRIENDS_URL}/friends/${senderId}/block-status/${recipientId}`, {
-      method: 'GET',
-    });
-    if (!res.ok) return false; // En cas d'erreur réseau, on ne bloque pas (fail-open pour éviter les faux positifs)
-    const data = await res.json() as { iBlockedThem?: boolean; theyBlockedMe?: boolean };
-    const aBlockedB = swapped ? !!data.theyBlockedMe : !!data.iBlockedThem;
-    const bBlockedA = swapped ? !!data.iBlockedThem : !!data.theyBlockedMe;
-    blockStatusCache.set(key, { aBlockedB, bBlockedA, expiresAt: now + BLOCK_CACHE_TTL });
-    return aBlockedB || bBlockedA;
-  } catch {
-    return false;
-  }
-}
-
-function invalidateBlockCache(u1: string, u2: string) {
-  const { key } = blockCacheKey(u1, u2);
-  blockStatusCache.delete(key);
-}
-
-// Registry des server-nodes self-hostés connectés (keyed by serverId)
-const connectedNodes = new Map<string, { socketId: string; serverId: string; endpoint?: string; connectedAt: Date }>();
-
-// ── Voice state tracking ──
-// channelId → Map<userId, { socketId, muted, deafened, serverId }>
-interface VoiceParticipant {
-  socketId: string;
-  userId: string;
-  username: string;
-  avatarUrl?: string;
-  muted: boolean;
-  deafened: boolean;
-  serverId: string;
-}
-const voiceChannels = new Map<string, Map<string, VoiceParticipant>>();
-// userId → channelId (each user can only be in one voice channel)
-const userVoiceChannel = new Map<string, string>();
-
-// ── Helper : forward un événement au server-node via acknowledge callback ────
-// Retourne null si aucun node n'est connecté (fallback vers microservice)
-function getNodeSocket(serverId: string): Socket | null {
-  const node = connectedNodes.get(serverId);
-  if (!node) return null;
-  const ns = io.of('/server-nodes');
-  return ns.sockets.get(node.socketId) || null;
-}
-
-function forwardToNode(
-  serverId: string,
-  event: string,
-  data: any,
-  timeoutMs = 15000,
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const nodeSocket = getNodeSocket(serverId);
-    if (!nodeSocket) return reject(new Error('NO_NODE'));
-    const timer = setTimeout(() => {
-      reject(new Error('NODE_TIMEOUT'));
-    }, timeoutMs);
-    nodeSocket.emit(event, data, (response: any) => {
-      clearTimeout(timer);
-      if (response?.error) return reject(new Error(response.error));
-      resolve(response);
-    });
-  });
-}
 
 /**
  * Vérifie qu'un utilisateur a les permissions requises sur un serveur.
@@ -2039,6 +609,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Messages
   socket.on('MESSAGE_CREATE', async (data) => {
     try {
+      const v = validateMessageContent(data?.content, data?.attachments);
+      data = { ...data, content: v.content, ...(v.attachments ? { attachments: v.attachments } : {}) };
       const message = await serviceProxy.messages.createMessage({
         ...data,
         senderId: userId,
@@ -2068,6 +640,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       recent.push(now);
       messageRateLimit.set(userId, recent);
+
+      // ── Validation contenu ──
+      try {
+        const v = validateMessageContent(data?.content, data?.attachments);
+        data = { ...data, content: v.content, ...(v.attachments ? { attachments: v.attachments } : {}) };
+      } catch (err: any) {
+        socket.emit('message:error', { error: 'INVALID', message: err.message });
+        return;
+      }
 
       // ── Vérification de blocage (DM uniquement) ──
       // Si l'un des deux utilisateurs a bloqué l'autre, on refuse l'envoi.
@@ -2206,7 +787,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('MESSAGE_UPDATE', async (data) => {
     try {
-      const message = await serviceProxy.messages.updateMessage(data.messageId, data.content, userId);
+      const v = validateMessageContent(data?.content);
+      const message = await serviceProxy.messages.updateMessage(data.messageId, v.content, userId);
       
       io.to(`conversation:${data.conversationId}`).emit('MESSAGE_UPDATE', {
         type: 'MESSAGE_UPDATE',
@@ -2221,7 +803,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Alias message:edit (compatibilité client)
   socket.on('message:edit', async (data: { messageId: string; content: string }) => {
     try {
-      const updated = await serviceProxy.messages.updateMessage(data.messageId, data.content, userId) as any;
+      const v = validateMessageContent(data?.content);
+      const updated = await serviceProxy.messages.updateMessage(data.messageId, v.content, userId) as any;
       if (!updated) return;
       const conversationId = updated.conversationId;
       io.to(`conversation:${conversationId}`).emit('message:edited', {
@@ -2894,7 +1477,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('SERVER_MESSAGE_SEND', async (data) => {
     try {
-      const { serverId, channelId, content, attachments, replyToId, tags } = data;
+      const v = validateMessageContent(data?.content, data?.attachments);
+      const cleanTags = validateTags(data?.tags);
+      const { serverId, channelId, replyToId } = data;
+      const content = v.content;
+      const attachments = v.attachments;
+      const tags = cleanTags;
 
       // Forward au server-node si connecté (avec callback)
       try {
@@ -2943,7 +1531,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('SERVER_MESSAGE_EDIT', async (data) => {
     try {
-      const { serverId, messageId, content, channelId } = data;
+      const v = validateMessageContent(data?.content);
+      const { serverId, messageId, channelId } = data;
+      const content = v.content;
 
       // Forward au server-node si connecté
       try {
@@ -3073,9 +1663,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CHANNEL_CREATE', async (data) => {
     try {
       const { serverId } = data;
+      const clean = validateChannelInput({ ...data, type: data.type || 'text' });
       try {
         const result = await forwardToNode(serverId, 'CHANNEL_CREATE', {
-          name: data.name, type: data.type || 'text', topic: data.topic, parentId: data.parentId, userId,
+          name: clean.name, type: clean.type || 'text', topic: clean.topic, parentId: clean.parentId, userId,
         });
         // Le node broadcast CHANNEL_CREATE via NODE_BROADCAST
         // Aussi notifier via socket pour confirmation
@@ -3091,7 +1682,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         if (e.message !== 'NO_NODE') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
       // Fallback microservice
-      const channel = await serviceProxy.servers.createChannel(serverId, { name: data.name, type: data.type, parentId: data.parentId }, userId);
+      const channel = await serviceProxy.servers.createChannel(serverId, { name: clean.name!, type: clean.type || 'text', parentId: clean.parentId }, userId);
       io.to(`server:${serverId}`).emit('CHANNEL_CREATE', {
         type: 'CHANNEL_CREATE',
         payload: channel,
@@ -3105,16 +1696,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CHANNEL_UPDATE', async (data) => {
     try {
       const { serverId, channelId } = data;
+      const clean = validateChannelInput(data);
       try {
         await forwardToNode(serverId, 'CHANNEL_UPDATE', {
-          channelId, name: data.name, topic: data.topic, position: data.position, type: data.type, parentId: data.parentId, userId,
+          channelId, name: clean.name, topic: clean.topic, position: data.position, type: clean.type, parentId: clean.parentId, userId,
         });
         // Le node broadcast via NODE_BROADCAST
         return;
       } catch (e: any) {
         if (e.message !== 'NO_NODE') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
-      const channel = await serviceProxy.servers.updateChannel(serverId, channelId, data.updates || data, userId);
+      const channel = await serviceProxy.servers.updateChannel(serverId, channelId, { ...(data.updates || {}), ...clean }, userId);
       io.to(`server:${serverId}`).emit('CHANNEL_UPDATE', {
         type: 'CHANNEL_UPDATE',
         payload: channel,
@@ -3194,9 +1786,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
+      const clean = validateRoleInput(data);
       try {
         const result = await forwardToNode(data.serverId, 'ROLE_CREATE', {
-          name: data.name, color: data.color, permissions: data.permissions, mentionable: data.mentionable, userId,
+          name: clean.name, color: clean.color, permissions: data.permissions, mentionable: data.mentionable, userId,
         });
         if (result?.role) {
           io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
@@ -3211,7 +1804,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       // Fallback microservice
       const role = await serviceProxy.servers.createRole(data.serverId, {
-        name: data.name, color: data.color, permissions: data.permissions,
+        name: clean.name!, color: clean.color, permissions: data.permissions,
       }) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
         type: 'ROLE_CREATE',
@@ -3227,9 +1820,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
+      const clean = validateRoleInput(data);
       try {
         const result = await forwardToNode(data.serverId, 'ROLE_UPDATE', {
-          roleId: data.roleId, name: data.name, color: data.color,
+          roleId: data.roleId, name: clean.name, color: clean.color,
           permissions: data.permissions, position: data.position, mentionable: data.mentionable, userId,
         });
         if (result?.role) {
@@ -3245,7 +1839,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       // Fallback microservice
       const updated = await serviceProxy.servers.updateRole(data.serverId, data.roleId, {
-        name: data.name, color: data.color, permissions: data.permissions,
+        name: clean.name, color: clean.color, permissions: data.permissions,
         position: data.position, mentionable: data.mentionable,
       }) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
@@ -3443,7 +2037,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // ── MEMBER_UPDATE ── Mise à jour des rôles / nickname d'un membre
   socket.on('MEMBER_UPDATE', async (data, callback) => {
     try {
-      const { serverId, targetUserId, roleIds, nickname } = data;
+      const { serverId, targetUserId } = data;
+      const clean = validateMemberUpdate(data);
+      const roleIds = clean.roleIds ?? data.roleIds;
+      const nickname = clean.nickname ?? data.nickname;
 
       // Permission check: MANAGE_ROLES required
       const hasPerm = await checkServerPermission(userId, serverId, 0x100);
@@ -3578,10 +2175,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('SERVER_UPDATE_NODE', async (data) => {
     try {
       const { serverId } = data;
+      const clean = validateServerInput(data);
+      Object.assign(data, clean);
       try {
         const result = await forwardToNode(serverId, 'SERVER_UPDATE', {
-          name: data.name, description: data.description,
-          iconUrl: data.iconUrl, bannerUrl: data.bannerUrl, isPublic: data.isPublic,
+          name: clean.name, description: clean.description,
+          iconUrl: clean.iconUrl, bannerUrl: clean.bannerUrl, isPublic: clean.isPublic,
         });
         io.to(`server:${serverId}`).emit('SERVER_UPDATE', {
           type: 'SERVER_UPDATE',
@@ -3647,10 +2246,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   socket.on('INVITE_CREATE', async (data, callback) => {
+    let clean: ReturnType<typeof validateInviteInput>;
+    try { clean = validateInviteInput(data); }
+    catch (e: any) { if (typeof callback === 'function') callback({ error: e.message }); return; }
     try {
       const result = await forwardToNode(data.serverId, 'INVITE_CREATE', {
-        creatorId: userId, maxUses: data.maxUses, expiresIn: data.expiresIn,
-        customSlug: data.customSlug, isPermanent: data.isPermanent,
+        creatorId: userId, maxUses: clean.maxUses, expiresIn: clean.expiresIn,
+        customSlug: clean.customSlug, isPermanent: clean.isPermanent,
       });
       // Synchroniser l'invitation dans le MySQL central pour que le lien HTTP fonctionne
       if (result && result.code) {
@@ -3659,10 +2261,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
             creatorId: userId,
             code: result.code,
             id: result.id,
-            maxUses: data.maxUses,
-            expiresIn: data.expiresIn,
-            customSlug: data.customSlug,
-            isPermanent: data.isPermanent,
+            maxUses: clean.maxUses,
+            expiresIn: clean.expiresIn,
+            customSlug: clean.customSlug,
+            isPermanent: clean.isPermanent,
           });
         } catch {
           // Sync non critique – le lien pourrait ne pas fonctionner mais ne bloque pas la création
@@ -3674,8 +2276,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Fallback microservice
       try {
         const invite = await serviceProxy.servers.createInvite(data.serverId, {
-          creatorId: userId, maxUses: data.maxUses, expiresIn: data.expiresIn,
-          customSlug: data.customSlug, isPermanent: data.isPermanent,
+          creatorId: userId, maxUses: clean.maxUses, expiresIn: clean.expiresIn,
+          customSlug: clean.customSlug, isPermanent: clean.isPermanent,
         });
         if (typeof callback === 'function') callback(invite);
       } catch {
@@ -3744,6 +2346,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Mise à jour du profil via WebSocket
   socket.on('PROFILE_UPDATE', async (data) => {
     try {
+      data = validateProfile(data);
       const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
       const result = await serviceProxy.users.updateProfile(userId, data, token);
       const updatedUser = (result as any)?.data || { userId, ...data };
@@ -3781,8 +2384,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Créer un groupe
   socket.on('GROUP_CREATE', async (data) => {
     try {
-      const { name, participantIds, avatarUrl } = data;
-      
+      const clean = validateGroupInput(data);
+      const name = clean.name;
+      const avatarUrl = clean.avatarUrl;
+      const participantIds: string[] = clean.participantIds || data.participantIds || [];
+
       // Inclure le créateur dans les participants
       const allParticipants = [userId, ...participantIds.filter((id: string) => id !== userId)];
       
@@ -3830,7 +2436,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Mettre à jour un groupe (nom, avatar, participants)
   socket.on('GROUP_UPDATE', async (data) => {
     try {
-      const { groupId, name, avatarUrl, addParticipants, removeParticipants } = data;
+      const { groupId } = data;
+      const clean = validateGroupInput(data);
+      const name = clean.name;
+      const avatarUrl = clean.avatarUrl;
+      const addParticipants = clean.addParticipants;
+      const removeParticipants = clean.removeParticipants;
       const token: string | undefined = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
 
       // Mettre à jour nom/avatar via service messages
@@ -4430,144 +3041,7 @@ async function broadcastPresenceUpdate(
   }
 }
 
-// ============ ROUTES HTTP ============
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'gateway',
-    uptime: process.uptime(),
-    connections: connectedClients.size,
-  });
-});
-
-app.get('/stats', (req, res) => {
-  res.json({
-    connections: connectedClients.size,
-    rooms: io.sockets.adapter.rooms.size,
-  });
-});
-
-// ============ MONITORING SYSTEM ============
-
-const MONITORED_SERVICES: { name: string; url: string }[] = [
-  { name: 'website',  url: `${process.env.FRONTEND_URL         || 'https://alfychat.app'}` },
-  { name: 'users',    url: `${process.env.USERS_SERVICE_URL    || 'http://localhost:3001'}/health` },
-  { name: 'messages', url: `${process.env.MESSAGES_SERVICE_URL || 'http://localhost:3002'}/health` },
-  { name: 'friends',  url: `${process.env.FRIENDS_SERVICE_URL  || 'http://localhost:3003'}/health` },
-  { name: 'calls',    url: `${process.env.CALLS_SERVICE_URL    || 'http://localhost:3004'}/health` },
-  { name: 'servers',  url: `${process.env.SERVERS_SERVICE_URL  || 'http://localhost:3005'}/health` },
-  { name: 'bots',     url: `${process.env.BOTS_SERVICE_URL     || 'http://localhost:3006'}/health` },
-  { name: 'media',    url: `${process.env.MEDIA_SERVICE_URL    || 'https://media.s.backend.alfychat.app'}/health` },
-];
-
-const MONITORING_INTERVAL_MS = parseInt(process.env.MONITORING_INTERVAL || '60000'); // 60s default
-
-async function runMonitoringCycle(): Promise<void> {
-  const now = new Date();
-
-  // 1. Check each service health (via /health, pour le statut up/down)
-  const snapshots = await Promise.all(
-    MONITORED_SERVICES.map(async (svc) => {
-      const start = Date.now();
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const resp = await fetch(svc.url, { signal: controller.signal });
-        clearTimeout(timeout);
-        const ms = Date.now() - start;
-        const status = resp.ok ? 'up' : 'degraded';
-        return {
-          service: svc.name,
-          status: status as 'up' | 'degraded' | 'down',
-          responseTimeMs: ms,
-          statusCode: resp.status,
-          checkedAt: now,
-        };
-      } catch {
-        return {
-          service: svc.name,
-          status: 'down' as const,
-          responseTimeMs: null,
-          statusCode: null,
-          checkedAt: now,
-        };
-      }
-    }),
-  );
-
-  // 2. Poll /metrics de chaque instance enregistrée dans le registre
-  //    → met à jour CPU/RAM/req/debit en temps réel pour toutes les instances
-  const registeredInstances = serviceRegistry.getAll();
-  await Promise.all(
-    registeredInstances.map(async (instance) => {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 4000);
-        const resp = await fetch(`${instance.endpoint}/metrics`, { signal: controller.signal });
-        clearTimeout(timeout);
-        if (!resp.ok) return;
-        const data = await resp.json() as any;
-        // Mettre à jour les métriques dans le registre si les données sont valides
-        if (typeof data.cpuUsage === 'number' && typeof data.ramUsage === 'number') {
-          serviceRegistry.heartbeat(instance.id, {
-            ramUsage: data.ramUsage ?? 0,
-            ramMax: data.ramMax ?? 0,
-            cpuUsage: data.cpuUsage ?? 0,
-            cpuMax: data.cpuMax ?? 100,
-            bandwidthUsage: data.bandwidthUsage ?? 0,
-            requestCount20min: data.requestCount20min ?? 0,
-            responseTimeMs: data.responseTimeMs,
-          });
-        }
-      } catch {
-        // Pas bloquant — le heartbeat push prend le relais si /metrics est indisponible
-      }
-    }),
-  );
-
-  // 3. Add gateway itself (measure own /health response time)
-  const gwStart = Date.now();
-  try {
-    await fetch(`http://localhost:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
-  } catch { /* ignore */ }
-  snapshots.push({
-    service: 'gateway',
-    status: 'up',
-    responseTimeMs: Date.now() - gwStart,
-    statusCode: 200,
-    checkedAt: now,
-  });
-
-  // 4. Save to DB
-  await monitoringDB.saveServiceSnapshot(snapshots);
-
-  // 5. Save connected user count
-  await monitoringDB.saveUserStats(connectedClients.size);
-
-  logger.info(`[Monitoring] Cycle terminé — ${connectedClients.size} users connectés — services: ${snapshots.map(s => `${s.service}:${s.status}`).join(', ')} — instances polled: ${registeredInstances.length}`);
-}
-
-// Admin monitoring API — requires admin role
-async function requireAdmin(req: express.Request, res: express.Response): Promise<string | null> {
-  const userId = extractUserIdFromJWT(req.headers.authorization);
-  if (!userId) { res.status(401).json({ error: 'Non authentifié' }); return null; }
-  try {
-    const userRes = await fetch(`${getServiceUrl('users', USERS_URL)}/users/${userId}`, {
-      headers: { ...(req.headers.authorization && { authorization: req.headers.authorization }) },
-    });
-    const userData = await safeJson(userRes) as any;
-    if (!userData || userData.role !== 'admin') { res.status(403).json({ error: 'Accès refusé' }); return null; }
-  } catch {
-    res.status(502).json({ error: 'Service indisponible' });
-    return null;
-  }
-  return userId;
-}
-
 // ============ DÉMARRAGE ============
-
-const PORT = process.env.PORT || 3000;
 
 /**
  * Charge les instances de service depuis la DB MySQL et les enregistre dans le registre.
@@ -4631,15 +3105,20 @@ httpServer.listen(PORT, async () => {
   // Init monitoring DB and start collection loop
   await monitoringDB.init();
   await loadInstancesFromDB();
+
+  // ── Hot-reload guard : clear previous intervals created by bun --hot ──
+  const g = globalThis as any;
+  if (g.__gw_monitoringInterval) clearInterval(g.__gw_monitoringInterval);
+  if (g.__gw_pruneInterval) clearInterval(g.__gw_pruneInterval);
+
   // First cycle immediately, then every MONITORING_INTERVAL_MS
-  runMonitoringCycle().catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
-  setInterval(() => {
-    runMonitoringCycle().catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
-    // Prune data older than 30 days every 24h
+  runMonitoringCycle(connectedClients.size).catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
+  g.__gw_monitoringInterval = setInterval(() => {
+    runMonitoringCycle(connectedClients.size).catch((err) => logger.error({ err: err }, 'Monitoring cycle error:'));
   }, MONITORING_INTERVAL_MS);
   // Daily prune at startup + every 24h
   monitoringDB.prune(30).catch(() => {});
-  setInterval(() => monitoringDB.prune(30).catch(() => {}), 24 * 60 * 60 * 1000);
+  g.__gw_pruneInterval = setInterval(() => monitoringDB.prune(30).catch(() => {}), 24 * 60 * 60 * 1000);
 });
 
 // Gestion de l'arrêt gracieux
