@@ -23,7 +23,10 @@ import { RateLimiterRedis } from 'rate-limiter-flexible';
 
 dotenv.config();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'alfychat-super-secret-key-dev-2026';
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET manquant — définissez-le dans .env (openssl rand -hex 64). Refus de démarrer avec un secret par défaut.');
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const app = express();
 const httpServer = createServer(app);
@@ -33,12 +36,15 @@ const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:4000')
   .split(',')
   .map((o) => o.trim());
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
 const corsOptions = {
   origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
     // Autoriser les requêtes sans origin (apps natives, Postman…)
     if (!origin) return cb(null, true);
-    // Autoriser localhost sur n'importe quel port (Flutter web dev, …)
-    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
+    // Autoriser localhost sur n'importe quel port UNIQUEMENT en dev
+    // (évite qu'un attaquant local puisse cibler un déploiement prod)
+    if (!IS_PRODUCTION && /^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error(`CORS: origine non autorisée — ${origin}`));
   },
@@ -46,7 +52,28 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(helmet());
+// Helmet + CSP stricte en prod. Les uploads (media) restent accessibles cross-origin.
+app.use(helmet({
+  contentSecurityPolicy: IS_PRODUCTION ? {
+    useDefaults: true,
+    directives: {
+      "default-src": ["'self'"],
+      "script-src": ["'self'"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+      "img-src": ["'self'", "data:", "blob:", "https:"],
+      "media-src": ["'self'", "blob:", "https:"],
+      "connect-src": ["'self'", "https:", "wss:"],
+      "frame-ancestors": ["'none'"],
+      "object-src": ["'none'"],
+      "base-uri": ["'self'"],
+      "form-action": ["'self'"],
+      "upgrade-insecure-requests": [],
+    },
+  } : false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+  hsts: IS_PRODUCTION ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
+}));
 
 // ============ RATE LIMITING & IP BAN (HTTP) ============
 let redis: RedisClient;
@@ -61,6 +88,17 @@ const RATE_LIMIT_WINDOW = 1; // fenêtre d'1 seconde
 let _rlAnon:  RateLimiterRedis | null = null;
 let _rlUser:  RateLimiterRedis | null = null;
 let _rlAdmin: RateLimiterRedis | null = null;
+// Brute-force protection : login / register / 2FA / reset-password — 10 tentatives / 15 min / IP
+let _rlAuth:  RateLimiterRedis | null = null;
+const RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '10');
+const RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '900'); // 15 min
+const AUTH_BRUTEFORCE_PATHS = [
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/verify-2fa',
+  '/api/auth/forgot-password',
+  '/api/auth/reset-password',
+];
 
 // Trusted reverse-proxy IPs (load balancer / nginx on same host or LAN)
 // Set TRUSTED_PROXIES env var as comma-separated CIDR list or exact IPs.
@@ -244,6 +282,26 @@ async function proxyRequest(targetUrl: string, req: express.Request, res: expres
     res.status(502).json({ error: 'Service indisponible' });
   }
 }
+
+// ⚠️  Rate limit brute-force dédié sur les endpoints sensibles d'authentification.
+// Clé = IP (les attaques viennent rarement d'un compte authentifié).
+app.use(async (req, res, next) => {
+  if (!_rlAuth) return next();
+  if (req.method !== 'POST') return next();
+  const hit = AUTH_BRUTEFORCE_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'));
+  if (!hit) return next();
+  const ip = getClientIP(req);
+  try {
+    await _rlAuth.consume(ip);
+    next();
+  } catch (rateLimitRes: any) {
+    redis?.incrementRateLimitBlocked().catch(() => {});
+    logger.warn(`Brute-force bloqué sur ${req.path} depuis ${ip}`);
+    const retryAfter = rateLimitRes?.msBeforeNext ? Math.ceil(rateLimitRes.msBeforeNext / 1000) : 60;
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ error: 'Trop de tentatives. Réessayez dans quelques minutes.' });
+  }
+});
 
 // Routes Auth & Users
 app.all('/api/auth/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
@@ -960,6 +1018,7 @@ app.post('/api/friends/:targetId/block', async (req, res) => {
       body: JSON.stringify({ userId, blockedUserId: targetId }),
     });
     const data = await safeJson(response);
+    if (response.ok) invalidateBlockCache(userId, targetId);
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
     logger.error({ err: error }, 'Erreur blockUser:');
@@ -983,6 +1042,7 @@ app.post('/api/friends/:targetId/unblock', async (req, res) => {
       body: JSON.stringify({ userId }),
     });
     const data = await safeJson(response);
+    if (response.ok) invalidateBlockCache(userId, targetId);
     res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
   } catch (error) {
     logger.error({ err: error }, 'Erreur unblockUser:');
@@ -1515,6 +1575,7 @@ logger.info('Socket.IO: Redis adapter initialisé (multi-instances)');
 _rlAnon  = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_anon',  points: RATE_LIMIT_ANON,  duration: RATE_LIMIT_WINDOW });
 _rlUser  = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_user',  points: RATE_LIMIT_USER,  duration: RATE_LIMIT_WINDOW });
 _rlAdmin = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_admin', points: RATE_LIMIT_ADMIN, duration: RATE_LIMIT_WINDOW });
+_rlAuth  = new RateLimiterRedis({ storeClient: redis.getRawClient(), keyPrefix: 'rl_auth',  points: RATE_LIMIT_AUTH_POINTS, duration: RATE_LIMIT_AUTH_WINDOW });
 logger.info('Rate limiters initialisés (rate-limiter-flexible)');
 
 // Proxy vers les microservices
@@ -1579,8 +1640,64 @@ const connectedClients = new Map<string, ConnectedClient>();
 // ── Message rate limiting ──
 // userId → array of timestamps (last N messages)
 const messageRateLimit = new Map<string, number[]>();
-const MSG_RATE_WINDOW = 5000; // 5 seconds
-const MSG_RATE_MAX = 5;       // max 5 messages per window
+const MSG_RATE_WINDOW = 10000; // 10 seconds
+const MSG_RATE_MAX = 10;       // max 10 messages per window (1 msg/sec moyen, autorise bursts)
+
+// Rate limit SERVER_JOIN / SERVER_LEAVE (anti spam de messages système "X a rejoint")
+const serverJoinRateLimit = new Map<string, number[]>();
+const JOIN_RATE_WINDOW = 60000; // 60 seconds
+const JOIN_RATE_MAX = 5;        // max 5 join/leave per minute par user
+
+function checkServerJoinRate(userId: string): boolean {
+  const now = Date.now();
+  const timestamps = serverJoinRateLimit.get(userId) || [];
+  const recent = timestamps.filter(t => now - t < JOIN_RATE_WINDOW);
+  if (recent.length >= JOIN_RATE_MAX) return false;
+  recent.push(now);
+  serverJoinRateLimit.set(userId, recent);
+  return true;
+}
+
+// ── Cache block-status ──
+// Clé = `${userA}:${userB}` (toujours trié alphabétiquement pour éviter les doublons)
+// Valeur = { aBlockedB, bBlockedA, expiresAt }
+// Vidé sur FRIEND_BLOCK / FRIEND_UNBLOCK pour invalidation immédiate.
+interface BlockCacheEntry { aBlockedB: boolean; bBlockedA: boolean; expiresAt: number; }
+const blockStatusCache = new Map<string, BlockCacheEntry>();
+const BLOCK_CACHE_TTL = 60_000; // 60 s
+
+function blockCacheKey(u1: string, u2: string): { key: string; swapped: boolean } {
+  const swapped = u1 > u2;
+  return { key: swapped ? `${u2}:${u1}` : `${u1}:${u2}`, swapped };
+}
+
+async function isDmBlocked(senderId: string, recipientId: string): Promise<boolean> {
+  const { key, swapped } = blockCacheKey(senderId, recipientId);
+  const now = Date.now();
+  const cached = blockStatusCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    // Si l'une ou l'autre direction bloque, on refuse le DM
+    return cached.aBlockedB || cached.bBlockedA;
+  }
+  try {
+    const res = await fetch(`${FRIENDS_URL}/friends/${senderId}/block-status/${recipientId}`, {
+      method: 'GET',
+    });
+    if (!res.ok) return false; // En cas d'erreur réseau, on ne bloque pas (fail-open pour éviter les faux positifs)
+    const data = await res.json() as { iBlockedThem?: boolean; theyBlockedMe?: boolean };
+    const aBlockedB = swapped ? !!data.theyBlockedMe : !!data.iBlockedThem;
+    const bBlockedA = swapped ? !!data.iBlockedThem : !!data.theyBlockedMe;
+    blockStatusCache.set(key, { aBlockedB, bBlockedA, expiresAt: now + BLOCK_CACHE_TTL });
+    return aBlockedB || bBlockedA;
+  } catch {
+    return false;
+  }
+}
+
+function invalidateBlockCache(u1: string, u2: string) {
+  const { key } = blockCacheKey(u1, u2);
+  blockStatusCache.delete(key);
+}
 
 // Registry des server-nodes self-hostés connectés (keyed by serverId)
 const connectedNodes = new Map<string, { socketId: string; serverId: string; endpoint?: string; connectedAt: Date }>();
@@ -1939,7 +2056,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // Alias pour message:send (compatibilité client) — livraison optimiste <2ms
-  socket.on('message:send', (data) => {
+  socket.on('message:send', async (data) => {
     try {
       // ── Rate limiting ──
       const now = Date.now();
@@ -1951,6 +2068,16 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       recent.push(now);
       messageRateLimit.set(userId, recent);
+
+      // ── Vérification de blocage (DM uniquement) ──
+      // Si l'un des deux utilisateurs a bloqué l'autre, on refuse l'envoi.
+      if (data.recipientId && typeof data.recipientId === 'string' && data.recipientId !== userId) {
+        const blocked = await isDmBlocked(userId, data.recipientId);
+        if (blocked) {
+          socket.emit('message:error', { error: 'BLOCKED', message: 'Vous ne pouvez pas envoyer de message à cet utilisateur.' });
+          return;
+        }
+      }
 
       // ── Construire le conversationId ──
       let conversationId: string = data.conversationId || data.channelId;
@@ -2623,10 +2750,24 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // Reconnexion à un appel (après perte de connexion WebSocket)
-  socket.on('CALL_REJOIN', (data) => {
+  socket.on('CALL_REJOIN', async (data) => {
     try {
       const { callId } = data;
-      if (!callId) return;
+      if (!callId || typeof callId !== 'string') return;
+
+      // ⚠️  Sécurité : vérifier que l'utilisateur fait bien partie de l'appel
+      // avant de lui autoriser de rejoindre la room Socket.IO correspondante.
+      // Sans ce check, un attaquant pouvait écouter les ICE candidates d'un
+      // appel arbitraire en envoyant simplement un CALL_REJOIN avec son ID.
+      const call = await serviceProxy.calls.getCall(callId);
+      if (!call || !Array.isArray(call.participants) || !call.participants.includes(userId)) {
+        logger.warn(`CALL_REJOIN refusé: ${userId} n'est pas participant de ${callId}`);
+        return;
+      }
+      if (call.status === 'ended') {
+        return;
+      }
+
       socket.join(`call:${callId}`);
       // Notifier les autres participants pour relancer la négociation WebRTC
       socket.to(`call:${callId}`).emit('CALL_PEER_RECONNECTED', {
@@ -2644,6 +2785,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('SERVER_JOIN', async (data) => {
     try {
+      if (!checkServerJoinRate(userId)) {
+        emitError(socket, 'RATE_LIMITED', { message: 'Trop de join/leave — patientez une minute.' });
+        return;
+      }
       // Toujours enregistrer dans le microservice (annuaire central)
       const member = await serviceProxy.servers.joinServer(data.serverId, userId);
       socket.join(`server:${data.serverId}`);
@@ -2712,19 +2857,22 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('SERVER_LEAVE', async (data) => {
     try {
+      if (!checkServerJoinRate(userId)) {
+        emitError(socket, 'RATE_LIMITED', { message: 'Trop de join/leave — patientez une minute.' });
+        return;
+      }
       await serviceProxy.servers.leaveServer(data.serverId, userId);
       socket.leave(`server:${data.serverId}`);
 
-      // Notifier le node si connecté (avec retry)
+      // Notifier le node si connecté (avec retry) — self-leave : actorId = userId
       try {
-        await forwardToNode(data.serverId, 'MEMBER_KICK', { userId });
+        await forwardToNode(data.serverId, 'MEMBER_KICK', { userId, actorId: userId, selfLeave: true });
         logger.info(`Member ${userId} removed from node for server ${data.serverId}`);
       } catch (nodeErr: any) {
         logger.warn(`Failed to remove member ${userId} from node for server ${data.serverId}: ${nodeErr?.message}`);
-        // Retry une fois après 500ms
         setTimeout(async () => {
           try {
-            await forwardToNode(data.serverId, 'MEMBER_KICK', { userId });
+            await forwardToNode(data.serverId, 'MEMBER_KICK', { userId, actorId: userId, selfLeave: true });
             logger.info(`Retry: member ${userId} removed from node for server ${data.serverId}`);
           } catch {
             logger.warn(`Retry failed: member ${userId} still in node for server ${data.serverId}`);
@@ -3215,7 +3363,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           for (const stale of staleMembers) {
             const staleId = stale.userId || stale.user_id || stale.id;
             logger.info(`Cleaning stale member ${staleId} from node for server ${data.serverId}`);
-            forwardToNode(data.serverId, 'MEMBER_KICK', { userId: staleId }).catch(() => {});
+            forwardToNode(data.serverId, 'MEMBER_KICK', { userId: staleId, systemCleanup: true }).catch(() => {});
           }
 
           // Seeds les membres MySQL manquants dans le node
@@ -4051,7 +4199,13 @@ serverNodesNs.on('connection', async (nodeSocket) => {
   // la console du server-node. Ce code permet à l'hôte de réclamer les
   // droits admin depuis le frontend. Il expire en 15 min et est invalidé
   // dès qu'il est utilisé.
-  const setupCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+  const setupCode = (() => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = randomBytes(8);
+    let code = '';
+    for (let i = 0; i < 8; i++) code += chars[bytes[i] % chars.length];
+    return code;
+  })();
   await redis.set(`setup_code:${serverId}`, setupCode, 900); // 15 min
   nodeSocket.emit('SETUP_CODE', { code: setupCode, serverId, expiresIn: 900 });
   logger.info(`🔑 Code admin généré pour serverId=${serverId}`);

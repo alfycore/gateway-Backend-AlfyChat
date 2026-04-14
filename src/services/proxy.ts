@@ -382,6 +382,16 @@ class CallsProxy {
     });
   }
 
+  async getCall(callId: string): Promise<{ id: string; participants: string[]; status: string } | null> {
+    try {
+      return await fetchService<{ id: string; participants: string[]; status: string }>(`${this.baseUrl}/calls/${callId}`, {
+        method: 'GET',
+      });
+    } catch {
+      return null;
+    }
+  }
+
   async rejectCall(callId: string, userId: string) {
     return fetchService(`${this.baseUrl}/calls/${callId}/reject`, {
       method: 'POST',
