@@ -4,6 +4,17 @@ import { serviceRegistry } from '../utils/service-registry';
 import { logger } from '../utils/logger';
 import { MEDIA_URL, allowedOrigins } from '../config/env';
 
+/** Résout l'endpoint d'un service média en ignorant les instances localhost quand MEDIA_URL est distant. */
+const LOCAL_HOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
+function resolveMediaEndpoint(preferredLocation?: string): string {
+  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
+  if (instance && instance.isLocal && MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL)) {
+    logger.warn(`MediaProxy: seule instance locale disponible (${instance.endpoint}), fallback sur MEDIA_URL distant`);
+    return MEDIA_URL;
+  }
+  return instance?.endpoint ?? MEDIA_URL;
+}
+
 export function registerMediaRoutes(app: Express): void {
   // ============ ROUTES MÉDIA — Routage géo-distribué ============
   //
@@ -68,9 +79,7 @@ export function registerMediaRoutes(app: Express): void {
     const preferredLocation = (req.headers['x-media-location'] as string | undefined)
       ?? (req.query.location as string | undefined);
 
-    const instance = serviceRegistry.selectBestByLocation('media', preferredLocation)
-      ?? null;
-    const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+    const targetEndpoint = resolveMediaEndpoint(preferredLocation);
 
     // Réécrire l'URL vers /media/upload/:type (le préfixe /api est retiré)
     const mediaPath = req.originalUrl.replace(/^\/api/, '');
@@ -81,8 +90,7 @@ export function registerMediaRoutes(app: Express): void {
   app.all('/api/media/*', async (req, res) => {
     const preferredLocation = (req.headers['x-media-location'] as string | undefined)
       ?? (req.query.location as string | undefined);
-    const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
-    const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+    const targetEndpoint = resolveMediaEndpoint(preferredLocation);
     const mediaPath = req.originalUrl.replace(/^\/api/, '');
     proxyToMedia(targetEndpoint, mediaPath, req, res);
   });
@@ -93,9 +101,11 @@ export function registerMediaRoutes(app: Express): void {
     res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
     try {
-      // Chercher une instance média quelconque saine
-      const instance = serviceRegistry.selectBest('media');
-      const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
+      // Chercher une instance média quelconque saine (exclure les instances locales si MEDIA_URL est distant)
+      const rawInstance = serviceRegistry.selectBest('media');
+      const targetEndpoint = (rawInstance && rawInstance.isLocal && MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL))
+        ? MEDIA_URL
+        : (rawInstance?.endpoint ?? MEDIA_URL);
       const url = `${targetEndpoint}${req.originalUrl}`;
       const response = await fetch(url);
 
