@@ -459,6 +459,7 @@ class ServersProxy {
   async joinServer(serverId: string, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/join`, {
       method: 'POST',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ userId }),
     });
   }
@@ -466,6 +467,7 @@ class ServersProxy {
   async leaveServer(serverId: string, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/leave`, {
       method: 'POST',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ userId }),
     });
   }

@@ -67,6 +67,7 @@ export function registerServersRoutes(app: Express): void {
   app.post('/api/servers', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
 
   // Routes qui restent TOUJOURS vers le microservice même pour un serverId
+  app.all('/api/servers/:serverId/join', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
   app.all('/api/servers/:serverId/leave', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
   app.all('/api/servers/:serverId/node-token', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));
   app.all('/api/servers/:serverId/claim-admin', (req, res) => proxyRequest(getServiceUrl('servers', SERVERS_URL), req, res, SERVERS_URL));

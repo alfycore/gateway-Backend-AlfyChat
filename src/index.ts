@@ -606,6 +606,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     emitToSocket(socket, 'HEARTBEAT_ACK', { timestamp: Date.now() });
   });
 
+  // Synchronisation de lecture multi-appareils
+  // Quand un appareil lit une conversation, on le propage aux autres sessions du même user
+  socket.on('MARK_READ', (data: { key?: string }) => {
+    const key = data?.key;
+    if (!key || typeof key !== 'string') return;
+    // Diffuser à tous les autres sockets de cet utilisateur (pas à l'émetteur)
+    socket.to(`user:${userId}`).emit('NOTIFICATION_SYNC', { key });
+  });
+
   // Messages
   socket.on('MESSAGE_CREATE', async (data) => {
     try {
