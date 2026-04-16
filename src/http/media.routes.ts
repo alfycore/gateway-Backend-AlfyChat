@@ -25,6 +25,14 @@ export function registerMediaRoutes(app: Express): void {
     // 1. Chercher l'instance par serviceId dans le registre
     let instance = serviceRegistry.getById(serviceId);
 
+    // 1b. Si l'instance enregistrée est sur localhost, elle est inaccessible depuis le gateway
+    //     en environnement distribué/Docker → ignorer et utiliser le fallback distant si disponible.
+    const LOCAL_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
+    if (instance?.isLocal && MEDIA_URL && !LOCAL_RE.test(MEDIA_URL)) {
+      logger.warn(`MediaProxy: instance ${serviceId} a un endpoint local (${instance.endpoint}), fallback sur MEDIA_URL distant`);
+      instance = undefined;
+    }
+
     // 2. Fallback : chercher une instance saine dans la même région
     if (!instance || !instance.healthy) {
       const regional = serviceRegistry.selectBestByLocation('media', location);
