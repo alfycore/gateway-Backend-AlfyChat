@@ -7,8 +7,9 @@ import { MEDIA_URL, allowedOrigins } from '../config/env';
 /** Résout l'endpoint d'un service média en ignorant les instances localhost quand MEDIA_URL est distant. */
 const LOCAL_HOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
 function resolveMediaEndpoint(preferredLocation?: string): string {
+  const mediaUrlIsDistant = !!MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL);
   const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
-  if (instance && instance.isLocal && MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL)) {
+  if (instance && instance.isLocal && mediaUrlIsDistant) {
     logger.warn(`MediaProxy: seule instance locale disponible (${instance.endpoint}), fallback sur MEDIA_URL distant`);
     return MEDIA_URL;
   }
@@ -33,26 +34,31 @@ export function registerMediaRoutes(app: Express): void {
 
     const { location, serviceId, folder, filename } = req.params;
 
+    // Détermine si une instance doit être ignorée car son endpoint localhost
+    // est injoignable depuis le gateway en environnement Docker/distribué,
+    // c'est-à-dire : l'instance est locale ET MEDIA_URL pointe vers un host distant.
+    const LOCAL_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
+    const mediaUrlIsDistant = !!MEDIA_URL && !LOCAL_RE.test(MEDIA_URL);
+    const isUnreachableLocal = (inst: { isLocal: boolean } | undefined): boolean =>
+      !!inst?.isLocal && mediaUrlIsDistant;
+
     // 1. Chercher l'instance par serviceId dans le registre
     let instance = serviceRegistry.getById(serviceId);
-
-    // 1b. Si l'instance enregistrée est sur localhost, elle est inaccessible depuis le gateway
-    //     en environnement distribué/Docker → ignorer et utiliser le fallback distant si disponible.
-    const LOCAL_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
-    if (instance?.isLocal && MEDIA_URL && !LOCAL_RE.test(MEDIA_URL)) {
-      logger.warn(`MediaProxy: instance ${serviceId} a un endpoint local (${instance.endpoint}), fallback sur MEDIA_URL distant`);
+    if (isUnreachableLocal(instance)) {
+      logger.warn(`MediaProxy: instance ${serviceId} a un endpoint local (${instance!.endpoint}), fallback sur endpoint distant`);
       instance = undefined;
     }
 
-    // 2. Fallback : chercher une instance saine dans la même région
+    // 2. Fallback : chercher une instance saine dans la même région (non-locale si MEDIA_URL est distant)
     if (!instance || !instance.healthy) {
       const regional = serviceRegistry.selectBestByLocation('media', location);
-      if (regional) {
+      if (regional && !isUnreachableLocal(regional)) {
         logger.warn(`MediaProxy: instance ${serviceId} introuvable/hors-ligne, fallback sur ${regional.id}`);
         instance = regional;
       }
     }
 
+    // Si toutes les instances connues sont locales et MEDIA_URL est distant → utiliser MEDIA_URL directement
     const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
     const mediaPath = `/uploads/${folder}/${filename}`;
 
