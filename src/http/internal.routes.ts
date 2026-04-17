@@ -17,68 +17,15 @@ function safeCompare(a: string, b: string): boolean {
 export function registerInternalRoutes(app: Express): void {
   /**
    * POST /api/internal/service/register
-   * Enregistre (ou met à jour) une instance de microservice dans le registre.
-   * Protégé par le secret partagé INTERNAL_SECRET.
-   *
-   * Body: { secret, id, serviceType, endpoint, domain, location, metrics }
+   * Désactivé : l'auto-enregistrement des services n'est plus autorisé.
+   * Un administrateur doit ajouter les instances manuellement via POST /api/admin/services.
    */
   app.post('/api/internal/service/register', express.json(), (req, res) => {
-    const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
-
-    // Si INTERNAL_SECRET est configuré, la clé est obligatoire
-    if (INTERNAL_SECRET && (!secret || !validateServiceSecret(String(id), String(secret)))) {
-      return res.status(401).json({ error: 'Secret invalide' });
-    }
-
-    const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
-    if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
-      return res.status(400).json({ error: 'Paramètres manquants ou invalides (id, serviceType, endpoint, domain, location)' });
-    }
-
-    // Rejeter les instances bannies/désactivées par un admin
-    if (bannedServiceIds.has(String(id))) {
-      return res.status(403).json({ error: 'Instance désactivée — contactez un administrateur' });
-    }
-
-    // Rejeter les IDs non pré-enregistrés par un admin (whitelist)
-    if (allowedServiceIds.size > 0 && !allowedServiceIds.has(String(id))) {
-      logger.warn(`ServiceRegistry: tentative d'enregistrement non autorisée — ID "${id}" non connu (${endpoint})`);
-      return res.status(403).json({ error: 'Instance non autorisée — seul un administrateur peut ajouter de nouveaux services' });
-    }
-
-    // Rejeter les endpoints avec une adresse IP (seuls les noms de domaine sont acceptés)
-    if (IP_ENDPOINT_RE.test(String(endpoint))) {
-      logger.warn(`ServiceRegistry: endpoint IP refusé pour "${id}" — (${endpoint}) — utilisez un nom de domaine`);
-      return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine (ex: service.alfychat.eu)' });
-    }
-
-    const resolvedEndpoint = String(endpoint);
-    const resolvedDomain   = String(domain);
-
-    const defaultMetrics = {
-      ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100,
-      bandwidthUsage: 0, requestCount20min: 0,
-    };
-
-    const instance = serviceRegistry.register({
-      id: String(id),
-      serviceType: serviceType as ServiceType,
-      endpoint: resolvedEndpoint,
-      domain: resolvedDomain,
-      location: String(location).toUpperCase(),
-      metrics: metrics ?? defaultMetrics,
+    const { id } = req.body ?? {};
+    logger.warn(`ServiceRegistry: tentative d'auto-enregistrement refusée pour "${id || 'unknown'}" — admin-only`);
+    return res.status(403).json({
+      error: 'Auto-enregistrement désactivé — un administrateur doit ajouter ce service via /api/admin/services',
     });
-
-    // Persist to DB (non-blocking)
-    monitoringDB.upsertServiceInstance({
-      id: String(id),
-      serviceType: String(serviceType),
-      endpoint: resolvedEndpoint,
-      domain: resolvedDomain,
-      location: String(location).toUpperCase(),
-    }).catch(() => {});
-
-    res.json({ success: true, instance });
   });
 
   /**
