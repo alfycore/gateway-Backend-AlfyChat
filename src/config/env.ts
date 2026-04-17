@@ -35,8 +35,8 @@ export const RATE_LIMIT_USER  = parseInt(process.env.RATE_LIMIT_USER  || '150');
 export const RATE_LIMIT_ADMIN = parseInt(process.env.RATE_LIMIT_ADMIN || '500');
 export const RATE_LIMIT_WINDOW = 1;
 
-export const RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '10');
-export const RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '900');
+export const RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '30');
+export const RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '300');
 export const AUTH_BRUTEFORCE_PATHS = [
   '/api/auth/login',
   '/api/auth/register',

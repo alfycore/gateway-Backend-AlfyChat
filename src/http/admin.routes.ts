@@ -90,6 +90,26 @@ export function registerAdminRoutes(app: Express): void {
     }
   });
 
+  /**
+   * DELETE /api/admin/gateway/rate-limit/:ip
+   * Réinitialise le compteur de rate limit auth pour une IP donnée.
+   * Utile pour débloquer un utilisateur légitime bloqué par erreur.
+   */
+  app.delete('/api/admin/gateway/rate-limit/:ip', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const ip = decodeURIComponent(req.params.ip);
+    try {
+      const redisClient = runtime.redis.getRawClient();
+      // Supprimer les clés de rate limit auth pour cette IP
+      await redisClient.del(`rl_auth:${ip}`);
+      logger.info(`Rate limit auth réinitialisé pour ${ip} par admin`);
+      res.json({ success: true, message: `Rate limit réinitialisé pour ${ip}` });
+    } catch (error) {
+      logger.error({ err: error }, 'Erreur reset rate limit:');
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  });
+
   /** GET /api/admin/monitoring — current status + last 24h stats */
   app.get('/api/admin/monitoring', async (req, res) => {
     if (!await requireAdmin(req, res)) return;
