@@ -6,6 +6,7 @@ export interface User {
     displayName?: string;
     avatarUrl?: string;
     status: UserStatus;
+    customStatus?: string | null;
     bio?: string;
     createdAt: Date;
     updatedAt: Date;

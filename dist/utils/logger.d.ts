@@ -1,3 +1,3 @@
-import winston from 'winston';
-export declare const logger: winston.Logger;
+import pino from 'pino';
+export declare const logger: pino.Logger<never, boolean>;
 //# sourceMappingURL=logger.d.ts.map

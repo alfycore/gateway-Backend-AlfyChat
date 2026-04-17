@@ -9,27 +9,34 @@ function registerWebRTCHandlers(socket, io) {
     const userId = socket.userId;
     // Offre WebRTC
     socket.on('WEBRTC_OFFER', (data) => {
-        socket.to(`call:${data.callId}`).emit('WEBRTC_OFFER', {
-            type: 'WEBRTC_OFFER',
-            payload: { ...data, fromUserId: userId },
-            timestamp: new Date(),
-        });
+        const payload = { type: 'WEBRTC_OFFER', payload: { ...data, fromUserId: userId }, timestamp: new Date() };
+        if (data.targetUserId) {
+            // Appel de groupe : router vers un pair spécifique
+            io.to(`user:${data.targetUserId}`).emit('WEBRTC_OFFER', payload);
+        }
+        else {
+            socket.to(`call:${data.callId}`).emit('WEBRTC_OFFER', payload);
+        }
     });
     // Réponse WebRTC
     socket.on('WEBRTC_ANSWER', (data) => {
-        socket.to(`call:${data.callId}`).emit('WEBRTC_ANSWER', {
-            type: 'WEBRTC_ANSWER',
-            payload: { ...data, fromUserId: userId },
-            timestamp: new Date(),
-        });
+        const payload = { type: 'WEBRTC_ANSWER', payload: { ...data, fromUserId: userId }, timestamp: new Date() };
+        if (data.targetUserId) {
+            io.to(`user:${data.targetUserId}`).emit('WEBRTC_ANSWER', payload);
+        }
+        else {
+            socket.to(`call:${data.callId}`).emit('WEBRTC_ANSWER', payload);
+        }
     });
     // Candidat ICE
     socket.on('WEBRTC_ICE_CANDIDATE', (data) => {
-        socket.to(`call:${data.callId}`).emit('WEBRTC_ICE_CANDIDATE', {
-            type: 'WEBRTC_ICE_CANDIDATE',
-            payload: { ...data, fromUserId: userId },
-            timestamp: new Date(),
-        });
+        const payload = { type: 'WEBRTC_ICE_CANDIDATE', payload: { ...data, fromUserId: userId }, timestamp: new Date() };
+        if (data.targetUserId) {
+            io.to(`user:${data.targetUserId}`).emit('WEBRTC_ICE_CANDIDATE', payload);
+        }
+        else {
+            socket.to(`call:${data.callId}`).emit('WEBRTC_ICE_CANDIDATE', payload);
+        }
     });
     // Négociation nécessaire
     socket.on('WEBRTC_NEGOTIATION_NEEDED', (data) => {

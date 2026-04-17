@@ -1,31 +1,20 @@
 "use strict";
 // ==========================================
-// ALFYCHAT - LOGGER WINSTON
+// ALFYCHAT - LOGGER PINO
 // ==========================================
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.logger = void 0;
-const winston_1 = __importDefault(require("winston"));
-const { combine, timestamp, printf, colorize, errors } = winston_1.default.format;
-const logFormat = printf(({ level, message, timestamp, stack }) => {
-    return `${timestamp} [${level}]: ${stack || message}`;
-});
-exports.logger = winston_1.default.createLogger({
+const pino_1 = __importDefault(require("pino"));
+exports.logger = (0, pino_1.default)({
     level: process.env.LOG_LEVEL || 'info',
-    format: combine(timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), errors({ stack: true }), logFormat),
-    transports: [
-        new winston_1.default.transports.Console({
-            format: combine(colorize(), logFormat),
-        }),
-        new winston_1.default.transports.File({
-            filename: 'logs/error.log',
-            level: 'error',
-        }),
-        new winston_1.default.transports.File({
-            filename: 'logs/combined.log',
-        }),
-    ],
+    ...(process.env.NODE_ENV !== 'production' && {
+        transport: {
+            target: 'pino-pretty',
+            options: { colorize: true, translateTime: 'SYS:standard', ignore: 'pid,hostname' },
+        },
+    }),
 });
 //# sourceMappingURL=logger.js.map

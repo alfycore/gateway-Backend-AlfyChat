@@ -111,7 +111,7 @@ function registerServersHandlers(socket, io, serviceProxy) {
     // Mettre à jour un channel
     socket.on('CHANNEL_UPDATE', async (data) => {
         try {
-            const channel = await serviceProxy.servers.updateChannel(data.channelId, data.updates, userId);
+            const channel = await serviceProxy.servers.updateChannel(data.serverId, data.channelId, data.updates, userId);
             io.to(`server:${data.serverId}`).emit('CHANNEL_UPDATE', {
                 type: 'CHANNEL_UPDATE',
                 payload: channel,
@@ -125,7 +125,7 @@ function registerServersHandlers(socket, io, serviceProxy) {
     // Supprimer un channel
     socket.on('CHANNEL_DELETE', async (data) => {
         try {
-            await serviceProxy.servers.deleteChannel(data.channelId, userId);
+            await serviceProxy.servers.deleteChannel(data.serverId, data.channelId, userId);
             io.to(`server:${data.serverId}`).emit('CHANNEL_DELETE', {
                 type: 'CHANNEL_DELETE',
                 payload: { channelId: data.channelId },

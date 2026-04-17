@@ -1,0 +1,26 @@
+export declare const JWT_SECRET: string;
+export declare const IS_PRODUCTION: boolean;
+export declare const IS_DEV: boolean;
+export declare const PORT: string | number;
+export declare const USERS_URL: string;
+export declare const MESSAGES_URL: string;
+export declare const FRIENDS_URL: string;
+export declare const CALLS_URL: string;
+export declare const SERVERS_URL: string;
+export declare const BOTS_URL: string;
+export declare const MEDIA_URL: string;
+export declare const SERVERHOSTING_URL: string;
+export declare const SUBSCRIPTIONS_URL: string;
+export declare const INTERNAL_SECRET: string;
+export declare const RATE_LIMIT_ANON: number;
+export declare const RATE_LIMIT_USER: number;
+export declare const RATE_LIMIT_ADMIN: number;
+export declare const RATE_LIMIT_WINDOW = 1;
+export declare const RATE_LIMIT_AUTH_POINTS: number;
+export declare const RATE_LIMIT_AUTH_WINDOW: number;
+export declare const AUTH_BRUTEFORCE_PATHS: string[];
+export declare const TRUSTED_PROXIES: Set<string>;
+export declare const IP_ENDPOINT_RE: RegExp;
+export declare const allowedOrigins: string[];
+export declare const ADMIN_ALERT_EMAILS: string[];
+//# sourceMappingURL=env.d.ts.map

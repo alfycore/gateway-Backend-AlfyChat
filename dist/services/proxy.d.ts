@@ -19,7 +19,7 @@ declare class UsersProxy {
     private baseUrl;
     constructor(baseUrl: string);
     getUser(userId: string): Promise<unknown>;
-    updateStatus(userId: string, status: string): Promise<unknown>;
+    updateStatus(userId: string, status: string, customStatus?: string): Promise<unknown>;
     updateLastSeen(userId: string): Promise<unknown>;
     getPreferences(userId: string, token?: string): Promise<unknown>;
     updateProfile(userId: string, data: Record<string, unknown>, token?: string): Promise<unknown>;
@@ -28,7 +28,9 @@ declare class MessagesProxy {
     private baseUrl;
     constructor(baseUrl: string);
     getConversations(userId: string, token?: string): Promise<any[]>;
+    isParticipant(conversationId: string, userId: string): Promise<boolean>;
     createMessage(data: {
+        id?: string;
         conversationId: string;
         senderId: string;
         content: string;
@@ -51,8 +53,8 @@ declare class MessagesProxy {
         name?: string;
         avatarUrl?: string;
     }, token?: string): Promise<unknown>;
-    addParticipant(conversationId: string, userId: string): Promise<unknown>;
-    removeParticipant(conversationId: string, userId: string): Promise<unknown>;
+    addParticipant(conversationId: string, userId: string, token?: string): Promise<unknown>;
+    removeParticipant(conversationId: string, userId: string, token?: string): Promise<unknown>;
     leaveConversation(conversationId: string, userId: string, token?: string): Promise<unknown>;
     deleteConversation(conversationId: string, token?: string): Promise<unknown>;
     getArchiveStatus(conversationId: string, token?: string): Promise<unknown>;
@@ -61,6 +63,8 @@ declare class MessagesProxy {
     confirmArchive(conversationId: string, archiveLogId: string, token?: string): Promise<unknown>;
     getCachedArchivedMessage(messageId: string, token?: string): Promise<unknown>;
     cacheArchivedMessages(messages: any[]): Promise<unknown>;
+    saveNotification(userId: string, conversationId: string, senderName: string): Promise<unknown>;
+    getNotifications(userId: string, token: string): Promise<unknown>;
 }
 declare class FriendsProxy {
     private baseUrl;
@@ -85,16 +89,42 @@ declare class CallsProxy {
         recipientId?: string;
     }): Promise<unknown>;
     joinCall(callId: string, userId: string): Promise<unknown>;
+    getCall(callId: string): Promise<{
+        id: string;
+        participants: string[];
+        status: string;
+    } | null>;
     rejectCall(callId: string, userId: string): Promise<unknown>;
     endCall(callId: string, userId: string): Promise<unknown>;
     leaveCall(callId: string, userId: string): Promise<unknown>;
+    createGroupRoom(data: {
+        channelId: string;
+        participantId: string;
+        participantName: string;
+        type: string;
+    }): Promise<{
+        callId: string;
+        roomName: string;
+        token: string;
+        wsUrl: string;
+    }>;
+    getGroupCallToken(data: {
+        callId: string;
+        participantId: string;
+        participantName: string;
+    }): Promise<{
+        token: string;
+        roomName: string;
+        wsUrl: string;
+    }>;
+    endGroupCall(callId: string): Promise<unknown>;
 }
 declare class ServersProxy {
     private baseUrl;
     constructor(baseUrl: string);
-    getUserServers(userId: string): Promise<any[]>;
+    getUserServers(userId: string, token?: string): Promise<any[]>;
     getServer(serverId: string): Promise<any>;
-    getServerChannels(serverId: string): Promise<any[]>;
+    getServerChannels(serverId: string, userId?: string): Promise<any[]>;
     joinServer(serverId: string, userId: string): Promise<unknown>;
     leaveServer(serverId: string, userId: string): Promise<unknown>;
     registerServerHost(data: {
@@ -115,7 +145,7 @@ declare class ServersProxy {
         type: string;
         parentId?: string;
     }, userId: string): Promise<unknown>;
-    updateChannel(channelId: string, updates: any, userId: string): Promise<unknown>;
+    updateChannel(serverId: string, channelId: string, updates: any, userId: string): Promise<unknown>;
     deleteChannel(serverId: string, channelId: string, userId: string): Promise<unknown>;
     kickMember(serverId: string, memberUserId: string, requesterId: string): Promise<unknown>;
     banMember(serverId: string, memberUserId: string, requesterId: string, reason?: string): Promise<unknown>;
@@ -138,6 +168,13 @@ declare class ServersProxy {
     }): Promise<unknown>;
     isMember(serverId: string, userId: string): Promise<boolean>;
     getRoles(serverId: string): Promise<any[]>;
+    createRole(serverId: string, data: {
+        name: string;
+        color?: string;
+        permissions?: any;
+    }): Promise<unknown>;
+    updateRole(serverId: string, roleId: string, data: any): Promise<unknown>;
+    deleteRole(serverId: string, roleId: string): Promise<unknown>;
     createInvite(serverId: string, data: {
         creatorId: string;
         maxUses?: number;
