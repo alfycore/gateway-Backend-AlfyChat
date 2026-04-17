@@ -16,10 +16,10 @@ function getBreaker(url: string): InstanceType<typeof CircuitBreaker> {
   if (!_breakers.has(host)) {
     const action = (fn: () => Promise<unknown>) => fn();
     const breaker = new CircuitBreaker(action, {
-      timeout: 10_000,               // 10 s max par appel
-      errorThresholdPercentage: 50,  // ouvre après 50 % d'erreurs
-      resetTimeout: 30_000,          // demi-ouverture après 30 s
-      volumeThreshold: 5,            // évalue après 5 requêtes minimum
+      timeout: 15_000,               // 15 s max par appel
+      errorThresholdPercentage: 75,  // ouvre après 75 % d'erreurs (plus tolérant)
+      resetTimeout: 10_000,          // demi-ouverture après 10 s (récupère plus vite)
+      volumeThreshold: 10,           // évalue après 10 requêtes minimum
     });
     breaker.on('open',     () => logger.warn(`Circuit OUVERT: ${host}`));
     breaker.on('halfOpen', () => logger.info(`Circuit HALF-OPEN: ${host}`));
