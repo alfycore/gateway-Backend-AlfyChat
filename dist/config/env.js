@@ -33,8 +33,8 @@ exports.RATE_LIMIT_ANON = parseInt(process.env.RATE_LIMIT_ANON || '20');
 exports.RATE_LIMIT_USER = parseInt(process.env.RATE_LIMIT_USER || '150');
 exports.RATE_LIMIT_ADMIN = parseInt(process.env.RATE_LIMIT_ADMIN || '500');
 exports.RATE_LIMIT_WINDOW = 1;
-exports.RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '10');
-exports.RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '900');
+exports.RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '30');
+exports.RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '300');
 exports.AUTH_BRUTEFORCE_PATHS = [
     '/api/auth/login',
     '/api/auth/register',

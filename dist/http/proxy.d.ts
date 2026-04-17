@@ -1,6 +1,7 @@
 import express from 'express';
-/** Proxy JSON HTTP request to a microservice with optional fallback URL */
-export declare function proxyRequest(targetUrl: string, req: express.Request, res: express.Response, fallbackUrl?: string): Promise<void>;
+import { type ServiceType } from '../utils/service-registry';
+/** Proxy JSON HTTP request to a microservice with failover to other healthy instances */
+export declare function proxyRequest(targetUrl: string, req: express.Request, res: express.Response, fallbackUrl?: string, serviceType?: ServiceType): Promise<void>;
 /** Proxy JSON toward a self-hosted server-node (binary passthrough for images) */
 export declare function proxyToNode(nodeEndpoint: string, nodePath: string, req: express.Request, res: express.Response): Promise<void>;
 /** Proxy multipart/form-data to a server-node (file uploads) */

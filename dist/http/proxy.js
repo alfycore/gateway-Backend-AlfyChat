@@ -11,8 +11,9 @@ exports.proxyToMedia = proxyToMedia;
 const helpers_1 = require("./helpers");
 const env_1 = require("../config/env");
 const logger_1 = require("../utils/logger");
-/** Proxy JSON HTTP request to a microservice with optional fallback URL */
-async function proxyRequest(targetUrl, req, res, fallbackUrl) {
+const service_registry_1 = require("../utils/service-registry");
+/** Proxy JSON HTTP request to a microservice with failover to other healthy instances */
+async function proxyRequest(targetUrl, req, res, fallbackUrl, serviceType) {
     const SKIP_USERID_INJECT = ['/friends/request'];
     const userId = (0, helpers_1.extractUserIdFromJWT)(req.headers.authorization);
     const skipInject = SKIP_USERID_INJECT.some(path => req.originalUrl.replace(/^\/api/, '').startsWith(path));
@@ -22,15 +23,23 @@ async function proxyRequest(targetUrl, req, res, fallbackUrl) {
     }
     const doFetch = async (baseUrl) => {
         const url = `${baseUrl}${req.originalUrl.replace(/^\/api/, '')}`;
-        return fetch(url, {
-            method: req.method,
-            headers: {
-                'Content-Type': 'application/json',
-                ...(req.headers.authorization && { authorization: req.headers.authorization }),
-                ...(userId && { 'X-User-Id': userId }),
-            },
-            ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
-        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        try {
+            return await fetch(url, {
+                method: req.method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(req.headers.authorization && { authorization: req.headers.authorization }),
+                    ...(userId && { 'X-User-Id': userId }),
+                },
+                ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
+                signal: controller.signal,
+            });
+        }
+        finally {
+            clearTimeout(timer);
+        }
     };
     const sendResponse = async (response) => {
         const contentType = response.headers.get('content-type');
@@ -49,26 +58,57 @@ async function proxyRequest(targetUrl, req, res, fallbackUrl) {
             }
         }
     };
-    try {
-        const response = await doFetch(targetUrl);
-        return sendResponse(response);
+    // Essaye une URL — retourne la Response ou lève une exception pour 5XX
+    const tryUrl = async (baseUrl) => {
+        const response = await doFetch(baseUrl);
+        if (response.status >= 500) {
+            throw Object.assign(new Error(`${response.status}`), { statusCode: response.status, response });
+        }
+        return response;
+    };
+    // Construire la liste des URLs à essayer : primaire + autres instances du registry
+    const urlsToTry = [targetUrl];
+    if (serviceType) {
+        const others = service_registry_1.serviceRegistry.getInstances(serviceType)
+            .filter((i) => i.endpoint !== targetUrl && !i.degraded)
+            .sort((a, b) => service_registry_1.serviceRegistry.computeScore(b) - service_registry_1.serviceRegistry.computeScore(a))
+            .map((i) => i.endpoint);
+        urlsToTry.push(...others);
     }
-    catch (primaryError) {
-        if (fallbackUrl && fallbackUrl !== targetUrl) {
-            logger_1.logger.warn(`Proxy vers ${targetUrl} échoué, fallback vers ${fallbackUrl}`);
-            try {
-                const response = await doFetch(fallbackUrl);
-                return sendResponse(response);
+    if (fallbackUrl && !urlsToTry.includes(fallbackUrl)) {
+        urlsToTry.push(fallbackUrl);
+    }
+    // Dédupliquer
+    const seen = new Set();
+    const uniqueUrls = urlsToTry.filter((u) => { if (seen.has(u))
+        return false; seen.add(u); return true; });
+    let lastError;
+    for (const baseUrl of uniqueUrls) {
+        try {
+            const response = await tryUrl(baseUrl);
+            return sendResponse(response);
+        }
+        catch (err) {
+            lastError = err;
+            if (err?.statusCode >= 500) {
+                // 5XX → marquer dégradé si dans le registry et essayer le suivant
+                const inst = service_registry_1.serviceRegistry.getAll().find((i) => i.endpoint === baseUrl);
+                if (inst && serviceType) {
+                    service_registry_1.serviceRegistry.markDegraded(inst.id, `HTTP ${err.statusCode} sur proxyRequest`);
+                    logger_1.logger.warn(`[Proxy] Instance ${inst.id} dégradée (${err.statusCode}), bascule vers suivant…`);
+                }
+                else {
+                    logger_1.logger.warn(`[Proxy] ${baseUrl} → ${err.statusCode}, essai suivant…`);
+                }
             }
-            catch (fallbackError) {
-                logger_1.logger.error({ err: fallbackError }, `Proxy fallback ${fallbackUrl} aussi échoué:`);
+            else {
+                // Erreur réseau / timeout → essayer le suivant
+                logger_1.logger.warn(`[Proxy] Erreur réseau ${baseUrl}: ${err?.message}, essai suivant…`);
             }
         }
-        else {
-            logger_1.logger.error({ err: primaryError }, 'Erreur proxy:');
-        }
-        res.status(502).json({ error: 'Service indisponible' });
     }
+    logger_1.logger.error({ err: lastError }, '[Proxy] Tous les endpoints épuisés');
+    res.status(502).json({ error: 'Service indisponible' });
 }
 /** Proxy JSON toward a self-hosted server-node (binary passthrough for images) */
 async function proxyToNode(nodeEndpoint, nodePath, req, res) {

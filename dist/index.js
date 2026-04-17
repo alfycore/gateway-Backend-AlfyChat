@@ -182,30 +182,30 @@ app.use(async (req, res, next) => {
     }
 });
 // Routes Auth & Users
-app.all('/api/auth/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL));
-app.all('/api/users/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL));
-app.all('/api/users', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL));
-app.all('/api/rgpd/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL));
+app.all('/api/auth/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL, 'users'));
+app.all('/api/users/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL, 'users'));
+app.all('/api/users', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL, 'users'));
+app.all('/api/rgpd/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('users', env_1.USERS_URL), req, res, env_1.USERS_URL, 'users'));
 // ============ ROUTE MODULES ============
 (0, internal_routes_1.registerInternalRoutes)(app);
 (0, admin_routes_1.registerAdminRoutes)(app);
 // Routes Messages
-app.all('/api/messages/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/messages', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/conversations/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/conversations', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/archive/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/archive', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/notifications/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
-app.all('/api/notifications', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL));
+app.all('/api/messages/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/messages', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/conversations/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/conversations', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/archive/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/archive', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/notifications/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
+app.all('/api/notifications', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('messages', env_1.MESSAGES_URL), req, res, env_1.MESSAGES_URL, 'messages'));
 (0, friends_routes_1.registerFriendsRoutes)(app);
 // Routes Calls
-app.all('/api/calls/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('calls', env_1.CALLS_URL), req, res, env_1.CALLS_URL));
-app.all('/api/calls', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('calls', env_1.CALLS_URL), req, res, env_1.CALLS_URL));
+app.all('/api/calls/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('calls', env_1.CALLS_URL), req, res, env_1.CALLS_URL, 'calls'));
+app.all('/api/calls', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('calls', env_1.CALLS_URL), req, res, env_1.CALLS_URL, 'calls'));
 (0, servers_routes_1.registerServersRoutes)(app);
 // Routes Bots
-app.all('/api/bots/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('bots', env_1.BOTS_URL), req, res, env_1.BOTS_URL));
-app.all('/api/bots', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('bots', env_1.BOTS_URL), req, res, env_1.BOTS_URL));
+app.all('/api/bots/*', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('bots', env_1.BOTS_URL), req, res, env_1.BOTS_URL, 'bots'));
+app.all('/api/bots', (req, res) => (0, proxy_2.proxyRequest)((0, helpers_1.getServiceUrl)('bots', env_1.BOTS_URL), req, res, env_1.BOTS_URL, 'bots'));
 // Routes Hébergement serveurs (ServerHosting)
 app.all('/api/subscriptions/webhooks/*', (req, res) => (0, proxy_2.proxyRequest)(env_1.SUBSCRIPTIONS_URL, req, res));
 app.all('/api/hosting/*', (req, res) => (0, proxy_2.proxyRequest)(env_1.SERVERHOSTING_URL, req, res));
