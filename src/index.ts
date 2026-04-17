@@ -785,6 +785,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         socket.emit('message:failed', {
           messageId,
           error: 'Échec de la sauvegarde — veuillez réessayer',
+          detail: err?.message || String(err),
         });
       });
 

@@ -63,7 +63,9 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
       },
     });
     if (!response.ok) {
-      throw new Error(`Service error: ${response.status} ${response.statusText}`);
+      let detail = response.statusText;
+      try { const b = await response.json(); detail = JSON.stringify(b); } catch {}
+      throw new Error(`Service error: ${response.status} ${detail}`);
     }
     return response.json() as Promise<T>;
   };
