@@ -57,6 +57,7 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
       ...fetchOptions,
       headers: {
         'Content-Type': 'application/json',
+        ...(INTERNAL_SECRET ? { 'X-Internal-Secret': INTERNAL_SECRET } : {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...fetchOptions?.headers,
       },

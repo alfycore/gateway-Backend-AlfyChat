@@ -810,11 +810,25 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // Alias message:edit (compatibilité client)
-  socket.on('message:edit', async (data: { messageId: string; content: string }) => {
+  socket.on('message:edit', async (data: { messageId: string; content: string; conversationId?: string }) => {
     try {
+      // ── Rate limiting (même compteur que message:send) ──
+      const now = Date.now();
+      const timestamps = messageRateLimit.get(userId) || [];
+      const recent = timestamps.filter(t => now - t < MSG_RATE_WINDOW);
+      if (recent.length >= MSG_RATE_MAX) {
+        socket.emit('message:edit-error', { messageId: data?.messageId, error: 'RATE_LIMITED' });
+        return;
+      }
+      recent.push(now);
+      messageRateLimit.set(userId, recent);
+
       const v = validateMessageContent(data?.content);
       const updated = await serviceProxy.messages.updateMessage(data.messageId, v.content, userId) as any;
-      if (!updated) return;
+      if (!updated) {
+        socket.emit('message:edit-error', { messageId: data.messageId, error: 'Message non trouvé ou non autorisé' });
+        return;
+      }
       const conversationId = updated.conversationId;
       io.to(`conversation:${conversationId}`).emit('message:edited', {
         messageId: updated.id,
@@ -824,6 +838,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       });
     } catch (error) {
       console.error('❌ Error editing message:', error);
+      socket.emit('message:edit-error', { messageId: data?.messageId, error: error instanceof Error ? error.message : 'Erreur interne' });
     }
   });
 

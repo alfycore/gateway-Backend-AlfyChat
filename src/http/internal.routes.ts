@@ -1,9 +1,18 @@
 import express, { type Express } from 'express';
+import { timingSafeEqual } from 'crypto';
 import { serviceRegistry, type ServiceType } from '../utils/service-registry';
 import { monitoringDB } from '../utils/monitoring-db';
 import { logger } from '../utils/logger';
 import { validateServiceSecret, bannedServiceIds, allowedServiceIds } from '../state/service-keys';
 import { INTERNAL_SECRET, IP_ENDPOINT_RE } from '../config/env';
+
+function safeCompare(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
 
 export function registerInternalRoutes(app: Express): void {
   /**
@@ -109,7 +118,7 @@ export function registerInternalRoutes(app: Express): void {
    */
   app.post('/api/internal/service/deregister', express.json(), (req, res) => {
     const { secret, id } = req.body ?? {};
-    if (!secret || secret !== INTERNAL_SECRET) {
+    if (!secret || !safeCompare(String(secret), INTERNAL_SECRET)) {
       return res.status(401).json({ error: 'Secret invalide' });
     }
     if (!id) return res.status(400).json({ error: 'id requis' });
@@ -124,8 +133,8 @@ export function registerInternalRoutes(app: Express): void {
    * Protégé par X-Internal-Secret header ou ?secret=... query param.
    */
   app.get('/api/internal/service/list', (req, res) => {
-    const secret = (req.headers['x-internal-secret'] as string | undefined) ?? (req.query.secret as string | undefined);
-    if (!secret || secret !== INTERNAL_SECRET) {
+    const secret = req.headers['x-internal-secret'] as string | undefined;
+    if (!secret || !safeCompare(String(secret), INTERNAL_SECRET)) {
       return res.status(401).json({ error: 'Secret invalide' });
     }
     const instances = serviceRegistry.getAll().map((inst) => ({
