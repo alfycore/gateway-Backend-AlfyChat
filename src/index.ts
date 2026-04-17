@@ -781,7 +781,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         }
       }).catch((err: Error) => {
         // La DB a échoué : notifier l'expéditeur pour afficher une erreur sur le message
-        console.error('❌ DB write failed for message:', messageId, err);
+        console.error('❌ DB write failed for message:', messageId, err?.message || err);
         socket.emit('message:failed', {
           messageId,
           error: 'Échec de la sauvegarde — veuillez réessayer',
