@@ -257,9 +257,10 @@ class MessagesProxy {
   constructor(private baseUrl: string) {}
 
   async getConversations(userId: string, token?: string) {
-    return fetchService<any[]>(`${this.baseUrl}/conversations`, {
+    return fetchWithFailover<any[]>(`${this.baseUrl}/conversations`, 'messages', {
       headers: { 'x-user-id': userId },
       ...(token ? { token } : {}),
+      signal: AbortSignal.timeout(5_000), // 5s max au connect — non bloquant
     });
   }
 
