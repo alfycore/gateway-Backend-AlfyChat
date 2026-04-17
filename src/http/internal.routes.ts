@@ -25,7 +25,8 @@ export function registerInternalRoutes(app: Express): void {
   app.post('/api/internal/service/register', express.json(), (req, res) => {
     const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
 
-    if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
+    // Si INTERNAL_SECRET est configuré, la clé est obligatoire
+    if (INTERNAL_SECRET && (!secret || !validateServiceSecret(String(id), String(secret)))) {
       return res.status(401).json({ error: 'Secret invalide' });
     }
 
@@ -89,7 +90,7 @@ export function registerInternalRoutes(app: Express): void {
   app.post('/api/internal/service/heartbeat', express.json(), (req, res) => {
     const { secret, id, metrics } = req.body ?? {};
 
-    if (!secret || !id || !validateServiceSecret(String(id), String(secret))) {
+    if (INTERNAL_SECRET && (!secret || !validateServiceSecret(String(id), String(secret)))) {
       return res.status(401).json({ error: 'Secret invalide' });
     }
 
