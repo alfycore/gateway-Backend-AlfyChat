@@ -609,6 +609,22 @@ class MonitoringDB {
     }
   }
 
+  /** Met à jour l'endpoint d'une instance (persiste en DB) */
+  async updateServiceEndpoint(id: string, endpoint: string): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `UPDATE service_instances SET endpoint = ?, updated_at = NOW() WHERE id = ?`,
+        [endpoint, id],
+      );
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur updateServiceEndpoint');
+    } finally {
+      conn.release();
+    }
+  }
+
   /** Active ou désactive une instance (persiste l'état) */
   async setInstanceEnabled(id: string, enabled: boolean): Promise<void> {
     if (!this.ready || !this.pool) return;

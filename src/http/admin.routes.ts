@@ -374,6 +374,24 @@ export function registerAdminRoutes(app: Express): void {
   });
 
   /**
+   * PUT /api/admin/services/:id/endpoint — modifie l'URL d'une instance existante.
+   * Body: { endpoint: string }
+   */
+  app.put('/api/admin/services/:id/endpoint', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const decodedId = decodeURIComponent(req.params.id);
+    const { endpoint } = req.body ?? {};
+    if (!endpoint || typeof endpoint !== 'string' || !/^https?:\/\/.+/.test(endpoint)) {
+      return res.status(400).json({ error: 'Un endpoint HTTP(S) valide est requis' });
+    }
+    const ok = serviceRegistry.updateEndpoint(decodedId, endpoint.trim());
+    if (!ok) return res.status(404).json({ error: 'Instance introuvable' });
+    monitoringDB.updateServiceEndpoint(decodedId, endpoint.trim()).catch(() => {});
+    logger.info(`Admin: endpoint de "${decodedId}" mis à jour → ${endpoint.trim()}`);
+    res.json({ success: true, endpoint: endpoint.trim() });
+  });
+
+  /**
    * DELETE /api/admin/services/:id — supprime définitivement une instance.
    * Ban en mémoire (jusqu'au prochain redémarrage du gateway) + suppression DB.
    */

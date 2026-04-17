@@ -153,6 +153,16 @@ class ServiceRegistry {
     return true;
   }
 
+  /** Met à jour l'endpoint (URL) d'une instance existante */
+  updateEndpoint(id: string, endpoint: string): boolean {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    instance.endpoint = endpoint;
+    instance.isLocal = LOCAL_ENDPOINT_RE.test(endpoint) || IP_ENDPOINT_RE.test(endpoint);
+    logger.info(`ServiceRegistry: endpoint de "${id}" mis à jour → ${endpoint}`);
+    return true;
+  }
+
   // ── Sélection ──────────────────────────────────────────────────────────────
 
   /** Retourne toutes les instances d'un type de service */
