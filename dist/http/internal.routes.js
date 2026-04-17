@@ -30,7 +30,8 @@ function registerInternalRoutes(app) {
      */
     app.post('/api/internal/service/register', express_1.default.json(), (req, res) => {
         const { secret, id, serviceType, endpoint, domain, location, metrics } = req.body ?? {};
-        if (!secret || !id || !(0, service_keys_1.validateServiceSecret)(String(id), String(secret))) {
+        // Si INTERNAL_SECRET est configuré, la clé est obligatoire
+        if (env_1.INTERNAL_SECRET && (!secret || !(0, service_keys_1.validateServiceSecret)(String(id), String(secret)))) {
             return res.status(401).json({ error: 'Secret invalide' });
         }
         const VALID_TYPES = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
@@ -83,7 +84,7 @@ function registerInternalRoutes(app) {
      */
     app.post('/api/internal/service/heartbeat', express_1.default.json(), (req, res) => {
         const { secret, id, metrics } = req.body ?? {};
-        if (!secret || !id || !(0, service_keys_1.validateServiceSecret)(String(id), String(secret))) {
+        if (env_1.INTERNAL_SECRET && (!secret || !(0, service_keys_1.validateServiceSecret)(String(id), String(secret)))) {
             return res.status(401).json({ error: 'Secret invalide' });
         }
         if (!id || !metrics) {
