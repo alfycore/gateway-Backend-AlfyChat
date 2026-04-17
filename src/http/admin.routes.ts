@@ -357,6 +357,10 @@ export function registerAdminRoutes(app: Express): void {
     res.json({ success: true, serviceKey: rawKey });
   });
 
+  // Proxy helpdesk → users service (must be before /api/admin catch-all)
+  app.all('/api/helpdesk/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+  app.all('/api/helpdesk', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
+
   app.all('/api/admin/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
   app.all('/api/admin', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
 }
