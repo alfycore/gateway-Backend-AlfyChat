@@ -4,8 +4,15 @@
 
 import CircuitBreaker from 'opossum';
 import { logger } from '../utils/logger';
+import { serviceRegistry, type ServiceType } from '../utils/service-registry';
+import { sendMail } from '../utils/mailer';
+import { ADMIN_ALERT_EMAILS } from '../config/env';
 
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || '';
+
+// Throttle des alertes email : 1 email max par instance toutes les 10 minutes
+const _alertThrottle = new Map<string, number>();
+const ALERT_THROTTLE_MS = 10 * 60 * 1000;
 
 // ── Circuit breakers — un par hostname ──────────────────────────────────────
 const _breakers = new Map<string, InstanceType<typeof CircuitBreaker>>();
@@ -49,10 +56,48 @@ interface ServiceUrls {
   bots: string;
 }
 
-async function fetchService<T = unknown>(url: string, options?: RequestInit & { token?: string }): Promise<T> {
+// ── Alerte email admin (throttled) ──────────────────────────────────────────
+function notifyAdminDegraded(instance: { id: string; serviceType: string; endpoint: string; domain: string }, reason: string): void {
+  const now = Date.now();
+  const last = _alertThrottle.get(instance.id) ?? 0;
+  if (now - last < ALERT_THROTTLE_MS) return;
+  _alertThrottle.set(instance.id, now);
+
+  const subject = `[AlfyChat] ⚠️ Service dégradé : ${instance.id}`;
+  const text = [
+    `L'instance "${instance.id}" (${instance.serviceType}) a retourné une erreur 5XX.`,
+    ``,
+    `  Endpoint : ${instance.endpoint}`,
+    `  Domaine  : ${instance.domain}`,
+    `  Raison   : ${reason}`,
+    `  Heure    : ${new Date().toISOString()}`,
+    ``,
+    `L'instance a été SUSPENDUE automatiquement et ne recevra plus de trafic.`,
+    ``,
+    `Pour la réactiver, un administrateur ou technicien doit confirmer via :`,
+    `  PATCH /api/admin/services/${encodeURIComponent(instance.id)}/restore`,
+    ``,
+    `— AlfyChat Gateway`,
+  ].join('\n');
+
+  sendMail({ to: ADMIN_ALERT_EMAILS, subject, text }).catch(() => {});
+}
+
+// ── Fetch avec failover multi-instance ──────────────────────────────────────
+/**
+ * Exécute un fetch HTTP en utilisant l'URL fournie en priorité.
+ * Si l'URL retourne une erreur 5XX (ou le circuit est ouvert), tente de basculer
+ * sur une autre instance saine du même serviceType dans le registre.
+ * L'instance défaillante est marquée dégradée et les admins sont alertés par email.
+ */
+async function fetchWithFailover<T = unknown>(
+  primaryUrl: string,
+  serviceType: ServiceType | null,
+  options?: RequestInit & { token?: string },
+): Promise<T> {
   const { token, ...fetchOptions } = options || {};
 
-  const doRequest = async (): Promise<T> => {
+  const doRequest = async (url: string): Promise<T> => {
     const response = await fetch(url, {
       ...fetchOptions,
       headers: {
@@ -65,18 +110,85 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
     if (!response.ok) {
       let detail = response.statusText;
       try { const b = await response.json(); detail = JSON.stringify(b); } catch {}
-      throw new Error(`Service error: ${response.status} ${detail}`);
+      const err = new Error(`Service error: ${response.status} ${detail}`);
+      (err as any).statusCode = response.status;
+      throw err;
     }
     return response.json() as Promise<T>;
   };
 
-  try {
+  const tryFetch = async (url: string): Promise<T> => {
     const breaker = getBreaker(url);
-    return await breaker.fire(() => withRetry(doRequest)) as T;
-  } catch (error) {
-    logger.error({ err: error }, `Fetch error for ${url}`);
-    throw error;
+    return await breaker.fire(() => withRetry(doRequest.bind(null, url))) as T;
+  };
+
+  // Tentative primaire
+  try {
+    return await tryFetch(primaryUrl);
+  } catch (primaryErr: any) {
+    const isPrimary5xx = (primaryErr?.statusCode >= 500) || /Breaker is open|503|502|500/.test(String(primaryErr?.message));
+
+    // Pas un 5XX (ex: 400, 401, 404) → ne pas basculer, propager l'erreur
+    if (!isPrimary5xx || !serviceType) {
+      logger.error({ err: primaryErr }, `Fetch error for ${primaryUrl}`);
+      throw primaryErr;
+    }
+
+    // Trouver l'instance correspondant à l'URL primaire
+    const allInstances = serviceRegistry.getAll().filter((i) => i.serviceType === serviceType);
+    const primaryInstance = allInstances.find((i) => primaryUrl.startsWith(i.endpoint));
+
+    if (primaryInstance) {
+      serviceRegistry.markDegraded(primaryInstance.id, primaryErr.message);
+      notifyAdminDegraded(primaryInstance, primaryErr.message);
+      logger.warn(`[Failover] Instance primaire dégradée: ${primaryInstance.id} — recherche d'un fallback…`);
+    }
+
+    // Chercher une autre instance saine du même type (exclut la primaire)
+    const fallbacks = serviceRegistry.getInstances(serviceType).filter(
+      (i) => i.id !== primaryInstance?.id && !i.degraded,
+    );
+
+    if (fallbacks.length === 0) {
+      logger.error(`[Failover] Aucun fallback disponible pour ${serviceType}`);
+      throw primaryErr;
+    }
+
+    // Trier par score et essayer dans l'ordre
+    const sorted = fallbacks.sort(
+      (a, b) => serviceRegistry.computeScore(b) - serviceRegistry.computeScore(a),
+    );
+
+    for (const fallback of sorted) {
+      // Remplacer la base de l'URL primaire par le endpoint du fallback
+      const fallbackUrl = primaryUrl.replace(
+        primaryInstance?.endpoint || primaryUrl.split('/').slice(0, 3).join('/'),
+        fallback.endpoint,
+      );
+      try {
+        logger.info(`[Failover] Bascule vers ${fallback.id} (${fallback.endpoint})`);
+        const result = await tryFetch(fallbackUrl);
+        return result;
+      } catch (fallbackErr: any) {
+        const isFallback5xx = (fallbackErr?.statusCode >= 500) || /Breaker is open|503|502|500/.test(String(fallbackErr?.message));
+        if (isFallback5xx) {
+          serviceRegistry.markDegraded(fallback.id, fallbackErr.message);
+          notifyAdminDegraded(fallback, fallbackErr.message);
+          logger.warn(`[Failover] Fallback ${fallback.id} aussi dégradé, essai suivant…`);
+        } else {
+          throw fallbackErr;
+        }
+      }
+    }
+
+    logger.error(`[Failover] Tous les fallbacks épuisés pour ${serviceType}`);
+    throw primaryErr;
   }
+}
+
+// Wrapper rétrocompatible pour les appels sans failover (services sans registry)
+async function fetchService<T = unknown>(url: string, options?: RequestInit & { token?: string }): Promise<T> {
+  return fetchWithFailover<T>(url, null, options);
 }
 
 export class ServiceProxy {
@@ -164,7 +276,7 @@ class MessagesProxy {
   }
 
   async createMessage(data: { id?: string; conversationId: string; senderId: string; content: string; senderContent?: string; e2eeType?: number; replyToId?: string }) {
-    return fetchService(`${this.baseUrl}/messages`, {
+    return fetchWithFailover(`${this.baseUrl}/messages`, 'messages', {
       method: 'POST',
       body: JSON.stringify(data),
     });

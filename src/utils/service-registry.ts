@@ -35,6 +35,9 @@ export interface ServiceInstance {
   metrics: ServiceMetrics;
   healthy: boolean;
   enabled: boolean;         // activé/désactivé par un admin (persiste en DB)
+  degraded: boolean;        // dégradé : erreur 5XX détectée, suspendu jusqu'à validation admin
+  degradedAt?: Date;        // date de la mise en dégradé
+  degradedReason?: string;  // raison (ex: "503 Service Unavailable")
   isLocal: boolean;         // endpoint localhost/127.0.0.1 (priorité basse)
 }
 
@@ -81,6 +84,10 @@ class ServiceRegistry {
       healthy: true,
       // Conserver l'état enabled existant si non fourni (évite d'écraser un disable admin)
       enabled: data.enabled !== undefined ? data.enabled : (existing?.enabled ?? true),
+      // Ne pas réinitialiser degraded au register — seul un admin peut le faire via restoreInstance()
+      degraded: existing?.degraded ?? false,
+      degradedAt: existing?.degradedAt,
+      degradedReason: existing?.degradedReason,
       isLocal: LOCAL_ENDPOINT_RE.test(data.endpoint) || IP_ENDPOINT_RE.test(data.endpoint),
     };
 
@@ -109,6 +116,34 @@ class ServiceRegistry {
     return deleted;
   }
 
+  /** Marque une instance comme dégradée (erreur 5XX) — la sort du pool de trafic jusqu'à validation admin */
+  markDegraded(id: string, reason: string): ServiceInstance | null {
+    const instance = this.instances.get(id);
+    if (!instance) return null;
+    instance.degraded = true;
+    instance.degradedAt = new Date();
+    instance.degradedReason = reason;
+    logger.warn(`ServiceRegistry: instance DÉGRADÉE — ${id} (${reason})`);
+    return instance;
+  }
+
+  /** Restaure une instance dégradée (validation admin) */
+  restoreInstance(id: string): boolean {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    instance.degraded = false;
+    instance.degradedAt = undefined;
+    instance.degradedReason = undefined;
+    instance.healthy = true;
+    logger.info(`ServiceRegistry: instance RESTAURÉE — ${id}`);
+    return true;
+  }
+
+  /** Retourne toutes les instances dégradées */
+  getDegraded(): ServiceInstance[] {
+    return [...this.instances.values()].filter((i) => i.degraded);
+  }
+
   /** Active ou désactive une instance (sans la supprimer) */
   setEnabled(id: string, enabled: boolean): boolean {
     const instance = this.instances.get(id);
@@ -126,7 +161,8 @@ class ServiceRegistry {
       (i) =>
         i.serviceType === serviceType &&
         (includeUnhealthy || i.healthy) &&
-        (includeDisabled || i.enabled),
+        (includeDisabled || i.enabled) &&
+        !i.degraded,
     );
   }
 

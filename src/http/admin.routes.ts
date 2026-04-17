@@ -301,6 +301,36 @@ export function registerAdminRoutes(app: Express): void {
   });
 
   /**
+   * POST /api/admin/services/:id/restore
+   * Restaure une instance dégradée (validation admin ou technicien).
+   * Retire le flag degraded → l'instance reprend le trafic normal.
+   */
+  app.post('/api/admin/services/:id/restore', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const decodedId = decodeURIComponent(req.params.id);
+    const ok = serviceRegistry.restoreInstance(decodedId);
+    if (!ok) return res.status(404).json({ error: 'Instance introuvable' });
+    logger.info(`Admin: instance "${decodedId}" restaurée manuellement`);
+    res.json({ success: true, message: `Instance "${decodedId}" remise en service` });
+  });
+
+  /**
+   * GET /api/admin/services/degraded — liste les instances dégradées
+   */
+  app.get('/api/admin/services/degraded', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const degraded = serviceRegistry.getDegraded().map((i) => ({
+      id: i.id,
+      serviceType: i.serviceType,
+      endpoint: i.endpoint,
+      domain: i.domain,
+      degradedAt: i.degradedAt,
+      degradedReason: i.degradedReason,
+    }));
+    res.json({ degraded });
+  });
+
+  /**
    * PATCH /api/admin/services/:id — active ou désactive une instance (persiste en DB).
    * Body: { enabled: boolean }
    * Ne bannit pas → le service peut continuer à heartbeater mais ne reçoit plus de trafic.

@@ -57,3 +57,10 @@ export const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
 export const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:4000')
   .split(',')
   .map((o) => o.trim());
+
+// ── Email SMTP ──────────────────────────────────────────────────────
+// ADMIN_ALERT_EMAILS : liste d'emails séparés par des virgules qui reçoivent les alertes de dégradation
+export const ADMIN_ALERT_EMAILS: string[] = (process.env.ADMIN_ALERT_EMAILS || '')
+  .split(',')
+  .map((e) => e.trim())
+  .filter(Boolean);
