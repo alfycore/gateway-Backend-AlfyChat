@@ -283,16 +283,16 @@ class MessagesProxy {
     });
   }
 
-  async updateMessage(messageId: string, content: string, userId: string) {
-    return fetchService(`${this.baseUrl}/messages/${messageId}`, {
+  async updateMessage(messageId: string, content: string, userId: string, senderContent?: string, e2eeType?: number) {
+    return fetchWithFailover(`${this.baseUrl}/messages/${messageId}`, 'messages', {
       method: 'PATCH',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, ...(senderContent !== undefined && { senderContent }), ...(e2eeType !== undefined && { e2eeType }) }),
       headers: { 'x-user-id': userId },
     });
   }
 
   async deleteMessage(messageId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/messages/${messageId}`, {
+    return fetchWithFailover(`${this.baseUrl}/messages/${messageId}`, 'messages', {
       method: 'DELETE',
       headers: { 'x-user-id': userId },
     });

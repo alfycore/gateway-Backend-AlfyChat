@@ -811,7 +811,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // Alias message:edit (compatibilité client)
-  socket.on('message:edit', async (data: { messageId: string; content: string; conversationId?: string }) => {
+  socket.on('message:edit', async (data: { messageId: string; content: string; senderContent?: string; e2eeType?: number; conversationId?: string }) => {
     try {
       // ── Rate limiting (même compteur que message:send) ──
       const now = Date.now();
@@ -825,7 +825,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       messageRateLimit.set(userId, recent);
 
       const v = validateMessageContent(data?.content);
-      const updated = await serviceProxy.messages.updateMessage(data.messageId, v.content, userId) as any;
+      const updated = await serviceProxy.messages.updateMessage(data.messageId, v.content, userId, data.senderContent, data.e2eeType) as any;
       if (!updated) {
         socket.emit('message:edit-error', { messageId: data.messageId, error: 'Message non trouvé ou non autorisé' });
         return;
@@ -859,16 +859,26 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   // Alias message:delete (compatibilité client)
   socket.on('message:delete', async (data: { messageId: string; conversationId?: string }) => {
+    const room = data.conversationId ? `conversation:${data.conversationId}` : `user:${userId}`;
     try {
       await serviceProxy.messages.deleteMessage(data.messageId, userId);
-    } catch (error) {
-      // Le message n'est peut-être pas encore en base (écriture fire-and-forget en cours).
-      // On planifie la suppression pour quand l'écriture sera terminée.
-      pendingDeletions.set(data.messageId, userId);
-      console.warn('⚠️ Delete scheduled (message not in DB yet):', data.messageId);
+    } catch (error: any) {
+      const status = error?.statusCode as number | undefined;
+      if (status === 404) {
+        // Message pas encore en base (écriture fire-and-forget en cours) — différer.
+        pendingDeletions.set(data.messageId, userId);
+        console.warn('⚠️ Delete scheduled (message not in DB yet):', data.messageId);
+      } else {
+        // Service temporairement indisponible après retries — planifier un second essai.
+        console.warn('⚠️ Delete failed (service error), scheduling retry:', data.messageId, error?.message);
+        setTimeout(() => {
+          serviceProxy.messages.deleteMessage(data.messageId, userId).catch((retryErr) => {
+            console.error('❌ Delete retry failed:', data.messageId, retryErr?.message);
+          });
+        }, 3_000);
+      }
     }
     // Toujours émettre de façon optimiste — le client a déjà retiré le message localement.
-    const room = data.conversationId ? `conversation:${data.conversationId}` : `user:${userId}`;
     io.to(room).emit('message:deleted', { messageId: data.messageId });
     socket.emit('message:deleted', { messageId: data.messageId });
   });
