@@ -8,7 +8,11 @@ import { MEDIA_URL, allowedOrigins } from '../config/env';
 const LOCAL_HOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
 function resolveMediaEndpoint(preferredLocation?: string): string {
   const mediaUrlIsDistant = !!MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL);
-  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation) ?? null;
+  // Chercher une instance saine en priorité, sinon n'importe quelle instance connue
+  const instance = serviceRegistry.selectBestByLocation('media', preferredLocation)
+    ?? serviceRegistry.getAll().find(i => i.serviceType === 'media' && !i.isLocal)
+    ?? serviceRegistry.getAll().find(i => i.serviceType === 'media')
+    ?? null;
   if (instance && instance.isLocal && mediaUrlIsDistant) {
     logger.warn(`MediaProxy: seule instance locale disponible (${instance.endpoint}), fallback sur MEDIA_URL distant`);
     return MEDIA_URL;
@@ -42,18 +46,21 @@ export function registerMediaRoutes(app: Express): void {
     const isUnreachableLocal = (inst: { isLocal: boolean } | undefined): boolean =>
       !!inst?.isLocal && mediaUrlIsDistant;
 
-    // 1. Chercher l'instance par serviceId dans le registre
+    // 1. Chercher l'instance par serviceId dans le registre (même si unhealthy — pour les fichiers déjà uploadés, le statut de santé ne doit pas bloquer la récupération)
     let instance = serviceRegistry.getById(serviceId);
     if (isUnreachableLocal(instance)) {
       logger.warn(`MediaProxy: instance ${serviceId} a un endpoint local (${instance!.endpoint}), fallback sur endpoint distant`);
       instance = undefined;
     }
 
-    // 2. Fallback : chercher une instance saine dans la même région (non-locale si MEDIA_URL est distant)
-    if (!instance || !instance.healthy) {
-      const regional = serviceRegistry.selectBestByLocation('media', location);
-      if (regional && !isUnreachableLocal(regional)) {
-        logger.warn(`MediaProxy: instance ${serviceId} introuvable/hors-ligne, fallback sur ${regional.id}`);
+    // 2. Si l'instance n'est pas trouvée du tout, chercher n'importe quelle instance de la même région
+    //    (healthy ou non, car un service peut être marqué unhealthy juste pour absence de heartbeat)
+    if (!instance) {
+      const regional = serviceRegistry.selectBestByLocation('media', location)
+        ?? serviceRegistry.getAll().find(i => i.serviceType === 'media' && i.location.toUpperCase() === location.toUpperCase() && !isUnreachableLocal(i))
+        ?? serviceRegistry.getAll().find(i => i.serviceType === 'media' && !isUnreachableLocal(i));
+      if (regional) {
+        logger.warn(`MediaProxy: instance ${serviceId} introuvable, fallback sur ${regional.id}`);
         instance = regional;
       }
     }
