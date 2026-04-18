@@ -69,13 +69,30 @@ const corsOptions = {
     // (évite qu'un attaquant local puisse cibler un déploiement prod)
     if (!IS_PRODUCTION && /^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origine non autorisée — ${origin}`));
+    // Ne pas passer une Error — Express supprimerait les headers CORS de la réponse.
+    // Retourner false déclenche un rejet 403 avec les headers CORS présents.
+    cb(null, false);
   },
   credentials: true,
 };
 
-app.options('*', cors(corsOptions)); // préflight explicite — doit être avant tout autre middleware
+// Préflight explicite : doit précéder tous les autres middlewares
+app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
+// Bloquer explicitement les origines non autorisées APRÈS que cors() a posé les headers
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const origin = req.headers.origin as string | undefined;
+  if (
+    origin &&
+    IS_PRODUCTION &&
+    !allowedOrigins.includes(origin) &&
+    !/^http:\/\/localhost(:\d+)?$/.test(origin)
+  ) {
+    logger.warn(`CORS: origine non autorisée — ${origin}`);
+    return res.status(403).json({ error: 'Origine non autorisée' });
+  }
+  next();
+});
 // Helmet + CSP stricte en prod. Les uploads (media) restent accessibles cross-origin.
 app.use(helmet({
   contentSecurityPolicy: IS_PRODUCTION ? {
