@@ -21,3 +21,18 @@ export function checkServerJoinRate(userId: string): boolean {
   serverJoinRateLimit.set(userId, recent);
   return true;
 }
+
+/** INVITE_VERIFY rate limit — anti-énumération de codes d'invitation. */
+export const inviteVerifyRateLimit = new Map<string, number[]>();
+export const INVITE_VERIFY_WINDOW = 60000; // 60 s
+export const INVITE_VERIFY_MAX = 20;       // max 20 tentatives / min / user
+
+export function checkInviteVerifyRate(userId: string): boolean {
+  const now = Date.now();
+  const timestamps = inviteVerifyRateLimit.get(userId) || [];
+  const recent = timestamps.filter(t => now - t < INVITE_VERIFY_WINDOW);
+  if (recent.length >= INVITE_VERIFY_MAX) return false;
+  recent.push(now);
+  inviteVerifyRateLimit.set(userId, recent);
+  return true;
+}

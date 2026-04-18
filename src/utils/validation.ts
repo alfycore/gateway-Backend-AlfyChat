@@ -233,13 +233,26 @@ export function validateChannelInput(data: any): { name?: string; topic?: string
   return out;
 }
 
-export function validateRoleInput(data: any): { name?: string; color?: string } {
+// Bitmask de permissions valides (doit rester aligné avec PERM dans gateway/servers).
+// READ|SEND|REACT|MANAGE_MESSAGES|KICK|BAN|ADMIN|MANAGE_CHANNELS|MANAGE_ROLES|KICK_MEMBERS|BAN_MEMBERS
+const ALL_PERMS_MASK = 0xFFF;
+
+export function validateRoleInput(data: any): { name?: string; color?: string; permissions?: number; mentionable?: boolean } {
   const out: any = {};
   if (data.name !== undefined) out.name = validateText(data.name, { field: 'name', ...LIMITS.roleName, required: true });
   if (data.color !== undefined) {
     if (typeof data.color !== 'string' || !/^#[0-9a-f]{6}$/i.test(data.color)) throw new ValidationError('color', 'invalid hex color');
     out.color = data.color;
   }
+  if (data.permissions !== undefined && data.permissions !== null) {
+    const n = typeof data.permissions === 'number' ? data.permissions : Number(data.permissions);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+      throw new ValidationError('permissions', 'must be a non-negative integer');
+    }
+    // Masquer pour empêcher permissions:-1 / bits hors plage (bypass de hasPermission).
+    out.permissions = n & ALL_PERMS_MASK;
+  }
+  if (data.mentionable !== undefined) out.mentionable = validateBool(data.mentionable, 'mentionable');
   return out;
 }
 

@@ -27,7 +27,10 @@ export const MEDIA_URL = process.env.MEDIA_SERVICE_URL || 'https://media.s.backe
 export const SERVERHOSTING_URL = process.env.SERVERHOSTING_SERVICE_URL || 'http://localhost:3008';
 export const SUBSCRIPTIONS_URL = process.env.SUBSCRIPTIONS_SERVICE_URL || 'http://localhost:3009';
 
-export const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret-dev';
+if (!process.env.INTERNAL_SECRET) {
+  throw new Error('INTERNAL_SECRET manquant — définissez-le dans .env (openssl rand -hex 64). Refus de démarrer avec un secret par défaut.');
+}
+export const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 
 // ── Rate limiting ───────────────────────────────────────────────────
 export const RATE_LIMIT_ANON  = parseInt(process.env.RATE_LIMIT_ANON  || '20');
@@ -43,6 +46,13 @@ export const AUTH_BRUTEFORCE_PATHS = [
   '/api/auth/verify-2fa',
   '/api/auth/forgot-password',
   '/api/auth/reset-password',
+  '/api/auth/resend-verification-email',
+];
+
+// Patterns brute-forçables (codes/tokens courts) — le middleware applique le même
+// rate-limit aux chemins qui matchent l'une de ces regex.
+export const AUTH_BRUTEFORCE_REGEX: RegExp[] = [
+  /^\/api\/servers\/[^/]+\/claim-admin$/, // code à 8 caractères (~40 bits)
 ];
 
 // ── Trusted reverse-proxy IPs ───────────────────────────────────────
@@ -54,9 +64,15 @@ export const TRUSTED_PROXIES = new Set(
 export const IP_ENDPOINT_RE = /^https?:\/\/(\d{1,3}\.){3}\d{1,3}/;
 
 // ── CORS ────────────────────────────────────────────────────────────
+// En prod, FRONTEND_URL est obligatoire : un fallback localhost accepterait
+// des requêtes credentialed depuis n'importe quel port local (DNS rebinding).
+if (IS_PRODUCTION && !process.env.FRONTEND_URL) {
+  throw new Error('FRONTEND_URL manquant en production — définissez-le dans .env (liste d\'origines séparées par des virgules).');
+}
 export const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:4000')
   .split(',')
-  .map((o) => o.trim());
+  .map((o) => o.trim())
+  .filter(Boolean);
 
 // ── Email SMTP ──────────────────────────────────────────────────────
 // ADMIN_ALERT_EMAILS : liste d'emails séparés par des virgules qui reçoivent les alertes de dégradation

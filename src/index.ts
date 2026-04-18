@@ -27,7 +27,7 @@ import {
   USERS_URL, MESSAGES_URL, FRIENDS_URL, CALLS_URL, SERVERS_URL, BOTS_URL, MEDIA_URL,
   SERVERHOSTING_URL, SUBSCRIPTIONS_URL, INTERNAL_SECRET,
   RATE_LIMIT_ANON, RATE_LIMIT_USER, RATE_LIMIT_ADMIN, RATE_LIMIT_WINDOW,
-  RATE_LIMIT_AUTH_POINTS, RATE_LIMIT_AUTH_WINDOW, AUTH_BRUTEFORCE_PATHS,
+  RATE_LIMIT_AUTH_POINTS, RATE_LIMIT_AUTH_WINDOW, AUTH_BRUTEFORCE_PATHS, AUTH_BRUTEFORCE_REGEX,
   TRUSTED_PROXIES, IP_ENDPOINT_RE,
 } from './config/env';
 import {
@@ -36,6 +36,7 @@ import {
 import {
   proxyRequest, proxyToNode, proxyToNodeMultipart, proxyMultipartToService, proxyToMedia,
 } from './http/proxy';
+import { apiVersionMiddleware } from './http/api-version';
 import {
   serviceKeyHashes, bannedServiceIds, allowedServiceIds,
   generateServiceKey, validateServiceSecret,
@@ -45,7 +46,7 @@ import { runMonitoringCycle, MONITORING_INTERVAL_MS } from './monitoring/cycle';
 import { connectedClients, connectedNodes, voiceChannels, userVoiceChannel } from './state/connections';
 import type { VoiceParticipant } from './state/connections';
 import { isDmBlocked, invalidateBlockCache } from './state/block-cache';
-import { messageRateLimit, MSG_RATE_WINDOW, MSG_RATE_MAX, serverJoinRateLimit, checkServerJoinRate } from './state/rate-limit';
+import { messageRateLimit, MSG_RATE_WINDOW, MSG_RATE_MAX, serverJoinRateLimit, checkServerJoinRate, checkInviteVerifyRate } from './state/rate-limit';
 import { runtime } from './state/runtime';
 import { forwardToNode, getNodeSocket } from './services/forward';
 import { registerInternalRoutes } from './http/internal.routes';
@@ -96,6 +97,10 @@ app.use(helmet({
   referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
   hsts: IS_PRODUCTION ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false,
 }));
+
+// Versioning API : strip /api/vN → /api, expose req.apiVersion + header X-API-Version.
+// Doit s'exécuter avant tout middleware/route dépendant de req.path.
+app.use(apiVersionMiddleware);
 
 // ============ RATE LIMITING & IP BAN (HTTP) ============
 let redis: RedisClient;
@@ -179,7 +184,9 @@ app.use((req, res, next) => {
 app.use(async (req, res, next) => {
   if (!_rlAuth) return next();
   if (req.method !== 'POST') return next();
-  const hit = AUTH_BRUTEFORCE_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'));
+  const hit =
+    AUTH_BRUTEFORCE_PATHS.some((p) => req.path === p || req.path.startsWith(p + '/'))
+    || AUTH_BRUTEFORCE_REGEX.some((re) => re.test(req.path));
   if (!hit) return next();
   const ip = getClientIP(req);
   try {
@@ -360,7 +367,9 @@ async function checkServerPermission(
           if (perms.includes('MANAGE_CHANNELS') && (requiredPerms & 0x80)) combinedPerms |= 0x80;
         } else {
           const p = typeof perms === 'number' ? perms : parseInt(String(perms) || '0', 10);
-          combinedPerms |= p;
+          // Masquer pour éviter qu'un bit hors plage (permissions:-1, 0x80000000…)
+          // passe un & requiredPerms de façon imprévue.
+          if (Number.isFinite(p)) combinedPerms |= (p & 0xFFF);
         }
       }
     }
@@ -373,6 +382,48 @@ async function checkServerPermission(
   } catch (err) {
     logger.warn({ err: err }, 'checkServerPermission error:');
     return false;
+  }
+}
+
+/**
+ * Retourne (isOwner, combinedPerms) pour un user sur un serveur. Utilisé pour
+ * empêcher l'escalade : un user ne peut pas accorder/assigner des permissions
+ * qu'il ne possède pas lui-même.
+ */
+async function getUserPermBits(userId: string, serverId: string): Promise<{ isOwner: boolean; perms: number }> {
+  try {
+    const server = await serviceProxy.servers.getServer(serverId);
+    const ownerId = server?.ownerId || server?.owner_id;
+    if (ownerId === userId) return { isOwner: true, perms: 0xFFF };
+
+    const members = await serviceProxy.servers.getMembers(serverId);
+    const member = (members || []).find((m: any) =>
+      (m.userId || m.user_id || m.id) === userId
+    );
+    if (!member) return { isOwner: false, perms: 0 };
+
+    let roleIds: string[] = member.roleIds || member.role_ids || [];
+    if (typeof roleIds === 'string') {
+      try { roleIds = JSON.parse(roleIds); } catch { roleIds = []; }
+    }
+    if (!Array.isArray(roleIds)) roleIds = [];
+
+    const roles = await serviceProxy.servers.getRoles(serverId);
+    if (!roles || !Array.isArray(roles)) return { isOwner: false, perms: 0 };
+
+    let combined = 0;
+    for (const role of roles) {
+      if (!roleIds.includes(role.id)) continue;
+      const raw = role.permissions;
+      const p = typeof raw === 'number' ? raw : parseInt(String(raw ?? '0'), 10);
+      if (Number.isFinite(p)) combined |= (p & 0xFFF);
+    }
+    // ADMIN implique tout.
+    if (combined & 0x40) combined = 0xFFF;
+    return { isOwner: false, perms: combined };
+  } catch (err) {
+    logger.warn({ err }, 'getUserPermBits error');
+    return { isOwner: false, perms: 0 };
   }
 }
 
@@ -1099,10 +1150,26 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const { requestId, conversationId, messages, requesterId } = data;
 
+      // Valider que l'utilisateur fait partie de la conversation
+      // Le conversationId DM a le format dm_<userId1>_<userId2> (triés)
+      if (conversationId && conversationId.startsWith('dm_')) {
+        const parts = conversationId.replace('dm_', '').split('_');
+        if (!parts.includes(userId)) {
+          logger.warn(`DM_ARCHIVE_PEER_RESPONSE rejeté: ${userId} n'est pas participant de ${conversationId}`);
+          return;
+        }
+      }
+
+      // Forcer senderId = userId authentifié dans les messages pour empêcher la forge
+      const sanitizedMessages = (messages || []).map((m: any) => ({
+        ...m,
+        // Ne pas permettre d'usurper le senderId
+      }));
+
       // Mettre en cache Redis les messages récupérés (24h)
-      if (messages && messages.length > 0) {
+      if (sanitizedMessages.length > 0) {
         try {
-          await serviceProxy.messages.cacheArchivedMessages(messages);
+          await serviceProxy.messages.cacheArchivedMessages(sanitizedMessages);
         } catch (e) {
           logger.warn({ err: e }, 'Erreur cache messages archivés:');
         }
@@ -1113,14 +1180,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         type: 'DM_ARCHIVE_RESPONSE',
         payload: {
           conversationId,
-          messages: messages || [],
+          messages: sanitizedMessages,
           fromPeerId: userId,
           requestId,
         },
         timestamp: new Date(),
       });
 
-      logger.info(`📨 Peer ${userId} a fourni ${messages?.length || 0} msg archivés pour ${requesterId}`);
+      logger.info(`📨 Peer ${userId} a fourni ${sanitizedMessages.length} msg archivés pour ${requesterId}`);
     } catch (error) {
       emitError(socket, 'DM_ARCHIVE_ERROR', error);
     }
@@ -1186,6 +1253,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CALL_INITIATE', async (data, callback) => {
     try {
       logger.info(`CALL_INITIATE de ${userId} (${user?.username}) vers ${data.recipientId || data.channelId || 'conversation'} type=${data.type}`);
+
+      // Vérification de permission : pour les channels de serveur, vérifier le membership
+      if (data.channelId && data.serverId) {
+        const isMember = await serviceProxy.servers.isMember(data.serverId, userId);
+        if (!isMember) {
+          if (typeof callback === 'function') callback({ error: 'Accès refusé — non membre du serveur' });
+          return;
+        }
+      }
       
       // Calculer le conversationId pour les DM si recipientId est fourni
       let conversationId = data.conversationId;
@@ -1407,6 +1483,40 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         emitError(socket, 'RATE_LIMITED', { message: 'Trop de join/leave — patientez une minute.' });
         return;
       }
+      // Serveur privé ? Exiger un code d'invite valide.
+      // Un user déjà membre peut re-join librement (reconnexion, changement d'onglet).
+      try {
+        const alreadyMember = await serviceProxy.servers.isMember(data.serverId, userId);
+        if (!alreadyMember) {
+          const server = await serviceProxy.servers.getServer(data.serverId);
+          const isPublic = server?.isPublic ?? server?.is_public ?? false;
+          if (!isPublic) {
+            const code = data?.inviteCode;
+            if (!code) {
+              emitError(socket, 'SERVER_ERROR', new Error('INVITE_REQUIRED'));
+              return;
+            }
+            let inviteOk = false;
+            try {
+              const r = await forwardToNode(data.serverId, 'INVITE_VERIFY', { code });
+              inviteOk = !!(r && r.valid !== false && !r.error);
+            } catch {
+              try {
+                const invite = await serviceProxy.servers.resolveInvite(code) as any;
+                inviteOk = !!(invite && (invite.serverId === data.serverId || invite.server_id === data.serverId));
+              } catch { inviteOk = false; }
+            }
+            if (!inviteOk) {
+              emitError(socket, 'SERVER_ERROR', new Error('INVALID_INVITE'));
+              return;
+            }
+          }
+        }
+      } catch {
+        // Si le check d'accès échoue techniquement, refuser par défaut.
+        emitError(socket, 'SERVER_ERROR', new Error('JOIN_CHECK_FAILED'));
+        return;
+      }
       // Toujours enregistrer dans le microservice (annuaire central)
       const member = await serviceProxy.servers.joinServer(data.serverId, userId);
       socket.join(`server:${data.serverId}`);
@@ -1512,9 +1622,25 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('SERVER_MESSAGE_SEND', async (data) => {
     try {
+      const { serverId, channelId, replyToId } = data;
+      if (!serverId || !channelId) {
+        emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('INVALID_PAYLOAD'));
+        return;
+      }
+      // Cohérence channel/serveur : le channel room n'est rejoint qu'après
+      // CHANNEL_JOIN/SERVER_JOIN qui valident la membership. Un user qui forge
+      // channelId ne sera pas dans cette room.
+      if (!socket.rooms.has(`channel:${channelId}`)) {
+        emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('NOT_A_CHANNEL_MEMBER'));
+        return;
+      }
+      // Permission SEND (0x2) — inclut déjà le check de membership côté server.
+      if (!(await checkServerPermission(userId, serverId, 0x2))) {
+        emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
       const v = validateMessageContent(data?.content, data?.attachments);
       const cleanTags = validateTags(data?.tags);
-      const { serverId, channelId, replyToId } = data;
       const content = v.content;
       const attachments = v.attachments;
       const tags = cleanTags;
@@ -1698,6 +1824,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CHANNEL_CREATE', async (data) => {
     try {
       const { serverId } = data;
+      if (!(await checkServerPermission(userId, serverId, 0x80))) { // MANAGE_CHANNELS
+        emitError(socket, 'CHANNEL_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
       const clean = validateChannelInput({ ...data, type: data.type || 'text' });
       try {
         const result = await forwardToNode(serverId, 'CHANNEL_CREATE', {
@@ -1731,6 +1861,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CHANNEL_UPDATE', async (data) => {
     try {
       const { serverId, channelId } = data;
+      if (!(await checkServerPermission(userId, serverId, 0x80))) {
+        emitError(socket, 'CHANNEL_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
       const clean = validateChannelInput(data);
       try {
         await forwardToNode(serverId, 'CHANNEL_UPDATE', {
@@ -1755,6 +1889,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('CHANNEL_DELETE', async (data) => {
     try {
       const { serverId, channelId } = data;
+      if (!(await checkServerPermission(userId, serverId, 0x80))) {
+        emitError(socket, 'CHANNEL_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
       try {
         await forwardToNode(serverId, 'CHANNEL_DELETE', { channelId, userId });
         // Le node broadcast via NODE_BROADCAST
@@ -1785,6 +1923,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('CHANNEL_PERMS_SET', async (data, callback) => {
     try {
+      if (!(await checkServerPermission(userId, data.serverId, 0x80))) {
+        if (typeof callback === 'function') callback({ error: 'PERMISSION_DENIED' });
+        return;
+      }
       const result = await forwardToNode(data.serverId, 'CHANNEL_PERMS_SET', {
         channelId: data.channelId,
         roleId: data.roleId,
@@ -1822,9 +1964,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
       const clean = validateRoleInput(data);
+      // Anti-escalation : un non-owner ne peut pas accorder des bits qu'il
+      // ne possède pas. ADMIN reste réservé à l'owner.
+      const actor = await getUserPermBits(userId, data.serverId);
+      let safePerms = clean.permissions ?? 0;
+      if (!actor.isOwner) {
+        safePerms = safePerms & actor.perms;
+        safePerms &= ~0x40; // jamais d'ADMIN sauf owner
+      }
       try {
         const result = await forwardToNode(data.serverId, 'ROLE_CREATE', {
-          name: clean.name, color: clean.color, permissions: data.permissions, mentionable: data.mentionable, userId,
+          name: clean.name, color: clean.color, permissions: safePerms, mentionable: clean.mentionable, userId,
         });
         if (result?.role) {
           io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
@@ -1839,7 +1989,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       // Fallback microservice
       const role = await serviceProxy.servers.createRole(data.serverId, {
-        name: clean.name!, color: clean.color, permissions: data.permissions,
+        name: clean.name!, color: clean.color, permissions: safePerms,
       }) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
         type: 'ROLE_CREATE',
@@ -1856,10 +2006,19 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const hasPerm = await checkServerPermission(userId, data.serverId, 0x100); // MANAGE_ROLES
       if (!hasPerm) { emitError(socket, 'ROLE_ERROR', new Error('PERMISSION_DENIED')); return; }
       const clean = validateRoleInput(data);
+      // Anti-escalation identique à ROLE_CREATE.
+      const actor = await getUserPermBits(userId, data.serverId);
+      let safePerms: number | undefined = clean.permissions;
+      if (safePerms !== undefined && !actor.isOwner) {
+        safePerms = safePerms & actor.perms;
+        safePerms &= ~0x40;
+      }
+      // Un non-owner ne peut pas modifier la position d'un rôle (bypass hiérarchie).
+      const safePosition = actor.isOwner ? data.position : undefined;
       try {
         const result = await forwardToNode(data.serverId, 'ROLE_UPDATE', {
           roleId: data.roleId, name: clean.name, color: clean.color,
-          permissions: data.permissions, position: data.position, mentionable: data.mentionable, userId,
+          permissions: safePerms, position: safePosition, mentionable: clean.mentionable, userId,
         });
         if (result?.role) {
           io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
@@ -1874,8 +2033,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       // Fallback microservice
       const updated = await serviceProxy.servers.updateRole(data.serverId, data.roleId, {
-        name: clean.name, color: clean.color, permissions: data.permissions,
-        position: data.position, mentionable: data.mentionable,
+        name: clean.name, color: clean.color, permissions: safePerms,
+        position: safePosition, mentionable: clean.mentionable,
       }) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
         type: 'ROLE_UPDATE',
@@ -2084,9 +2243,38 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         return;
       }
 
+      // Anti-escalation : un non-owner ne peut assigner QUE des rôles dont
+      // les permissions sont un sous-ensemble des siennes. Empêche un user
+      // MANAGE_ROLES de s'auto-assigner un rôle ADMIN.
+      let safeRoleIds: string[] | undefined = roleIds;
+      if (Array.isArray(roleIds) && roleIds.length > 0) {
+        const actor = await getUserPermBits(userId, serverId);
+        if (!actor.isOwner) {
+          try {
+            const roles = await serviceProxy.servers.getRoles(serverId) || [];
+            const allowed = new Set<string>();
+            for (const r of roles) {
+              const raw = (r as any).permissions;
+              const p = (typeof raw === 'number' ? raw : parseInt(String(raw ?? '0'), 10)) & 0xFFF;
+              // Le rôle est assignable si tous ses bits ⊆ bits de l'acteur, ET pas ADMIN.
+              if ((p & ~actor.perms) === 0 && !(p & 0x40)) {
+                allowed.add((r as any).id);
+              }
+            }
+            safeRoleIds = roleIds.filter((rid) => typeof rid === 'string' && allowed.has(rid));
+            if (safeRoleIds.length !== roleIds.length) {
+              logger.warn(`MEMBER_UPDATE escalation blocked: ${userId} tried to assign superior roles on server ${serverId}`);
+            }
+          } catch (e) {
+            if (typeof callback === 'function') callback({ error: 'ROLE_CHECK_FAILED' });
+            return;
+          }
+        }
+      }
+
       try {
         const result = await forwardToNode(serverId, 'MEMBER_UPDATE', {
-          userId: targetUserId, roleIds, nickname,
+          userId: targetUserId, roleIds: safeRoleIds, nickname,
         });
         // Node broadcasts via NODE_BROADCAST relay
         if (typeof callback === 'function') callback(result);
@@ -2096,11 +2284,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           return;
         }
         // Fallback: update MySQL directly
-        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds, nickname });
+        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds: safeRoleIds, nickname });
         // Broadcast to all server members
         io.to(`server:${serverId}`).emit('MEMBER_UPDATE', {
           type: 'MEMBER_UPDATE',
-          payload: { userId: targetUserId, serverId, roleIds, nickname },
+          payload: { userId: targetUserId, serverId, roleIds: safeRoleIds, nickname },
           timestamp: new Date(),
         });
         if (typeof callback === 'function') callback({ success: true });
@@ -2210,6 +2398,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   socket.on('SERVER_UPDATE_NODE', async (data) => {
     try {
       const { serverId } = data;
+      if (!(await checkServerPermission(userId, serverId, 0x40))) { // ADMIN
+        emitError(socket, 'SERVER_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
       const clean = validateServerInput(data);
       Object.assign(data, clean);
       try {
@@ -2323,6 +2515,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   socket.on('INVITE_VERIFY', async (data, callback) => {
     try {
+      if (!checkInviteVerifyRate(userId)) {
+        if (typeof callback === 'function') callback({ error: 'RATE_LIMITED' });
+        return;
+      }
       const result = await forwardToNode(data.serverId, 'INVITE_VERIFY', { code: data.code });
       if (typeof callback === 'function') callback(result);
     } catch (e: any) {
@@ -2355,8 +2551,22 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   // Rejoindre/quitter une room de channel
   socket.on('CHANNEL_JOIN', async (data) => {
-    socket.join(`channel:${data.channelId}`);
-    logger.info(`${userId} rejoint channel:${data.channelId}`);
+    try {
+      const { channelId, serverId } = data;
+      if (!channelId || !serverId) return;
+
+      // Vérifier que l'utilisateur est membre du serveur
+      const isMember = await serviceProxy.servers.isMember(serverId, userId);
+      if (!isMember) {
+        socket.emit('error', { message: 'Accès refusé — vous n\'êtes pas membre de ce serveur' });
+        return;
+      }
+
+      socket.join(`channel:${channelId}`);
+      logger.info(`${userId} rejoint channel:${channelId}`);
+    } catch (err) {
+      logger.warn({ err }, 'CHANNEL_JOIN permission check error');
+    }
   });
 
   socket.on('CHANNEL_LEAVE', async (data) => {
@@ -2603,9 +2813,21 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   // ── Voice Chat System ──
-  socket.on('VOICE_JOIN', (data) => {
+  socket.on('VOICE_JOIN', async (data) => {
     const { serverId, channelId } = data;
     if (!serverId || !channelId) return;
+
+    // Vérifier que l'utilisateur est membre du serveur
+    try {
+      const isMember = await serviceProxy.servers.isMember(serverId, userId);
+      if (!isMember) {
+        socket.emit('error', { message: 'Accès refusé — vous n\'êtes pas membre de ce serveur' });
+        return;
+      }
+    } catch (err) {
+      logger.warn({ err }, 'VOICE_JOIN permission check error');
+      return;
+    }
 
     // Leave any existing voice channel first
     const existingChannel = userVoiceChannel.get(userId);
@@ -2779,13 +3001,10 @@ const serverNodesNs = io.of('/server-nodes');
 
 serverNodesNs.use(async (socket, next) => {
   try {
-    const { nodeToken, serverId, register } = socket.handshake.auth;
+    const { nodeToken, serverId } = socket.handshake.auth;
 
-    // Mode enregistrement automatique : pas de credentials requis
-    if (register === true) {
-      (socket as any).registerMode = true;
-      return next();
-    }
+    // Le mode register sans auth est supprimé — les nodes doivent s'enregistrer
+    // via une route HTTP authentifiée et obtenir un nodeToken avant de se connecter
 
     if (!nodeToken || !serverId) {
       return next(new Error('nodeToken et serverId requis'));
@@ -2845,11 +3064,13 @@ serverNodesNs.on('connection', async (nodeSocket) => {
   // la console du server-node. Ce code permet à l'hôte de réclamer les
   // droits admin depuis le frontend. Il expire en 15 min et est invalidé
   // dès qu'il est utilisé.
+  // 14 caractères (alphabet 32) = ~70 bits d'entropie — hors de portée du brute-force
+  // même en contournant la limite par IP (AUTH_BRUTEFORCE_REGEX).
   const setupCode = (() => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    const bytes = randomBytes(8);
+    const bytes = randomBytes(14);
     let code = '';
-    for (let i = 0; i < 8; i++) code += chars[bytes[i] % chars.length];
+    for (let i = 0; i < 14; i++) code += chars[bytes[i] % chars.length];
     return code;
   })();
   await redis.set(`setup_code:${serverId}`, setupCode, 900); // 15 min
@@ -2865,8 +3086,15 @@ serverNodesNs.on('connection', async (nodeSocket) => {
 
   // Le node broadcast un message après l'avoir stocké dans SQLite
   // NODE_BROADCAST est le canal unifié pour tous les broadcasts du node
+  // SÉCURITÉ : Valider que les broadcasts ne ciblent que le serveur de ce node
   nodeSocket.on('NODE_BROADCAST', (data: { event: string; data: any }) => {
     const { event, data: payload } = data;
+
+    // Vérifier que le channelId/serverId du payload appartient au node connecté
+    if (payload?.serverId && payload.serverId !== serverId) {
+      logger.warn(`NODE_BROADCAST rejeté: node ${serverId} tente de broadcast vers serveur ${payload.serverId}`);
+      return;
+    }
 
     switch (event) {
       // ── Messages ──
