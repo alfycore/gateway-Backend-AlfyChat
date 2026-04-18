@@ -74,6 +74,7 @@ const corsOptions = {
   credentials: true,
 };
 
+app.options('*', cors(corsOptions)); // préflight explicite — doit être avant tout autre middleware
 app.use(cors(corsOptions));
 // Helmet + CSP stricte en prod. Les uploads (media) restent accessibles cross-origin.
 app.use(helmet({
