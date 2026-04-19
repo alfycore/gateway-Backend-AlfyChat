@@ -6,6 +6,7 @@ import { PORT } from '../config/env';
 import { logger } from '../utils/logger';
 import { monitoringDB } from '../utils/monitoring-db';
 import { serviceRegistry } from '../utils/service-registry';
+import { handleStatusTransition } from './kener-client';
 
 export const MONITORED_SERVICES: { name: string; url: string }[] = [
   { name: 'website',  url: `${process.env.FRONTEND_URL         || 'https://alfychat.app'}` },
@@ -71,6 +72,7 @@ export async function runMonitoringCycle(
           } else {
             logger.warn(`[Monitoring] ${statusIcon(status)} ${svc.name} DÉGRADÉ (HTTP ${resp!.status}) — ${ms}ms`);
           }
+          handleStatusTransition(svc.name, prev, status, `HTTP ${resp!.status} en ${ms}ms`);
         }
         prevStates[svc.name] = status;
 
@@ -82,6 +84,7 @@ export async function runMonitoringCycle(
         const prev = prevStates[svc.name];
         if (prev !== 'down') {
           logger.error(`[Monitoring] ✗ ${svc.name} HORS LIGNE — ${reason}`);
+          handleStatusTransition(svc.name, prev, 'down', reason);
         }
         prevStates[svc.name] = 'down';
 

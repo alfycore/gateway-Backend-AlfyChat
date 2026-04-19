@@ -240,6 +240,32 @@ export class RedisClient {
     await this.publisher.quit();
   }
 
+  // ============ ANOMALY DETECTION ============
+
+  /**
+   * Incrémente un compteur avec sliding window (INCR + EXPIRE one-time).
+   * Retourne le nouveau total dans la fenêtre.
+   */
+  async anomalyIncrReq(key: string, windowSecs: number): Promise<number> {
+    const count = await this.client.incr(key);
+    if (count === 1) await this.client.expire(key, windowSecs);
+    return count;
+  }
+
+  /**
+   * Enregistre un endpoint unique dans un SET Redis et retourne le nombre d'endpoints distincts.
+   * Le SET expire après windowSecs (positionné à la première insertion).
+   */
+  async anomalyAddEndpoint(key: string, endpoint: string, windowSecs: number): Promise<number> {
+    const added = await this.client.sadd(key, endpoint);
+    if (added === 1) {
+      // Refresh TTL only on first insertion of each member (cheap: 1 EXPIRE instead of every call)
+      const ttl = await this.client.ttl(key);
+      if (ttl === -1) await this.client.expire(key, windowSecs);
+    }
+    return this.client.scard(key);
+  }
+
   /** Expose le client ioredis brut (nécessaire pour rate-limiter-flexible et redis-adapter). */
   getRawClient(): Redis {
     return this.client;

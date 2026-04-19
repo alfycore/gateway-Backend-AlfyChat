@@ -43,6 +43,7 @@ import {
 } from './state/service-keys';
 import { requireAdmin } from './monitoring/admin-guard';
 import { runMonitoringCycle, MONITORING_INTERVAL_MS } from './monitoring/cycle';
+import { anomalyMiddleware, attachAnomalyWsHooks } from './monitoring/anomaly';
 import { connectedClients, connectedNodes, voiceChannels, userVoiceChannel } from './state/connections';
 import type { VoiceParticipant } from './state/connections';
 import { isDmBlocked, invalidateBlockCache } from './state/block-cache';
@@ -195,6 +196,9 @@ app.use((req, res, next) => {
   express.json({ limit: '2mb' })(req, res, next);
 });
 
+// Détection d'anomalies : enregistre les stats de chaque requête après la réponse
+app.use(anomalyMiddleware);
+
 // ============ ROUTES API REST (PROXY) ============
 
 // ⚠️  Rate limit brute-force dédié sur les endpoints sensibles d'authentification.
@@ -331,7 +335,10 @@ io.use(async (socket: AuthenticatedSocket, next) => {
     socket.userId = decoded.userId;
     socket.sessionId = uuidv4();
     socket.user = user;
-    
+
+    // Détection d'anomalies WS — suit les événements non-triviaux après auth
+    attachAnomalyWsHooks(socket, decoded.userId);
+
     next();
   } catch (error) {
     logger.error({ err: error }, 'Erreur d\'authentification WebSocket:');
