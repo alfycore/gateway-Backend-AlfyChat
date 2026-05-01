@@ -251,6 +251,50 @@ registerFriendsRoutes(app);
 // Routes Calls
 app.all('/api/calls/*', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL, 'calls'));
 app.all('/api/calls', (req, res) => proxyRequest(getServiceUrl('calls', CALLS_URL), req, res, CALLS_URL, 'calls'));
+// ── Hook claim-admin : après succès, sync le server-node sans restart ──────────
+// Doit être déclaré AVANT registerServersRoutes pour prendre la priorité Express.
+app.post('/api/servers/:serverId/claim-admin', async (req: express.Request, res: express.Response) => {
+  const { serverId } = req.params;
+  const userId = extractUserIdFromJWT(req.headers.authorization);
+  try {
+    const serversBase = getServiceUrl('servers', SERVERS_URL);
+    const response = await fetch(`${serversBase}/servers/${serverId}/claim-admin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(req.headers.authorization && { authorization: req.headers.authorization }),
+        ...(userId && { 'X-User-Id': userId }),
+      },
+      body: JSON.stringify({ ...req.body, userId, ownerId: userId }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const data = await safeJson(response) ?? { error: 'Réponse vide' };
+    if (!response.ok) return res.status(response.status).json(data);
+
+    // Sync le server-node sans bloquer la réponse
+    if (userId && connectedNodes.has(serverId)) {
+      (async () => {
+        try {
+          // 1. Mettre à jour ownerId dans serverSelf du node
+          await forwardToNode(serverId, 'SERVER_UPDATE', { ownerId: userId }, 5_000);
+          // 2. Broadcaster SERVER_UPDATE à tous les clients du serveur
+          runtime.io.to(`server:${serverId}`).emit('SERVER_UPDATE', {
+            type: 'SERVER_UPDATE',
+            payload: { id: serverId, ownerId: userId },
+            timestamp: new Date(),
+          });
+        } catch {
+          // Node hors-ligne ou timeout → sera pris en compte au prochain démarrage du node
+        }
+      })();
+    }
+
+    res.json(data);
+  } catch (err: any) {
+    logger.error({ err }, 'Erreur claim-admin gateway hook:');
+    res.status(502).json({ error: 'Service indisponible' });
+  }
+});
 registerServersRoutes(app);
 // Routes Bots
 app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL, 'bots'));
@@ -3272,8 +3316,21 @@ serverNodesNs.on('connection', async (nodeSocket) => {
         });
         break;
 
-      default:
-        logger.warn(`NODE_BROADCAST événement inconnu: ${event}`);
+      // ── Catch-all : tous les événements non mappés explicitement sont
+      // relayés tel-quel vers la room server:{serverId}. Cela permet aux
+      // handlers du node (forum, stage, bot, automod…) d'envoyer des événements
+      // sans avoir à modifier ce switch à chaque ajout.
+      default: {
+        const room = payload?.channelId
+          ? `channel:${payload.channelId}`
+          : `server:${serverId}`;
+        io.to(room).emit(event, {
+          type: event,
+          payload: payload?.serverId ? payload : { ...payload, serverId },
+          timestamp: new Date(),
+        });
+        break;
+      }
     }
   });
 
