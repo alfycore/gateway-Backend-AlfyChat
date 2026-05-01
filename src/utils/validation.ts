@@ -212,10 +212,8 @@ export function validateServerInput(data: any): { name?: string; description?: s
   const out: any = {};
   if (data.name !== undefined) out.name = validateText(data.name, { field: 'name', ...LIMITS.serverName, required: true });
   if (data.description !== undefined) out.description = validateText(data.description, { field: 'description', ...LIMITS.serverDescription });
-  const icon = validateUrl(data.iconUrl, 'iconUrl');
-  if (icon !== undefined) out.iconUrl = icon;
-  const banner = validateUrl(data.bannerUrl, 'bannerUrl');
-  if (banner !== undefined) out.bannerUrl = banner;
+  try { const icon = validateUrl(data.iconUrl, 'iconUrl'); if (icon !== undefined) out.iconUrl = icon; } catch {}
+  try { const banner = validateUrl(data.bannerUrl, 'bannerUrl'); if (banner !== undefined) out.bannerUrl = banner; } catch {}
   const pub = validateBool(data.isPublic, 'isPublic');
   if (pub !== undefined) out.isPublic = pub;
   return out;
@@ -226,7 +224,7 @@ export function validateChannelInput(data: any): { name?: string; topic?: string
   if (data.name !== undefined) out.name = validateText(data.name, { field: 'name', ...LIMITS.channelName, required: true });
   if (data.topic !== undefined) out.topic = validateText(data.topic, { field: 'topic', ...LIMITS.channelTopic });
   if (data.type !== undefined) {
-    if (!['text', 'voice', 'forum', 'announcement'].includes(data.type)) throw new ValidationError('type', 'invalid channel type');
+    if (!['text', 'voice', 'forum', 'announcement', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media'].includes(data.type)) throw new ValidationError('type', 'invalid channel type');
     out.type = data.type;
   }
   if (data.parentId !== undefined && typeof data.parentId === 'string') out.parentId = data.parentId;
