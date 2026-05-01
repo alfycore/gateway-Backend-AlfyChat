@@ -485,6 +485,13 @@ class CallsProxy {
   constructor(private _fallbackUrl: string) {}
   private get baseUrl(): string { return resolveServiceUrl('calls', this._fallbackUrl); }
 
+  private internalHeaders(userId?: string): Record<string, string> {
+    return {
+      'x-internal-secret': INTERNAL_SECRET,
+      ...(userId ? { 'x-user-id': userId } : {}),
+    };
+  }
+
   async initiateCall(data: { type: string; initiatorId: string; conversationId?: string; channelId?: string; recipientId?: string }) {
     // Le calls service requiert participantIds — construire à partir de initiatorId + recipientId
     const participantIds = [data.initiatorId];
@@ -493,6 +500,7 @@ class CallsProxy {
     }
     return fetchService(`${this.baseUrl}/calls`, {
       method: 'POST',
+      headers: this.internalHeaders(data.initiatorId),
       body: JSON.stringify({
         type: data.type,
         initiatorId: data.initiatorId,
@@ -506,6 +514,7 @@ class CallsProxy {
   async joinCall(callId: string, userId: string) {
     return fetchService(`${this.baseUrl}/calls/${callId}/join`, {
       method: 'POST',
+      headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
     });
   }
@@ -514,6 +523,7 @@ class CallsProxy {
     try {
       return await fetchService<{ id: string; participants: string[]; status: string }>(`${this.baseUrl}/calls/${callId}`, {
         method: 'GET',
+        headers: this.internalHeaders(),
       });
     } catch {
       return null;
@@ -523,6 +533,7 @@ class CallsProxy {
   async rejectCall(callId: string, userId: string) {
     return fetchService(`${this.baseUrl}/calls/${callId}/reject`, {
       method: 'POST',
+      headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
     });
   }
@@ -530,6 +541,7 @@ class CallsProxy {
   async endCall(callId: string, userId: string) {
     return fetchService(`${this.baseUrl}/calls/${callId}/end`, {
       method: 'POST',
+      headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
     });
   }
@@ -537,6 +549,7 @@ class CallsProxy {
   async leaveCall(callId: string, userId: string) {
     return fetchService(`${this.baseUrl}/calls/${callId}/leave`, {
       method: 'POST',
+      headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
     });
   }
@@ -546,19 +559,22 @@ class CallsProxy {
   async createGroupRoom(data: { channelId: string; participantId: string; participantName: string; type: string }) {
     return fetchService<{ callId: string; roomName: string; token: string; wsUrl: string }>(
       `${this.baseUrl}/calls/group/room`,
-      { method: 'POST', body: JSON.stringify(data) },
+      { method: 'POST', headers: this.internalHeaders(data.participantId), body: JSON.stringify(data) },
     );
   }
 
   async getGroupCallToken(data: { callId: string; participantId: string; participantName: string }) {
     return fetchService<{ token: string; roomName: string; wsUrl: string }>(
       `${this.baseUrl}/calls/group/token`,
-      { method: 'POST', body: JSON.stringify(data) },
+      { method: 'POST', headers: this.internalHeaders(data.participantId), body: JSON.stringify(data) },
     );
   }
 
   async endGroupCall(callId: string) {
-    return fetchService(`${this.baseUrl}/calls/group/${callId}/end`, { method: 'POST' });
+    return fetchService(`${this.baseUrl}/calls/group/${callId}/end`, {
+      method: 'POST',
+      headers: this.internalHeaders(),
+    });
   }
 }
 
@@ -618,6 +634,7 @@ class ServersProxy {
   async updateServer(serverId: string, updates: any, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}`, {
       method: 'PATCH',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ ...updates, userId }),
     });
   }
@@ -625,6 +642,7 @@ class ServersProxy {
   async deleteServer(serverId: string, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}`, {
       method: 'DELETE',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ userId }),
     });
   }
@@ -632,6 +650,7 @@ class ServersProxy {
   async createChannel(serverId: string, data: { name: string; type: string; parentId?: string }, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels`, {
       method: 'POST',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ ...data, userId }),
     });
   }
@@ -639,6 +658,7 @@ class ServersProxy {
   async updateChannel(serverId: string, channelId: string, updates: any, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
       method: 'PATCH',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ ...updates, userId }),
     });
   }
@@ -646,6 +666,7 @@ class ServersProxy {
   async deleteChannel(serverId: string, channelId: string, userId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
       method: 'DELETE',
+      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
       body: JSON.stringify({ userId }),
     });
   }
@@ -713,9 +734,10 @@ class ServersProxy {
     return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/members`);
   }
 
-  async updateMember(serverId: string, memberUserId: string, data: { roleIds?: string[]; nickname?: string }) {
+  async updateMember(serverId: string, memberUserId: string, data: { roleIds?: string[]; nickname?: string }, actorId?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}`, {
       method: 'PATCH',
+      headers: actorId ? { 'x-user-id': actorId, 'x-internal-secret': INTERNAL_SECRET } : undefined,
       body: JSON.stringify(data),
     });
   }
@@ -729,23 +751,26 @@ class ServersProxy {
     return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/roles`);
   }
 
-  async createRole(serverId: string, data: { name: string; color?: string; permissions?: any }) {
+  async createRole(serverId: string, data: { name: string; color?: string; permissions?: any }, userId?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/roles`, {
       method: 'POST',
+      headers: userId ? { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET } : undefined,
       body: JSON.stringify(data),
     });
   }
 
-  async updateRole(serverId: string, roleId: string, data: any) {
+  async updateRole(serverId: string, roleId: string, data: any, userId?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
       method: 'PATCH',
+      headers: userId ? { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET } : undefined,
       body: JSON.stringify(data),
     });
   }
 
-  async deleteRole(serverId: string, roleId: string) {
+  async deleteRole(serverId: string, roleId: string, userId?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
       method: 'DELETE',
+      headers: userId ? { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET } : undefined,
     });
   }
 

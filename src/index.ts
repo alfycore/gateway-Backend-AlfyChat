@@ -2062,7 +2062,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Fallback microservice
       const role = await serviceProxy.servers.createRole(data.serverId, {
         name: clean.name!, color: clean.color, permissions: safePerms,
-      }) as Record<string, unknown>;
+      }, userId) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_CREATE', {
         type: 'ROLE_CREATE',
         payload: { ...role, serverId: data.serverId },
@@ -2107,7 +2107,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const updated = await serviceProxy.servers.updateRole(data.serverId, data.roleId, {
         name: clean.name, color: clean.color, permissions: safePerms,
         position: safePosition, mentionable: clean.mentionable,
-      }) as Record<string, unknown>;
+      }, userId) as Record<string, unknown>;
       io.to(`server:${data.serverId}`).emit('ROLE_UPDATE', {
         type: 'ROLE_UPDATE',
         payload: { ...updated, roleId: data.roleId, serverId: data.serverId },
@@ -2134,7 +2134,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         if (e.message !== 'NO_NODE') { emitError(socket, 'ROLE_ERROR', e); return; }
       }
       // Fallback microservice
-      await serviceProxy.servers.deleteRole(data.serverId, data.roleId);
+      await serviceProxy.servers.deleteRole(data.serverId, data.roleId, userId);
       io.to(`server:${data.serverId}`).emit('ROLE_DELETE', {
         type: 'ROLE_DELETE',
         payload: { roleId: data.roleId, serverId: data.serverId },
@@ -2356,7 +2356,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           return;
         }
         // Fallback: update MySQL directly
-        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds: safeRoleIds, nickname });
+        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds: safeRoleIds, nickname }, userId);
         // Broadcast to all server members
         io.to(`server:${serverId}`).emit('MEMBER_UPDATE', {
           type: 'MEMBER_UPDATE',
