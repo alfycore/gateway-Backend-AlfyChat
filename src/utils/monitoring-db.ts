@@ -195,6 +195,34 @@ class MonitoringDB {
           INDEX idx_created_at (created_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
       `);
+
+      // ── Table des instances de gateway (multi-gateway) ─────────────────────
+      await conn.execute(`
+        CREATE TABLE IF NOT EXISTS lb_gateways (
+          id           VARCHAR(64)  NOT NULL PRIMARY KEY,
+          name         VARCHAR(128) NOT NULL,
+          url          VARCHAR(512) NOT NULL,
+          enabled      TINYINT(1)   NOT NULL DEFAULT 1,
+          created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+
+      // Migration m004 : ajouter gateway_id sur service_instances
+      const [m004] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM gateway_migrations WHERE id = 'm004-gateway-id'`
+      );
+      if (!(m004 as any[]).length) {
+        const [cols] = await conn.execute<mysql.RowDataPacket[]>(
+          `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'service_instances' AND COLUMN_NAME = 'gateway_id'`
+        );
+        if (!(cols as any[]).length) {
+          await conn.execute(`ALTER TABLE service_instances ADD COLUMN gateway_id VARCHAR(64) NULL`);
+        }
+        await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m004-gateway-id')`);
+        logger.info('MonitoringDB: migration m004 — colonne gateway_id ajoutée');
+      }
+
     } finally {
       conn.release();
     }
@@ -671,8 +699,74 @@ class MonitoringDB {
     }
   }
 
-  isReady(): boolean {
-    return this.ready;
+  isReady(): boolean { return this.ready; }
+
+  // ── Gateway registry ────────────────────────────────────────────────────────
+
+  async loadGateways(): Promise<{ id: string; name: string; url: string; enabled: boolean }[]> {
+    if (!this.ready || !this.pool) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      const [rows] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id, name, url, enabled FROM lb_gateways ORDER BY created_at ASC`,
+      );
+      return (rows as any[]).map(r => ({
+        id: r.id, name: r.name, url: r.url, enabled: !!r.enabled,
+      }));
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur loadGateways');
+      return [];
+    } finally {
+      conn.release();
+    }
+  }
+
+  async upsertGateway(data: { id: string; name: string; url: string; enabled?: boolean }): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(
+        `INSERT INTO lb_gateways (id, name, url, enabled)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), url = VALUES(url), enabled = VALUES(enabled), updated_at = NOW()`,
+        [data.id, data.name, data.url, data.enabled !== false ? 1 : 0],
+      );
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur upsertGateway');
+    } finally {
+      conn.release();
+    }
+  }
+
+  async deleteGateway(id: string): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.execute(`DELETE FROM lb_gateways WHERE id = ?`, [id]);
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur deleteGateway');
+    } finally {
+      conn.release();
+    }
+  }
+
+  async patchGateway(id: string, data: { name?: string; url?: string; enabled?: boolean }): Promise<void> {
+    if (!this.ready || !this.pool) return;
+    const conn = await this.pool.getConnection();
+    try {
+      const sets: string[] = [];
+      const vals: any[] = [];
+      if (data.name !== undefined)    { sets.push('name = ?');    vals.push(data.name); }
+      if (data.url  !== undefined)    { sets.push('url = ?');     vals.push(data.url); }
+      if (data.enabled !== undefined) { sets.push('enabled = ?'); vals.push(data.enabled ? 1 : 0); }
+      if (!sets.length) return;
+      vals.push(id);
+      await conn.execute(`UPDATE lb_gateways SET ${sets.join(', ')}, updated_at = NOW() WHERE id = ?`, vals);
+    } catch (err) {
+      logger.error({ err }, 'MonitoringDB: erreur patchGateway');
+    } finally {
+      conn.release();
+    }
   }
 }
 

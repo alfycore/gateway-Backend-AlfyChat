@@ -6,12 +6,16 @@ import { requireAdmin } from '../monitoring/admin-guard';
 import { monitoringDB } from '../utils/monitoring-db';
 import type { ServiceUptimeDay } from '../utils/monitoring-db';
 import { serviceRegistry, type ServiceType } from '../utils/service-registry';
+import { lbRegistry, generateServiceKey } from '../lb/registry';
+import { gatewayRegistry } from '../lb/gateway-registry';
 import { logger } from '../utils/logger';
 import { connectedClients } from '../state/connections';
-import { serviceKeyHashes, bannedServiceIds, allowedServiceIds, generateServiceKey } from '../state/service-keys';
+import { serviceKeyHashes, bannedServiceIds, allowedServiceIds } from '../state/service-keys';
 import {
   USERS_URL, RATE_LIMIT_WINDOW, RATE_LIMIT_ANON, RATE_LIMIT_USER, RATE_LIMIT_ADMIN, IP_ENDPOINT_RE,
 } from '../config/env';
+
+const GATEWAY_ID = process.env.GATEWAY_ID || 'gateway-default';
 
 export function registerAdminRoutes(app: Express): void {
   // ============ ADMIN : GESTION IP BANS (gateway direct) ============
@@ -423,6 +427,235 @@ export function registerAdminRoutes(app: Express): void {
     monitoringDB.storeServiceKeyHash(decodedId, rawKey).catch(() => {});
     logger.info(`Admin: clé régénérée pour le service "${decodedId}"`);
     res.json({ success: true, serviceKey: rawKey });
+  });
+
+  // ============ INTERNAL : RAPPORT D'ERREUR MICROSERVICE ============
+
+  /**
+   * POST /api/internal/service-error
+   * Appelé par un microservice quand il détecte une erreur critique.
+   * Protégé par X-Internal-Secret.
+   * Crée un incident dans la DB et envoie un email aux admins.
+   */
+  app.post('/api/internal/service-error', async (req, res) => {
+    const { sendMail } = await import('../utils/mailer');
+    const { ADMIN_ALERT_EMAILS, INTERNAL_SECRET: SECRET } = await import('../config/env');
+    const internalSecret = req.headers['x-internal-secret'] as string | undefined;
+    if (!internalSecret || internalSecret !== SECRET) {
+      return res.status(401).json({ error: 'Non autorisé' });
+    }
+    const { serviceId, errorType, message, stack, severity } = req.body as {
+      serviceId?: string;
+      errorType?: string;
+      message?: string;
+      stack?: string;
+      severity?: 'info' | 'warning' | 'critical';
+    };
+    if (!serviceId || !message) {
+      return res.status(400).json({ error: 'serviceId et message requis' });
+    }
+    const sev = severity ?? 'warning';
+    const title = `[${serviceId}] ${errorType ?? 'Erreur'}`;
+
+    try {
+      await monitoringDB.createIncident({
+        title,
+        message: `${message}${stack ? `\n\nStack:\n${stack}` : ''}`,
+        severity: sev,
+        services: [serviceId],
+        status: 'investigating',
+        createdBy: 'system',
+      });
+    } catch (dbErr) {
+      logger.error({ err: dbErr }, 'service-error: erreur insertion DB');
+    }
+
+    const mailBody = [
+      `Le service "${serviceId}" a signalé une erreur ${sev.toUpperCase()}.`,
+      ``,
+      `  Type    : ${errorType ?? 'Inconnu'}`,
+      `  Message : ${message}`,
+      stack ? `\nStack:\n${stack}` : '',
+      ``,
+      `  Heure   : ${new Date().toISOString()}`,
+      ``,
+      `Un incident a été créé automatiquement dans le dashboard admin.`,
+      ``,
+      `— AlfyChat Gateway`,
+    ].join('\n');
+
+    sendMail({
+      to: ADMIN_ALERT_EMAILS,
+      subject: `[AlfyChat] ⚠️ Erreur service : ${serviceId}`,
+      text: mailBody,
+    }).catch(() => {});
+
+    logger.error({ serviceId, errorType, message }, '[service-error] incident créé');
+    res.json({ success: true });
+  });
+
+  // ============ ADMIN : GESTION DES GATEWAYS (multi-gateway) ============
+
+  /** GET /api/admin/lb/gateways — liste toutes les instances de gateway */
+  app.get('/api/admin/lb/gateways', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const mem = gatewayRegistry.getAll();
+    const online120s = 120_000;
+    const gateways = mem.map(g => ({
+      ...g,
+      online: gatewayRegistry.isOnline(g.id, online120s),
+      isSelf: g.id === GATEWAY_ID,
+    }));
+    res.json({ gateways });
+  });
+
+  /** POST /api/admin/lb/gateways — ajoute une instance de gateway */
+  app.post('/api/admin/lb/gateways', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const { id, name, url } = req.body ?? {};
+    if (!id || !name || !url) {
+      return res.status(400).json({ error: 'id, name, url requis' });
+    }
+    if (!/^https?:\/\/.+/.test(url)) {
+      return res.status(400).json({ error: 'url doit être un endpoint HTTP(S) valide' });
+    }
+    const entry = gatewayRegistry.register({ id, name, url, enabled: true });
+    monitoringDB.upsertGateway({ id, name, url, enabled: true }).catch(() => {});
+    logger.info(`Admin: gateway "${id}" ajouté`);
+    res.status(201).json({ success: true, gateway: entry });
+  });
+
+  /** PATCH /api/admin/lb/gateways/:id — met à jour un gateway */
+  app.patch('/api/admin/lb/gateways/:id', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const gid = decodeURIComponent(req.params.id);
+    const { name, url, enabled } = req.body ?? {};
+    if (name !== undefined || url !== undefined) gatewayRegistry.update(gid, { name, url });
+    if (enabled !== undefined) gatewayRegistry.setEnabled(gid, !!enabled);
+    monitoringDB.patchGateway(gid, { name, url, enabled }).catch(() => {});
+    logger.info(`Admin: gateway "${gid}" mis à jour`);
+    res.json({ success: true });
+  });
+
+  /** DELETE /api/admin/lb/gateways/:id — supprime un gateway */
+  app.delete('/api/admin/lb/gateways/:id', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const gid = decodeURIComponent(req.params.id);
+    if (gid === GATEWAY_ID) {
+      return res.status(400).json({ error: 'Impossible de supprimer le gateway courant' });
+    }
+    const ok = gatewayRegistry.remove(gid);
+    if (!ok) return res.status(404).json({ error: 'Gateway introuvable' });
+    monitoringDB.deleteGateway(gid).catch(() => {});
+    res.json({ success: true });
+  });
+
+  // ============ ADMIN : GESTION DES SERVICES LB (nouveau système) ============
+
+  /** GET /api/admin/lb/services — liste tous les services */
+  app.get('/api/admin/lb/services', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const instances = lbRegistry.getAll().map(e => ({
+      ...e,
+      score: lbRegistry.computeScore(e),
+    }));
+    res.json({ instances });
+  });
+
+  /**
+   * POST /api/admin/lb/services
+   * Crée un slot de service pré-enregistré et génère une clé.
+   * Body: { id, serviceType, location }
+   * Retour: { serviceKey } — à mettre dans SERVICE_KEY du microservice
+   */
+  app.post('/api/admin/lb/services', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const { id, serviceType, location } = req.body ?? {};
+    const VALID_TYPES: ServiceType[] = ['users','messages','friends','calls','servers','bots','media'];
+    if (!id || !VALID_TYPES.includes(serviceType) || !location) {
+      return res.status(400).json({ error: 'id, serviceType, location requis' });
+    }
+    if (lbRegistry.getById(String(id))) {
+      return res.status(409).json({ error: `Un service avec l'id "${id}" existe déjà` });
+    }
+    const { rawKey, hash } = generateServiceKey();
+    lbRegistry.preRegister({
+      id: String(id),
+      serviceType: serviceType as ServiceType,
+      location: String(location).toUpperCase(),
+      enabled: true,
+      keyHash: hash,
+    });
+    monitoringDB.upsertServiceInstance({
+      id: String(id),
+      serviceType: String(serviceType),
+      endpoint: '',
+      domain: '',
+      location: String(location).toUpperCase(),
+    }).catch(() => {});
+    monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
+    allowedServiceIds.add(String(id));
+    bannedServiceIds.delete(String(id));
+    logger.info(`Admin: service LB "${id}" créé — clé générée`);
+    res.status(201).json({
+      success: true,
+      serviceKey: rawKey,
+      hint: `Ajoutez SERVICE_KEY=${rawKey} dans le .env du microservice "${id}"`,
+    });
+  });
+
+  /**
+   * POST /api/admin/lb/services/:id/rotate-key
+   * Régénère la clé d'un service existant.
+   */
+  app.post('/api/admin/lb/services/:id/rotate-key', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const sid = decodeURIComponent(req.params.id);
+    if (!lbRegistry.getById(sid)) return res.status(404).json({ error: 'Service introuvable' });
+    const { rawKey, hash } = generateServiceKey();
+    lbRegistry.addKeyHash(sid, hash);
+    monitoringDB.storeServiceKeyHash(sid, rawKey).catch(() => {});
+    logger.info(`Admin: clé rotée pour service "${sid}"`);
+    res.json({ success: true, serviceKey: rawKey });
+  });
+
+  /** DELETE /api/admin/lb/services/:id */
+  app.delete('/api/admin/lb/services/:id', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const sid = decodeURIComponent(req.params.id);
+    const ok = lbRegistry.remove(sid);
+    if (!ok) return res.status(404).json({ error: 'Service introuvable' });
+    bannedServiceIds.add(sid);
+    allowedServiceIds.delete(sid);
+    monitoringDB.removeServiceInstance(sid).catch(() => {});
+    logger.info(`Admin: service LB "${sid}" supprimé`);
+    res.json({ success: true });
+  });
+
+  /** PATCH /api/admin/lb/services/:id — enable/disable + mise à jour endpoint */
+  app.patch('/api/admin/lb/services/:id', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const sid = decodeURIComponent(req.params.id);
+    const { enabled, endpoint } = req.body ?? {};
+    if (typeof enabled === 'boolean') {
+      lbRegistry.setEnabled(sid, enabled);
+      monitoringDB.setInstanceEnabled(sid, enabled).catch(() => {});
+      if (enabled) bannedServiceIds.delete(sid); else bannedServiceIds.add(sid);
+    }
+    if (endpoint && typeof endpoint === 'string') {
+      lbRegistry.updateEndpoint(sid, endpoint);
+      monitoringDB.updateServiceEndpoint(sid, endpoint).catch(() => {});
+    }
+    res.json({ success: true });
+  });
+
+  /** POST /api/admin/lb/services/:id/restore — restaure un service dégradé */
+  app.post('/api/admin/lb/services/:id/restore', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const sid = decodeURIComponent(req.params.id);
+    const ok = lbRegistry.restoreInstance(sid);
+    if (!ok) return res.status(404).json({ error: 'Service introuvable' });
+    res.json({ success: true });
   });
 
   // Proxy helpdesk → users service (must be before /api/admin catch-all)

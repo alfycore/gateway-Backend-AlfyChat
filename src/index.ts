@@ -51,7 +51,9 @@ import { messageRateLimit, MSG_RATE_WINDOW, MSG_RATE_MAX, serverJoinRateLimit, c
 import { runtime } from './state/runtime';
 import { forwardToNode, getNodeSocket } from './services/forward';
 import { registerInternalRoutes } from './http/internal.routes';
+import { registerLBRoutes } from './http/lb.routes';
 import { registerAdminRoutes } from './http/admin.routes';
+import { gatewayRegistry } from './lb/gateway-registry';
 import { registerFriendsRoutes } from './http/friends.routes';
 import { registerServersRoutes } from './http/servers.routes';
 import { registerMediaRoutes } from './http/media.routes';
@@ -231,6 +233,7 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 
 // ============ ROUTE MODULES ============
 registerInternalRoutes(app);
+registerLBRoutes(app);
 
 registerAdminRoutes(app);
 
@@ -3393,6 +3396,18 @@ httpServer.listen(PORT, async () => {
   // Init monitoring DB and start collection loop
   await monitoringDB.init();
   await loadInstancesFromDB();
+
+  // Enregistrer ce gateway dans le registry (multi-gateway)
+  const GATEWAY_ID   = process.env.GATEWAY_ID   || 'gateway-default';
+  const GATEWAY_NAME = process.env.GATEWAY_NAME  || 'Gateway Principal';
+  const GATEWAY_URL  = process.env.GATEWAY_PUBLIC_URL || `http://localhost:${PORT}`;
+  gatewayRegistry.register({ id: GATEWAY_ID, name: GATEWAY_NAME, url: GATEWAY_URL, isSelf: true });
+  monitoringDB.upsertGateway({ id: GATEWAY_ID, name: GATEWAY_NAME, url: GATEWAY_URL, enabled: true }).catch(() => {});
+  // Charger les autres gateways depuis la DB
+  const storedGateways = await monitoringDB.loadGateways();
+  for (const gw of storedGateways) {
+    if (gw.id !== GATEWAY_ID) gatewayRegistry.register({ ...gw });
+  }
 
   // ── Hot-reload guard : clear previous intervals created by bun --hot ──
   const g = globalThis as any;
