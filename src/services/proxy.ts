@@ -771,7 +771,6 @@ class ServersProxy {
     return fetchService(`${this.baseUrl}/servers/nodes/register`, {
       method: 'POST',
       body: JSON.stringify({ name }),
-      headers: { 'x-internal-secret': INTERNAL_SECRET },
     });
   }
 }
