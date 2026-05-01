@@ -3029,11 +3029,15 @@ const serverNodesNs = io.of('/server-nodes');
 
 serverNodesNs.use(async (socket, next) => {
   try {
-    const { nodeToken, serverId } = socket.handshake.auth;
+    const { nodeToken, serverId, register } = socket.handshake.auth;
 
-    // Le mode register sans auth est supprimé — les nodes doivent s'enregistrer
-    // via une route HTTP authentifiée et obtenir un nodeToken avant de se connecter
+    // Mode enregistrement : permet un nouveau node de s'enregistrer sans credentials
+    if (register === true) {
+      (socket as any).registerMode = true;
+      return next();
+    }
 
+    // Mode connexion normal : valide le token
     if (!nodeToken || !serverId) {
       return next(new Error('nodeToken et serverId requis'));
     }
