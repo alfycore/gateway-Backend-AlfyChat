@@ -2583,8 +2583,17 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const { channelId, serverId } = data;
       if (!channelId || !serverId) return;
 
-      // Vérifier que l'utilisateur est membre du serveur
-      const isMember = await serviceProxy.servers.isMember(serverId, userId);
+      // Pour les serveurs avec node connecté, la membership est gérée localement par le node.
+      // On forward la vérification au node ; sinon on interroge le microservice.
+      let isMember = false;
+      const nodeSocket = getNodeSocket(serverId);
+      if (nodeSocket) {
+        const result = await forwardToNode(serverId, 'MEMBER_CHECK', { userId }) as any;
+        isMember = result?.isMember === true;
+      } else {
+        isMember = await serviceProxy.servers.isMember(serverId, userId);
+      }
+
       if (!isMember) {
         socket.emit('error', { message: 'Accès refusé — vous n\'êtes pas membre de ce serveur' });
         return;
