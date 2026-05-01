@@ -191,6 +191,14 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
   return fetchWithFailover<T>(url, null, options);
 }
 
+// Résout dynamiquement l'endpoint d'un service depuis le registry (en priorité sur l'env var).
+// Si le registry n'a aucune instance saine pour ce type, retourne le fallback.
+function resolveServiceUrl(serviceType: ServiceType, fallbackUrl: string): string {
+  const best = serviceRegistry.selectBest(serviceType);
+  if (best) return best.endpoint;
+  return fallbackUrl;
+}
+
 export class ServiceProxy {
   public users: UsersProxy;
   public messages: MessagesProxy;
