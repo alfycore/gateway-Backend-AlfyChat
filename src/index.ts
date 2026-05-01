@@ -1363,9 +1363,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         conversationId,
         channelId: data.channelId,
         recipientId: data.recipientId,
-      }) as { id: string; [key: string]: any };
+      }) as { id?: string; callId?: string; [key: string]: any };
+
+      const callId = call.id || call.callId;
+      if (!callId) throw new Error('Calls service returned no call ID');
+      // Normalise: expose always as .id
+      call.id = callId;
       
-      logger.info(`Calls service responded with call id=${call.id}`);
+      logger.info(`Calls service responded with call id=${callId}`);
       
       // L'initiateur rejoint la room de l'appel
       socket.join(`call:${call.id}`);
