@@ -631,43 +631,48 @@ class ServersProxy {
     });
   }
 
-  async updateServer(serverId: string, updates: any, userId: string) {
+  async updateServer(serverId: string, updates: any, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}`, {
       method: 'PATCH',
-      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
+      headers: { 'x-user-id': userId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) },
       body: JSON.stringify({ ...updates, userId }),
+      token,
     });
   }
 
-  async deleteServer(serverId: string, userId: string) {
+  async deleteServer(serverId: string, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}`, {
       method: 'DELETE',
-      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
+      headers: { 'x-user-id': userId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) },
       body: JSON.stringify({ userId }),
+      token,
     });
   }
 
-  async createChannel(serverId: string, data: { name: string; type: string; parentId?: string }, userId: string) {
+  async createChannel(serverId: string, data: { name: string; type: string; parentId?: string }, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels`, {
       method: 'POST',
-      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
+      headers: { 'x-user-id': userId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) },
       body: JSON.stringify({ ...data, userId }),
+      token,
     });
   }
 
-  async updateChannel(serverId: string, channelId: string, updates: any, userId: string) {
+  async updateChannel(serverId: string, channelId: string, updates: any, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
       method: 'PATCH',
-      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
+      headers: { 'x-user-id': userId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) },
       body: JSON.stringify({ ...updates, userId }),
+      token,
     });
   }
 
-  async deleteChannel(serverId: string, channelId: string, userId: string) {
+  async deleteChannel(serverId: string, channelId: string, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
       method: 'DELETE',
-      headers: { 'x-user-id': userId, 'x-internal-secret': INTERNAL_SECRET },
+      headers: { 'x-user-id': userId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) },
       body: JSON.stringify({ userId }),
+      token,
     });
   }
 
@@ -734,11 +739,12 @@ class ServersProxy {
     return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/members`);
   }
 
-  async updateMember(serverId: string, memberUserId: string, data: { roleIds?: string[]; nickname?: string }, actorId?: string) {
+  async updateMember(serverId: string, memberUserId: string, data: { roleIds?: string[]; nickname?: string }, actorId?: string, token?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}`, {
       method: 'PATCH',
-      headers: actorId ? { 'x-user-id': actorId, 'x-internal-secret': INTERNAL_SECRET } : undefined,
+      headers: actorId ? { 'x-user-id': actorId, ...(INTERNAL_SECRET ? { 'x-internal-secret': INTERNAL_SECRET } : {}) } : undefined,
       body: JSON.stringify(data),
+      token,
     });
   }
 

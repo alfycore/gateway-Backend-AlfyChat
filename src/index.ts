@@ -1946,7 +1946,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         if (e.message !== 'NO_NODE') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
       // Fallback microservice
-      const channel = await serviceProxy.servers.createChannel(serverId, { name: clean.name!, type: clean.type || 'text', parentId: clean.parentId }, userId);
+      const channel = await serviceProxy.servers.createChannel(serverId, { name: clean.name!, type: clean.type || 'text', parentId: clean.parentId }, userId, token);
       io.to(`server:${serverId}`).emit('CHANNEL_CREATE', {
         type: 'CHANNEL_CREATE',
         payload: channel,
@@ -1974,7 +1974,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       } catch (e: any) {
         if (e.message !== 'NO_NODE') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
-      const channel = await serviceProxy.servers.updateChannel(serverId, channelId, { ...(data.updates || {}), ...clean }, userId);
+      const channel = await serviceProxy.servers.updateChannel(serverId, channelId, { ...(data.updates || {}), ...clean }, userId, token);
       io.to(`server:${serverId}`).emit('CHANNEL_UPDATE', {
         type: 'CHANNEL_UPDATE',
         payload: channel,
@@ -1999,7 +1999,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       } catch (e: any) {
         if (e.message !== 'NO_NODE' && e.message !== 'NODE_TIMEOUT') { emitError(socket, 'CHANNEL_ERROR', e); return; }
       }
-      await serviceProxy.servers.deleteChannel(serverId, channelId, userId);
+      await serviceProxy.servers.deleteChannel(serverId, channelId, userId, token);
       io.to(`server:${serverId}`).emit('CHANNEL_DELETE', {
         type: 'CHANNEL_DELETE',
         payload: { channelId },
@@ -2383,7 +2383,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           return;
         }
         // Fallback: update MySQL directly
-        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds: safeRoleIds, nickname }, userId);
+        await serviceProxy.servers.updateMember(serverId, targetUserId, { roleIds: safeRoleIds, nickname }, userId, token);
         // Broadcast to all server members
         io.to(`server:${serverId}`).emit('MEMBER_UPDATE', {
           type: 'MEMBER_UPDATE',
@@ -2527,7 +2527,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       if (data.iconUrl !== undefined) updates.iconUrl = data.iconUrl;
       if (data.bannerUrl !== undefined) updates.bannerUrl = data.bannerUrl;
       if (data.isPublic !== undefined) updates.isPublic = data.isPublic;
-      const updated = await serviceProxy.servers.updateServer(data.serverId, updates, userId) as Record<string, any> | undefined;
+      const updated = await serviceProxy.servers.updateServer(data.serverId, updates, userId, token) as Record<string, any> | undefined;
       io.to(`server:${data.serverId}`).emit('SERVER_UPDATE', {
         type: 'SERVER_UPDATE',
         payload: {
