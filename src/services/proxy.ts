@@ -220,7 +220,8 @@ export class ServiceProxy {
 // ============ USERS PROXY ============
 
 class UsersProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('users', this._fallbackUrl); }
 
   async getUser(userId: string) {
     return fetchService(`${this.baseUrl}/users/${userId}`);
@@ -262,7 +263,8 @@ class UsersProxy {
 // ============ MESSAGES PROXY ============
 
 class MessagesProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('messages', this._fallbackUrl); }
 
   async getConversations(userId: string, token?: string) {
     return fetchWithFailover<any[]>(`${this.baseUrl}/conversations`, 'messages', {
@@ -416,7 +418,8 @@ class MessagesProxy {
 // ============ FRIENDS PROXY ============
 
 class FriendsProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('friends', this._fallbackUrl); }
 
   async getFriends(userId: string): Promise<any[]> {
     try {
@@ -479,7 +482,8 @@ class FriendsProxy {
 // ============ CALLS PROXY ============
 
 class CallsProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('calls', this._fallbackUrl); }
 
   async initiateCall(data: { type: string; initiatorId: string; conversationId?: string; channelId?: string; recipientId?: string }) {
     // Le calls service requiert participantIds — construire à partir de initiatorId + recipientId
@@ -561,7 +565,8 @@ class CallsProxy {
 // ============ SERVERS PROXY ============
 
 class ServersProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('servers', this._fallbackUrl); }
 
   async getUserServers(userId: string, token?: string) {
     return fetchService<any[]>(`${this.baseUrl}/servers?userId=${userId}`, token ? { token } : undefined);
@@ -786,7 +791,8 @@ class ServersProxy {
 // ============ BOTS PROXY ============
 
 class BotsProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private _fallbackUrl: string) {}
+  private get baseUrl(): string { return resolveServiceUrl('bots', this._fallbackUrl); }
 
   async getBot(botId: string) {
     return fetchService(`${this.baseUrl}/bots/${botId}`);
