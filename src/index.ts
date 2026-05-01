@@ -614,41 +614,56 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
   // Joindre automatiquement tous les serveurs dont l'utilisateur est membre
   try {
+    // ── Chemin rapide : restaurer depuis le cache Redis (évite NOT_A_CHANNEL_MEMBER au redémarrage) ──
+    try {
+      const cached = await redis.getUserRooms(userId);
+      if (cached) {
+        for (const sid of cached.serverIds) socket.join(`server:${sid}`);
+        for (const cid of cached.channelIds) socket.join(`channel:${cid}`);
+        logger.info(`${user.username} restored ${cached.serverIds.length} servers + ${cached.channelIds.length} channels from Redis cache`);
+      }
+    } catch { /* non bloquant */ }
+
+    // ── Chemin lent : rafraîchir depuis les microservices (met à jour le cache) ──
     const userServers = await serviceProxy.servers.getUserServers(userId, token);
     if (userServers && Array.isArray(userServers)) {
-      for (const srv of userServers) {
+      const allServerIds: string[] = [];
+      const allChannelIds: string[] = [];
+
+      await Promise.all(userServers.map(async (srv: any) => {
         const sid = srv.id || srv.server_id;
-        if (sid) {
-          socket.join(`server:${sid}`);
-          // Notifier le node si connecté (pour s'assurer que le membre existe dans la DB locale)
-          // + charger et joindre les channels du node
-          forwardToNode(sid, 'MEMBER_JOIN', {
-            userId,
-            username: user.username,
-            displayName: user.displayName || user.username,
-            avatarUrl: user.avatarUrl || null,
-          }).then(() => {
-            // Charger les channels depuis le node pour auto-join
-            return forwardToNode(sid, 'CHANNEL_LIST', {});
-          }).then((chResult) => {
-            if (chResult?.channels) {
-              for (const ch of chResult.channels) {
-                socket.join(`channel:${ch.id}`);
-              }
-            }
-          }).catch(() => {
-            // Pas de node → charger channels depuis microservice
-            serviceProxy.servers.getServer(sid).then((server: any) => {
-              if (server?.channels) {
-                for (const channel of server.channels) {
-                  socket.join(`channel:${channel.id}`);
-                }
-              }
-            }).catch(() => { /* ignore */ });
-          });
-        }
-      }
-      logger.info(`${user.username} auto-joined ${userServers.length} server rooms`);
+        if (!sid) return;
+        socket.join(`server:${sid}`);
+        allServerIds.push(sid);
+
+        // Notifier le node (fire-and-forget, non bloquant)
+        forwardToNode(sid, 'MEMBER_JOIN', {
+          userId,
+          username: user.username,
+          displayName: user.displayName || user.username,
+          avatarUrl: user.avatarUrl || null,
+        }).catch(() => {});
+
+        // Charger les channels (attendu pour éviter la race condition)
+        try {
+          let channels: any[] = [];
+          try {
+            const chResult = await forwardToNode(sid, 'CHANNEL_LIST', {});
+            channels = chResult?.channels || [];
+          } catch {
+            const server: any = await serviceProxy.servers.getServer(sid);
+            channels = server?.channels || [];
+          }
+          for (const ch of channels) {
+            socket.join(`channel:${ch.id}`);
+            allChannelIds.push(ch.id);
+          }
+        } catch { /* ignore */ }
+      }));
+
+      // Persister en Redis pour la prochaine reconnexion
+      redis.saveUserRooms(userId, allServerIds, allChannelIds).catch(() => {});
+      logger.info(`${user.username} auto-joined ${allServerIds.length} server rooms, ${allChannelIds.length} channel rooms`);
     }
   } catch (error) {
     console.error('Error joining server rooms:', error);
@@ -1703,8 +1718,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // CHANNEL_JOIN/SERVER_JOIN qui valident la membership. Un user qui forge
       // channelId ne sera pas dans cette room.
       if (!socket.rooms.has(`channel:${channelId}`)) {
-        emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('NOT_A_CHANNEL_MEMBER'));
-        return;
+        // Fallback : vérifier la membership réelle (résout la race condition au redémarrage)
+        const isMember = await serviceProxy.servers.isMember(serverId, userId).catch(() => false);
+        if (!isMember) {
+          emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('NOT_A_CHANNEL_MEMBER'));
+          return;
+        }
+        // Ré-ajouter aux rooms manquantes
+        socket.join(`server:${serverId}`);
+        socket.join(`channel:${channelId}`);
       }
       // Permission SEND (0x2) — inclut déjà le check de membership côté server.
       if (!(await checkServerPermission(userId, serverId, 0x2))) {

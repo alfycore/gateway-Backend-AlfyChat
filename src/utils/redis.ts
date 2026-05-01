@@ -141,6 +141,18 @@ export class RedisClient {
     await this.client.del(key);
   }
 
+  // ============ USER ROOMS (persistance reconnexion) ============
+
+  async saveUserRooms(userId: string, serverIds: string[], channelIds: string[]): Promise<void> {
+    await this.client.setex(`rooms:${userId}`, 7 * 24 * 3600, JSON.stringify({ serverIds, channelIds }));
+  }
+
+  async getUserRooms(userId: string): Promise<{ serverIds: string[]; channelIds: string[] } | null> {
+    const data = await this.client.get(`rooms:${userId}`);
+    if (!data) return null;
+    try { return JSON.parse(data); } catch { return null; }
+  }
+
   // ============ IP BAN ============
 
   async banIP(ip: string, reason: string, bannedBy: string): Promise<void> {
