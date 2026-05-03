@@ -9,6 +9,7 @@ import { lbRegistry, type ServiceMetrics } from '../lb/registry';
 import { gatewayRegistry } from '../lb/gateway-registry';
 import { monitoringDB } from '../utils/monitoring-db';
 import { logger } from '../utils/logger';
+import { INTERNAL_SECRET } from '../config/env';
 
 const GATEWAY_ID           = process.env.GATEWAY_ID || 'gateway-default';
 const HEARTBEAT_INTERVAL   = 30_000;
@@ -23,23 +24,33 @@ export function registerLBRoutes(app: Express): void {
    * Retour : { serviceId, gatewayId, heartbeatIntervalMs }
    */
   app.post('/api/lb/register', (req, res) => {
-    const key = req.headers['x-service-key'] as string | undefined;
-    if (!key?.startsWith('sk_')) {
-      return res.status(401).json({ error: 'X-Service-Key requis (format sk_...)' });
-    }
-    const { endpoint, domain } = req.body ?? {};
+    const key            = req.headers['x-service-key'] as string | undefined;
+    const internalSecret = req.headers['x-internal-secret'] as string | undefined;
+    const { endpoint, domain, serviceId: bodyServiceId } = req.body ?? {};
+
     if (!endpoint || typeof endpoint !== 'string') {
       return res.status(400).json({ error: 'endpoint requis' });
     }
 
-    const entry = lbRegistry.registerWithKey(key, {
-      endpoint,
-      domain:    domain || undefined,
-      gatewayId: GATEWAY_ID,
-    });
+    let entry;
 
-    if (!entry) {
-      return res.status(403).json({ error: 'Clé invalide ou service désactivé — vérifiez SERVICE_KEY dans votre .env' });
+    // Fallback : INTERNAL_SECRET + serviceId dans le body (SERVICE_KEY absent)
+    if (!key?.startsWith('sk_')) {
+      if (!internalSecret || internalSecret !== INTERNAL_SECRET) {
+        return res.status(401).json({ error: 'X-Service-Key requis (format sk_...) ou X-Internal-Secret valide' });
+      }
+      if (!bodyServiceId || typeof bodyServiceId !== 'string') {
+        return res.status(400).json({ error: 'serviceId requis dans le body quand SERVICE_KEY absent' });
+      }
+      entry = lbRegistry.registerById(bodyServiceId, { endpoint, domain: domain || undefined, gatewayId: GATEWAY_ID });
+      if (!entry) {
+        return res.status(403).json({ error: 'Service introuvable ou désactivé — vérifiez SERVICE_ID dans votre .env' });
+      }
+    } else {
+      entry = lbRegistry.registerWithKey(key, { endpoint, domain: domain || undefined, gatewayId: GATEWAY_ID });
+      if (!entry) {
+        return res.status(403).json({ error: 'Clé invalide ou service désactivé — vérifiez SERVICE_KEY dans votre .env' });
+      }
     }
 
     monitoringDB.updateServiceEndpoint(entry.id, endpoint).catch(() => {});
@@ -62,11 +73,18 @@ export function registerLBRoutes(app: Express): void {
    * Body   : { metrics: { cpuUsage, cpuMax, ramUsage, ramMax, bandwidthUsage, requestCount20min } }
    */
   app.post('/api/lb/heartbeat', (req, res) => {
-    const key = req.headers['x-service-key'] as string | undefined;
-    if (!key) return res.status(401).json({ error: 'X-Service-Key requis' });
+    const key            = req.headers['x-service-key'] as string | undefined;
+    const internalSecret = req.headers['x-internal-secret'] as string | undefined;
 
-    const serviceId = lbRegistry.validateKey(key);
-    if (!serviceId) return res.status(403).json({ error: 'Clé invalide' });
+    let serviceId: string | null = null;
+
+    if (key) {
+      serviceId = lbRegistry.validateKey(key);
+    } else if (internalSecret === INTERNAL_SECRET) {
+      serviceId = (req.body?.serviceId as string) ?? null;
+    }
+
+    if (!serviceId) return res.status(403).json({ error: 'Clé invalide ou serviceId manquant' });
 
     const { metrics } = req.body ?? {};
     if (!metrics || typeof metrics !== 'object') {
@@ -88,11 +106,17 @@ export function registerLBRoutes(app: Express): void {
    * Header : X-Service-Key: sk_xxx
    */
   app.post('/api/lb/deregister', (req, res) => {
-    const key = req.headers['x-service-key'] as string | undefined;
-    if (!key) return res.status(401).json({ error: 'X-Service-Key requis' });
+    const key            = req.headers['x-service-key'] as string | undefined;
+    const internalSecret = req.headers['x-internal-secret'] as string | undefined;
 
-    const serviceId = lbRegistry.validateKey(key);
-    if (!serviceId) return res.status(403).json({ error: 'Clé invalide' });
+    let serviceId: string | null = null;
+    if (key) {
+      serviceId = lbRegistry.validateKey(key);
+    } else if (internalSecret === INTERNAL_SECRET) {
+      serviceId = (req.body?.serviceId as string) ?? null;
+    }
+
+    if (!serviceId) return res.status(403).json({ error: 'Clé invalide ou serviceId manquant' });
 
     const entry = lbRegistry.getById(serviceId);
     if (entry) {

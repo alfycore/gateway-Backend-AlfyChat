@@ -658,6 +658,26 @@ export function registerAdminRoutes(app: Express): void {
     res.json({ success: true });
   });
 
+  /**
+   * POST /api/admin/lb/reload-keys
+   * Recharge tous les hashes de clés depuis la DB en mémoire, sans redémarrer.
+   * Utile après une rotation manuelle en DB.
+   */
+  app.post('/api/admin/lb/reload-keys', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const rows = await monitoringDB.loadServiceInstances();
+    let count = 0;
+    for (const row of rows) {
+      if (row.serviceKeyHash) {
+        lbRegistry.addKeyHash(row.id, row.serviceKeyHash);
+        serviceKeyHashes.set(row.id, row.serviceKeyHash);
+        count++;
+      }
+    }
+    logger.info(`Admin: ${count} clé(s) rechargée(s) depuis la DB`);
+    res.json({ success: true, reloaded: count });
+  });
+
   // Proxy helpdesk → users service (must be before /api/admin catch-all)
   app.all('/api/helpdesk/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));
   app.all('/api/helpdesk', (req, res) => proxyRequest(getServiceUrl('users', USERS_URL), req, res, USERS_URL));

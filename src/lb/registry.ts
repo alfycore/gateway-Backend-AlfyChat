@@ -128,6 +128,17 @@ class LBRegistry {
 
   // ── Live registration (microservice connects with key) ─────────────────────
 
+  /** Enregistrement sans clé — fallback INTERNAL_SECRET (SERVICE_KEY absent). */
+  registerById(serviceId: string, data: {
+    endpoint: string;
+    domain?: string;
+    gatewayId?: string;
+  }): ServiceEntry | null {
+    const entry = this.entries.get(serviceId);
+    if (!entry || !entry.enabled) return null;
+    return this._applyRegistration(entry, data);
+  }
+
   registerWithKey(rawKey: string, data: {
     endpoint: string;
     domain?: string;
@@ -138,7 +149,10 @@ class LBRegistry {
 
     const entry = this.entries.get(serviceId);
     if (!entry || !entry.enabled) return null;
+    return this._applyRegistration(entry, data);
+  }
 
+  private _applyRegistration(entry: ServiceEntry, data: { endpoint: string; domain?: string; gatewayId?: string }): ServiceEntry {
     const ep = data.endpoint.trim();
     entry.endpoint      = ep;
     entry.domain        = data.domain ?? ((() => { try { return new URL(ep).host; } catch { return ep; } })());
@@ -151,7 +165,7 @@ class LBRegistry {
     entry.degradedReason = undefined;
     entry.degradedAt    = undefined;
 
-    logger.info(`LBRegistry: "${serviceId}" (${entry.serviceType}) en ligne @ ${ep} [${entry.location}]`);
+    logger.info(`LBRegistry: "${entry.id}" (${entry.serviceType}) en ligne @ ${ep} [${entry.location}]`);
     return entry;
   }
 
