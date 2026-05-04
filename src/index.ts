@@ -1068,9 +1068,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     if (!data.recipientId || !data.conversationId) return;
     // Only allow requests for DM conversations where userId is a participant
     if (!data.conversationId.startsWith('dm_') || !data.conversationId.includes(userId)) return;
-    // Vérifier si le destinataire est connecté
-    const recipientSockets = await io.in(`user:${data.recipientId}`).fetchSockets();
-    if (recipientSockets.length === 0) {
+    // Vérifier si le destinataire est connecté (même source que le bandeau d'ami)
+    const isRecipientOnline = await redis.isUserOnline(data.recipientId);
+    if (!isRecipientOnline) {
       // Destinataire hors ligne → notifier l'expéditeur immédiatement
       socket.emit('e2ee:history-error', { reason: 'recipient_offline', conversationId: data.conversationId });
       return;
