@@ -1539,7 +1539,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           remoteSocket.emit('CALL_INCOMING', incomingPayload);
         }
         try {
-          await redis.setex(`pending_call:user:${data.recipientId}`, 60, JSON.stringify(incomingPayload));
+          await redis.set(`pending_call:user:${data.recipientId}`, JSON.stringify(incomingPayload), 60);
         } catch { /* non bloquant */ }
       } else if (conversationId) {
         socket.to(`conversation:${conversationId}`).emit('CALL_INCOMING', incomingPayload);
@@ -1635,7 +1635,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         // Créer la salle SFU si elle n'existe pas encore
         const currentMode = await redis.get(`call:mode:${callId}`).catch(() => null);
         if (currentMode !== 'sfu') {
-          await redis.set(`call:mode:${callId}`, 'sfu', 'EX', 3600);
+          await redis.set(`call:mode:${callId}`, 'sfu', 3600);
           try { await serviceProxy.media.createRoom(callId, 'group'); } catch { /* ok si existe déjà */ }
           // Notifier tous les participants du switch P2P→SFU
           import('./handlers/sfu.handler').then(({ broadcastModeSwitch }) => {
@@ -1889,7 +1889,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       try {
         await serviceProxy.media.createRoom(callId, 'server');
       } catch (sfuErr) {
-        logger.error('Impossible de créer la salle SFU pour appel serveur:', sfuErr);
+        logger.error({ err: sfuErr }, 'Impossible de créer la salle SFU pour appel serveur:');
       }
 
       // Notifier le canal (bannière passive, pas de dialogue modal)
@@ -3731,7 +3731,7 @@ serverNodesNs.on('connection', async (nodeSocket) => {
     for (let i = 0; i < 14; i++) code += chars[bytes[i] % chars.length];
     return code;
   })();
-  await redis.setex(`setup_code:${serverId}`, 900, setupCode); // 15 min
+  await redis.set(`setup_code:${serverId}`, setupCode, 900); // 15 min
   nodeSocket.emit('SETUP_CODE', { code: setupCode, serverId, expiresIn: 900 });
   logger.info(`🔑 Code admin généré pour serverId=${serverId}`);
 
