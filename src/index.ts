@@ -53,6 +53,7 @@ import { forwardToNode, getNodeSocket } from './services/forward';
 import { registerInternalRoutes } from './http/internal.routes';
 import { registerLBRoutes } from './http/lb.routes';
 import { registerAdminRoutes } from './http/admin.routes';
+import { registerSfuHandlers, broadcastQualityUpdate, GROUP_SFU_THRESHOLD } from './handlers/sfu.handler';
 import { gatewayRegistry } from './lb/gateway-registry';
 import { registerFriendsRoutes } from './http/friends.routes';
 import { registerServersRoutes } from './http/servers.routes';
@@ -329,6 +330,21 @@ redis = new RedisClient({
 runtime.io = io;
 runtime.redis = redis;
 
+// ── Endpoint interne : le media-server notifie le gateway d'un changement de tier qualité ──
+// Cet endpoint est appelé par le media-server (pas par les clients WebSocket)
+app.post('/internal/call-quality', express.json(), (req, res) => {
+  const secret = req.headers['x-internal-secret'];
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Accès interne requis' });
+  }
+  const { callId, tier, participantCount, tierParams } = req.body;
+  if (!callId || tier === undefined) {
+    return res.status(400).json({ error: 'callId et tier requis' });
+  }
+  broadcastQualityUpdate(io, callId, tier, participantCount, tierParams);
+  res.json({ success: true });
+});
+
 // Adaptateur Redis pour Socket.IO (scaling multi-instances)
 const _ioRedisPub = redis.getRawClient();
 const _ioRedisSub = _ioRedisPub.duplicate();
@@ -350,6 +366,7 @@ const serviceProxy = new ServiceProxy({
   calls: process.env.CALLS_SERVICE_URL || 'http://localhost:3004',
   servers: process.env.SERVERS_SERVICE_URL || 'http://localhost:3005',
   bots: process.env.BOTS_SERVICE_URL || 'http://localhost:3006',
+  mediaServer: process.env.MEDIA_SERVER_URL || 'http://localhost:3010',
 });
 
 // ============ TYPES ============
@@ -394,6 +411,58 @@ io.use(async (socket: AuthenticatedSocket, next) => {
 });
 
 // ============ GESTION DES CONNEXIONS ============
+
+/**
+ * Envoie les MENTION_NOTIFY aux utilisateurs mentionnés dans un message de salon serveur.
+ * - Si l'utilisateur est en ligne → event temps réel
+ * - Si hors ligne → DB + Redis (récupéré à la reconnexion via PENDING_PINGS)
+ */
+async function handleServerMentions(opts: {
+  mentionedUserIds: unknown;
+  senderId: string;
+  senderName: string;
+  senderAvatar: string | null;
+  channelId: string;
+  serverId: string;
+  channelName?: string;
+  content: string;
+}) {
+  const { mentionedUserIds, senderId, senderName, senderAvatar, channelId, serverId, channelName, content } = opts;
+  const ids: string[] = Array.isArray(mentionedUserIds)
+    ? (mentionedUserIds as string[]).filter((id) => id && id !== senderId)
+    : [];
+  if (ids.length === 0) return;
+
+  const convKey = `channel:${channelId}`;
+  const preview = content?.substring(0, 80) ?? '';
+
+  for (const mentionedId of ids) {
+    const mentionPayload = {
+      type: 'MENTION_NOTIFY',
+      payload: {
+        conversationKey: convKey,
+        channelId,
+        serverId,
+        senderId,
+        senderName,
+        senderAvatar,
+        channelName: channelName ?? null,
+        preview,
+        notificationType: 'mention' as const,
+      },
+      timestamp: new Date(),
+    };
+    try {
+      const isOnline = await redis.isUserOnline(mentionedId);
+      if (isOnline) {
+        io.to(`user:${mentionedId}`).emit('MENTION_NOTIFY', mentionPayload);
+      } else {
+        redis.addPendingPing(mentionedId, convKey, senderName).catch(() => {});
+        serviceProxy.messages.saveNotification(mentionedId, convKey, senderName, senderId, 'mention', channelName).catch(() => {});
+      }
+    } catch { /* ne pas bloquer l'envoi si la vérification échoue */ }
+  }
+}
 
 /**
  * Vérifie qu'un utilisateur a les permissions requises sur un serveur.
@@ -693,24 +762,42 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   } catch { /* non bloquant */ }
 
-  // Stocker le statut en ligne dans Redis (conserver le statut choisi par l'utilisateur)
-  const previousStatus = user.status && user.status !== 'offline' ? user.status : 'online';
-  await redis.setUserStatus(userId, previousStatus, user.customStatus ?? null);
+  // Restaurer la présence depuis Redis (survit 24h après déconnexion) ou fallback DB
+  const restoredPresence = await redis.getPresence(userId);
+  const chosenStatus = restoredPresence?.chosenStatus
+    ?? (user.status && user.status !== 'offline' ? user.status : 'online');
+  const restoredEmoji = restoredPresence?.emoji ?? null;
+  const restoredText = restoredPresence?.text ?? (user as any).customStatus ?? null;
 
-  // Notifier les amis de la connexion
-  broadcastPresenceUpdate(userId, previousStatus, friends, user.customStatus ?? null);
+  await redis.setPresence(userId, {
+    status: chosenStatus,
+    chosenStatus,
+    emoji: restoredEmoji,
+    text: restoredText,
+    lastActivity: Date.now(),
+  });
+
+  // Informer la socket connectée de son propre statut restauré
+  socket.emit('PRESENCE_RESTORED', {
+    type: 'PRESENCE_RESTORED',
+    payload: { status: chosenStatus, emoji: restoredEmoji, text: restoredText },
+    timestamp: new Date(),
+  });
+
+  // Notifier les amis seulement (plus de broadcast serveur — member-list utilise GET_BULK_PRESENCE)
+  broadcastPresenceUpdate(userId, chosenStatus, friends, restoredText, restoredEmoji);
 
   // Envoyer les pings en attente (messages reçus hors ligne) — DB + Redis
   try {
     // 1. Notifications persistantes en DB (source de vérité)
-    let dbNotifications: Record<string, { count: number; senderName: string }> = {};
+    let dbNotifications: Record<string, { count: number; senderName: string; type?: string; channelName?: string }> = {};
     try {
-      dbNotifications = (await serviceProxy.messages.getNotifications(userId, token)) as Record<string, { count: number; senderName: string }>;
+      dbNotifications = (await serviceProxy.messages.getNotifications(userId, token)) as Record<string, { count: number; senderName: string; type?: string; channelName?: string }>;
     } catch { /* non bloquant */ }
 
     // 2. Compat. Redis (fusionne avec DB)
     const redisPings = await redis.getPendingPings(userId);
-    const merged: Record<string, { count: number; senderName: string }> = { ...redisPings };
+    const merged: Record<string, { count: number; senderName: string; type?: string; channelName?: string }> = { ...redisPings };
     for (const [convId, notif] of Object.entries(dbNotifications)) {
       if (!merged[convId]) {
         merged[convId] = notif;
@@ -718,6 +805,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         merged[convId] = {
           count: Math.max(merged[convId].count, notif.count),
           senderName: notif.senderName || merged[convId].senderName,
+          // Conserver le type 'mention' si présent (priorité sur 'message')
+          type: notif.type === 'mention' ? 'mention' : (merged[convId].type ?? notif.type),
+          channelName: notif.channelName || merged[convId].channelName,
         };
       }
     }
@@ -740,7 +830,19 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // ============ GESTIONNAIRES D'ÉVÉNEMENTS ============
 
   // Heartbeat
-  socket.on('HEARTBEAT', () => {
+  socket.on('HEARTBEAT', (data?: { active?: boolean }) => {
+    const isActive = data?.active !== false;
+    if (isActive) {
+      redis.touchActivity(userId).catch(() => {});
+      // Si l'utilisateur était passé en auto-idle → restaurer son statut choisi
+      redis.getPresence(userId).then(async (p) => {
+        if (p && p.status === 'idle' && p.chosenStatus === 'online') {
+          await redis.setPresence(userId, { ...p, status: 'online', lastActivity: Date.now() });
+          const restoreFriends = await serviceProxy.friends.getFriends(userId);
+          broadcastPresenceUpdate(userId, 'online', restoreFriends, p.text, p.emoji);
+        }
+      }).catch(() => {});
+    }
     emitToSocket(socket, 'HEARTBEAT_ACK', { timestamp: Date.now() });
   });
 
@@ -751,6 +853,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     if (!key || typeof key !== 'string') return;
     // Diffuser à tous les autres sockets de cet utilisateur (pas à l'émetteur)
     socket.to(`user:${userId}`).emit('NOTIFICATION_SYNC', { key });
+  });
+
+  // Synchronisation des préférences multi-appareils (relay simple)
+  socket.on('PREFERENCES_UPDATE', (data: unknown) => {
+    socket.to(`user:${userId}`).emit('PREFERENCES_UPDATE', data);
   });
 
   // Messages
@@ -819,6 +926,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const messageForClient = {
         id: messageId,
         conversationId,
+        groupId: (!data.recipientId && !conversationId.startsWith('dm_')) ? conversationId : undefined,
         senderId: userId,
         content: data.content,
         senderContent: data.senderContent,
@@ -854,6 +962,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         }
         if (!recipientAlreadyInConvRoom) {
           io.to(`user:${data.recipientId}`).emit('message:new', messageForClient);
+          // Notifier le destinataire qu'une nouvelle conversation existe (sidebar mise à jour sans refresh)
+          io.to(`user:${data.recipientId}`).emit('CONVERSATION_CREATE', {
+            id: conversationId,
+            type: 'dm',
+            recipientId: userId,
+            recipientName: user.displayName || user.username,
+            recipientAvatar: user.avatarUrl || null,
+          });
         }
 
         // Filet de sécurité SENDER : envoyer à tous les autres appareils de l'expéditeur
@@ -865,6 +981,19 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
               io.to(sid).emit('message:new', messageForClient);
             }
           }
+        }
+        // Notifier les autres appareils de l'expéditeur qu'une nouvelle conversation existe
+        // (async, on récupère le profil du destinataire en arrière-plan)
+        if (senderUserRoom && senderUserRoom.size > 1) {
+          serviceProxy.users.getUser(data.recipientId).then((recipientUser: any) => {
+            io.to(`user:${userId}`).emit('CONVERSATION_CREATE', {
+              id: conversationId,
+              type: 'dm',
+              recipientId: data.recipientId,
+              recipientName: recipientUser?.displayName || recipientUser?.username || '',
+              recipientAvatar: recipientUser?.avatarUrl || null,
+            });
+          }).catch(() => {});
         }
       }
 
@@ -916,6 +1045,36 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
                 ).catch(() => {});
               }
             }).catch(() => {});
+        }
+
+        // Mentions dans les messages de groupe (@username → mentionedUserIds)
+        const mentionedUserIds: string[] = Array.isArray(data.mentionedUserIds)
+          ? (data.mentionedUserIds as string[]).filter((id: string) => id && id !== userId)
+          : [];
+        if (mentionedUserIds.length > 0) {
+          const senderName = user.displayName || user.username;
+          for (const mentionedId of mentionedUserIds) {
+            const mentionPayload = {
+              type: 'MENTION_NOTIFY',
+              payload: {
+                conversationId,
+                senderId: userId,
+                senderName,
+                senderAvatar: user.avatarUrl || null,
+                preview: (data.content as string)?.substring(0, 80) ?? '',
+                notificationType: 'mention' as const,
+              },
+              timestamp: new Date(),
+            };
+            redis.isUserOnline(mentionedId).then((isOnline: boolean) => {
+              if (isOnline) {
+                io.to(`user:${mentionedId}`).emit('MENTION_NOTIFY', mentionPayload);
+              } else {
+                redis.addPendingPing(mentionedId, conversationId, senderName).catch(() => {});
+                serviceProxy.messages.saveNotification(mentionedId, conversationId, senderName, userId, 'mention').catch(() => {});
+              }
+            }).catch(() => {});
+          }
         }
       }).catch((err: Error) => {
         // La DB a échoué : notifier l'expéditeur pour afficher une erreur sur le message
@@ -1057,7 +1216,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
 
     if (roomId) {
-      socket.join(`conversation:${roomId}`);
+      await socket.join(`conversation:${roomId}`);
       socket.emit('conversation:joined', { conversationId: roomId });
     }
   });
@@ -1336,21 +1495,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   });
 
-  // Appels
+  // ── Appels ────────────────────────────────────────────────────────────────
+
+  // ── Appel DM 1:1 ──────────────────────────────────────────────────────────
   socket.on('CALL_INITIATE', async (data, callback) => {
     try {
-      logger.info(`CALL_INITIATE de ${userId} (${user?.username}) vers ${data.recipientId || data.channelId || 'conversation'} type=${data.type}`);
+      logger.info(`CALL_INITIATE DM de ${userId} (${user?.username}) vers ${data.recipientId || '?'} type=${data.type}`);
 
-      // Vérification de permission : pour les channels de serveur, vérifier le membership
-      if (data.channelId && data.serverId) {
-        const isMember = await serviceProxy.servers.isMember(data.serverId, userId);
-        if (!isMember) {
-          if (typeof callback === 'function') callback({ error: 'Accès refusé — non membre du serveur' });
-          return;
-        }
-      }
-      
-      // Calculer le conversationId pour les DM si recipientId est fourni
       let conversationId = data.conversationId;
       if (!conversationId && data.recipientId) {
         const sortedIds = [userId, data.recipientId].sort();
@@ -1361,118 +1512,227 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         type: data.type,
         initiatorId: userId,
         conversationId,
-        channelId: data.channelId,
         recipientId: data.recipientId,
       }) as { id?: string; callId?: string; [key: string]: any };
 
-      const callId = call.id || call.callId;
+      const callId = call.id || call.callId || '';
       if (!callId) throw new Error('Calls service returned no call ID');
-      // Normalise: expose always as .id
-      call.id = callId;
-      
-      logger.info(`Calls service responded with call id=${callId}`);
-      
-      // L'initiateur rejoint la room de l'appel
-      socket.join(`call:${call.id}`);
-      
-      // Retourner le callId à l'initiateur
-      if (typeof callback === 'function') {
-        callback({ callId: call.id, id: call.id });
-      }
+
+      socket.join(`call:${callId}`);
+      if (typeof callback === 'function') callback({ callId, id: callId });
 
       const callPayload = {
-        ...call,
+        callId,
         conversationId,
         initiatorId: userId,
         recipientId: data.recipientId || null,
         callerName: user?.displayName || user?.username,
         callerAvatar: user?.avatarUrl,
+        callType: data.type || 'voice',
+        isGroup: false,
       };
 
-      // Notifier le destinataire ou les participants de la conversation
+      const incomingPayload = { type: 'CALL_INCOMING', payload: callPayload, timestamp: new Date() };
       if (data.recipientId) {
-        const recipientRoom = `user:${data.recipientId}`;
-        const socketsInRoom = await io.in(recipientRoom).fetchSockets();
-        logger.info(`CALL_INCOMING: room "${recipientRoom}" contient ${socketsInRoom.length} socket(s): [${socketsInRoom.map(s => s.id).join(', ')}]`);
-        
-        const callIncomingPayload = {
-          type: 'CALL_INCOMING',
-          payload: callPayload,
-          timestamp: new Date(),
-        };
-
-        // Émettre DIRECTEMENT à chaque socket du destinataire
+        const socketsInRoom = await io.in(`user:${data.recipientId}`).fetchSockets();
         for (const remoteSocket of socketsInRoom) {
-          remoteSocket.emit('CALL_INCOMING', callIncomingPayload);
-          logger.info(`CALL_INCOMING émis directement au socket ${remoteSocket.id} (user: ${(remoteSocket as any).userId})`);
+          remoteSocket.emit('CALL_INCOMING', incomingPayload);
         }
-        // Stocker en Redis pour les utilisateurs qui se connectent en retard (TTL 60s)
         try {
-          await redis.set(
-            `pending_call:user:${data.recipientId}`,
-            JSON.stringify({ type: 'CALL_INCOMING', payload: callPayload, timestamp: new Date() }),
-            60
-          );
+          await redis.setex(`pending_call:user:${data.recipientId}`, 60, JSON.stringify(incomingPayload));
         } catch { /* non bloquant */ }
       } else if (conversationId) {
-        socket.to(`conversation:${conversationId}`).emit('CALL_INCOMING', {
-          type: 'CALL_INCOMING',
-          payload: callPayload,
-          timestamp: new Date(),
-        });
-      } else if (data.channelId) {
-        socket.to(`channel:${data.channelId}`).emit('CALL_INCOMING', {
-          type: 'CALL_INCOMING',
-          payload: callPayload,
-          timestamp: new Date(),
-        });
+        socket.to(`conversation:${conversationId}`).emit('CALL_INCOMING', incomingPayload);
       }
+
+      logger.info(`Appel DM créé: ${callId}`);
     } catch (error) {
       emitError(socket, 'CALL_ERROR', error);
+      if (typeof callback === 'function') callback({ error: 'Failed to initiate call' });
+    }
+  });
+
+  // ── Appel groupe (WebRTC P2P mesh) ────────────────────────────────────────
+  socket.on('CALL_INITIATE_GROUP', async (data, callback) => {
+    try {
+      logger.info(`CALL_INITIATE_GROUP de ${userId} (${user?.username}) channel=${data.channelId} type=${data.type}`);
+
+      if (!data.channelId) {
+        if (typeof callback === 'function') callback({ error: 'channelId requis' });
+        return;
+      }
+
+      const groupCall = await serviceProxy.calls.createGroupCall({
+        channelId: data.channelId,
+        initiatorId: userId,
+        type: data.type || 'voice',
+      }) as { id?: string; callId?: string; [key: string]: any };
+
+      const callId = groupCall.id || groupCall.callId || '';
+      if (!callId) throw new Error('Calls service returned no call ID');
+
+      socket.join(`call:${callId}`);
+      if (typeof callback === 'function') callback({ callId, id: callId });
+
+      const callPayload = {
+        callId,
+        channelId: data.channelId,
+        callType: data.type || 'voice',
+        isGroup: true,
+        initiatorId: userId,
+        callerName: user?.displayName || user?.username,
+        callerAvatar: user?.avatarUrl,
+      };
+
+      // Notifier tous les membres — channel: pour serveurs, conversation: pour groupes DM
+      const incomingGroupPayload = { type: 'CALL_INCOMING', payload: callPayload, timestamp: new Date() };
+      socket.to(`channel:${data.channelId}`).emit('CALL_INCOMING', incomingGroupPayload);
+      socket.to(`conversation:${data.channelId}`).emit('CALL_INCOMING', incomingGroupPayload);
+
+      logger.info(`Appel groupe créé: ${callId} channel=${data.channelId}`);
+    } catch (error) {
+      emitError(socket, 'CALL_ERROR', error);
+      if (typeof callback === 'function') callback({ error: 'Failed to initiate group call' });
+    }
+  });
+
+  // Rejoindre un appel groupe existant (depuis CALL_INCOMING)
+  socket.on('CALL_JOIN', async (data, callback) => {
+    try {
+      const { callId } = data;
+      if (!callId) return;
+
+      const call = await serviceProxy.calls.getCall(callId);
+      if (!call || call.status === 'ended') {
+        if (typeof callback === 'function') callback({ error: 'Appel introuvable ou terminé' });
+        return;
+      }
+
+      await serviceProxy.calls.joinCall(callId, userId);
+      try { await redis.del(`pending_call:user:${userId}`); } catch { /* non bloquant */ }
+
+      // Récupérer les participants déjà dans la room Socket.IO (avec infos utilisateur)
+      const socketsInRoom = await io.in(`call:${callId}`).fetchSockets();
+      const existingParticipants = socketsInRoom
+        .filter((s) => (s as any).userId && (s as any).userId !== userId)
+        .map((s) => ({
+          userId: (s as any).userId as string,
+          userName: (s as any).user?.displayName || (s as any).user?.username || 'Utilisateur',
+          userAvatar: (s as any).user?.avatarUrl as string | undefined,
+        }));
+
+      socket.join(`call:${callId}`);
+
+      // Vérifier si le groupe franchit le seuil P2P→SFU
+      const newCount = socketsInRoom.length + 1; // +1 = ce nouveau participant
+      const callCat = (call as any).callCategory || 'group';
+
+      let callMode: 'p2p' | 'sfu' = 'p2p';
+      if (callCat === 'server') {
+        callMode = 'sfu';
+      } else if (callCat === 'group' && newCount > GROUP_SFU_THRESHOLD) {
+        callMode = 'sfu';
+        // Créer la salle SFU si elle n'existe pas encore
+        const currentMode = await redis.get(`call:mode:${callId}`).catch(() => null);
+        if (currentMode !== 'sfu') {
+          await redis.set(`call:mode:${callId}`, 'sfu', 'EX', 3600);
+          try { await serviceProxy.media.createRoom(callId, 'group'); } catch { /* ok si existe déjà */ }
+          // Notifier tous les participants du switch P2P→SFU
+          import('./handlers/sfu.handler').then(({ broadcastModeSwitch }) => {
+            broadcastModeSwitch(io, callId, 'sfu');
+          });
+        }
+      }
+
+      // Notifier les participants existants qu'un nouveau pair arrive
+      socket.to(`call:${callId}`).emit('CALL_PARTICIPANT_JOINED', {
+        type: 'CALL_PARTICIPANT_JOINED',
+        payload: {
+          callId, userId, userName: user?.displayName || user?.username,
+          userAvatar: user?.avatarUrl, existingParticipants: [], callMode,
+        },
+        timestamp: new Date(),
+      });
+
+      // Broadcast participant count pour la qualité adaptative
+      io.to(`call:${callId}`).emit('CALL_PARTICIPANT_COUNT', {
+        type: 'CALL_PARTICIPANT_COUNT',
+        payload: { callId, count: newCount },
+        timestamp: new Date(),
+      });
+
+      // Confirmer au nouvel arrivant avec la liste des participants existants (pour créer les PCs)
       if (typeof callback === 'function') {
-        callback({ error: 'Failed to initiate call' });
+        callback({ callId, existingParticipants, callMode });
+      } else {
+        socket.emit('CALL_JOIN_ACK', { callId, existingParticipants, callMode });
+      }
+
+      logger.info(`${userId} a rejoint l'appel ${callCat} ${callId} (${newCount} participants, mode=${callMode})`);
+    } catch (error: any) {
+      if (error?.statusCode === 404) {
+        socket.emit('CALL_END', { type: 'CALL_END', payload: { callId: data.callId }, timestamp: new Date() });
+        if (typeof callback === 'function') callback({ error: 'Appel déjà terminé' });
+      } else {
+        emitError(socket, 'CALL_ERROR', error);
+        if (typeof callback === 'function') callback({ error: 'Failed to join call' });
       }
     }
   });
 
   socket.on('CALL_ACCEPT', async (data) => {
     try {
-      const call = await serviceProxy.calls.joinCall(data.callId, userId);
-      
-      // Supprimer l'appel en attente Redis (plus besoin de notifier cet utilisateur)
+      // Idempotency: skip if this user is already in the call room (duplicate accept from another tab)
+      const alreadyInRoom = (await io.in(`call:${data.callId}`).fetchSockets())
+        .some((s) => (s as any).userId === userId);
+      if (alreadyInRoom) {
+        socket.join(`call:${data.callId}`);
+        return;
+      }
+
+      await serviceProxy.calls.joinCall(data.callId, userId);
       try { await redis.del(`pending_call:user:${userId}`); } catch { /* non bloquant */ }
-      
-      // Rejoindre la room AVANT de broadcast pour recevoir le signaling WebRTC
+
+      const socketsInRoom = await io.in(`call:${data.callId}`).fetchSockets();
+      const existingParticipants = socketsInRoom
+        .filter((s) => (s as any).userId && (s as any).userId !== userId)
+        .map((s) => ({
+          userId: (s as any).userId as string,
+          userName: (s as any).user?.displayName || (s as any).user?.username || 'Utilisateur',
+          userAvatar: (s as any).user?.avatarUrl as string | undefined,
+        }));
+
       socket.join(`call:${data.callId}`);
-      
-      // Signaler aux participants EXISTANTS qu'un nouveau pair a rejoint
-      // → déclenche handleParticipantJoined côté initiateur qui crée l'offre WebRTC
+
+      // Signaler aux participants existants qu'un nouveau pair a rejoint
       socket.to(`call:${data.callId}`).emit('CALL_PARTICIPANT_JOINED', {
         type: 'CALL_PARTICIPANT_JOINED',
-        payload: { callId: data.callId, userId },
+        payload: { callId: data.callId, userId, userName: user?.displayName || user?.username, userAvatar: user?.avatarUrl, existingParticipants: [] },
         timestamp: new Date(),
       });
-      
-      // Confirmer l'acceptation à tous les participants (y compris l'accepteur)
+
+      // Confirmer l'acceptation avec la liste des pairs existants
       io.to(`call:${data.callId}`).emit('CALL_ACCEPT', {
         type: 'CALL_ACCEPT',
-        payload: { callId: data.callId, userId },
+        payload: { callId: data.callId, userId, existingParticipants },
         timestamp: new Date(),
       });
-      
+
       logger.info(`Appel ${data.callId} accepté par ${userId}`);
-    } catch (error) {
-      emitError(socket, 'CALL_ERROR', error);
+    } catch (error: any) {
+      if (error?.statusCode === 404) {
+        // Call was ended before accept arrived — cleanly close on the acceptor's side
+        socket.emit('CALL_END', { type: 'CALL_END', payload: { callId: data.callId }, timestamp: new Date() });
+      } else {
+        emitError(socket, 'CALL_ERROR', error);
+      }
     }
   });
 
   socket.on('CALL_REJECT', async (data) => {
     try {
       await serviceProxy.calls.rejectCall(data.callId, userId);
-      
-      // Supprimer l'appel en attente Redis
       try { await redis.del(`pending_call:user:${userId}`); } catch { /* non bloquant */ }
-      
       io.to(`call:${data.callId}`).emit('CALL_REJECT', {
         type: 'CALL_REJECT',
         payload: { callId: data.callId, userId },
@@ -1483,24 +1743,51 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     }
   });
 
-  socket.on('CALL_END', async (data) => {
+  socket.on('CALL_LEAVE', async (data) => {
     try {
-      await serviceProxy.calls.endCall(data.callId, userId);
-      
-      io.to(`call:${data.callId}`).emit('CALL_END', {
-        type: 'CALL_END',
-        payload: { callId: data.callId },
+      await serviceProxy.calls.leaveCall(data.callId, userId);
+      socket.leave(`call:${data.callId}`);
+      // Notifier les autres participants du départ
+      io.to(`call:${data.callId}`).emit('CALL_PARTICIPANT_LEFT', {
+        type: 'CALL_PARTICIPANT_LEFT',
+        payload: { callId: data.callId, userId },
         timestamp: new Date(),
       });
+      // Si plus aucun participant dans la room → terminer l'appel
+      const remaining = await io.in(`call:${data.callId}`).fetchSockets();
+      if (remaining.length === 0) {
+        await serviceProxy.calls.endCall(data.callId, userId);
+        io.to(`call:${data.callId}`).emit('CALL_END', {
+          type: 'CALL_END',
+          payload: { callId: data.callId },
+          timestamp: new Date(),
+        });
+      }
+      logger.info(`${userId} a quitté l'appel ${data.callId}`);
     } catch (error) {
       emitError(socket, 'CALL_ERROR', error);
     }
   });
 
-  // WebRTC Signaling
+  socket.on('CALL_END', async (data) => {
+    try {
+      await serviceProxy.calls.endCall(data.callId, userId);
+      io.to(`call:${data.callId}`).emit('CALL_END', {
+        type: 'CALL_END',
+        payload: { callId: data.callId },
+        timestamp: new Date(),
+      });
+      // Éjecter tous les sockets de la room
+      io.socketsLeave(`call:${data.callId}`);
+    } catch (error) {
+      emitError(socket, 'CALL_ERROR', error);
+    }
+  });
+
+  // WebRTC Signaling — routage ciblé vers targetUserId (ou broadcast si absent)
   socket.on('WEBRTC_OFFER', (data) => {
-    logger.info(`WebRTC offer de ${userId} pour call ${data.callId}`);
-    socket.to(`call:${data.callId}`).emit('WEBRTC_OFFER', {
+    const target = data.targetUserId ? `user:${data.targetUserId}` : `call:${data.callId}`;
+    io.to(target).emit('WEBRTC_OFFER', {
       type: 'WEBRTC_OFFER',
       payload: { callId: data.callId, offer: data.offer, fromUserId: userId },
       timestamp: new Date(),
@@ -1508,8 +1795,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   socket.on('WEBRTC_ANSWER', (data) => {
-    logger.info(`WebRTC answer de ${userId} pour call ${data.callId}`);
-    socket.to(`call:${data.callId}`).emit('WEBRTC_ANSWER', {
+    const target = data.targetUserId ? `user:${data.targetUserId}` : `call:${data.callId}`;
+    io.to(target).emit('WEBRTC_ANSWER', {
       type: 'WEBRTC_ANSWER',
       payload: { callId: data.callId, answer: data.answer, fromUserId: userId },
       timestamp: new Date(),
@@ -1517,7 +1804,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   });
 
   socket.on('WEBRTC_ICE_CANDIDATE', (data) => {
-    socket.to(`call:${data.callId}`).emit('WEBRTC_ICE_CANDIDATE', {
+    const target = data.targetUserId ? `user:${data.targetUserId}` : `call:${data.callId}`;
+    io.to(target).emit('WEBRTC_ICE_CANDIDATE', {
       type: 'WEBRTC_ICE_CANDIDATE',
       payload: { callId: data.callId, candidate: data.candidate, fromUserId: userId },
       timestamp: new Date(),
@@ -1566,6 +1854,69 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       logger.warn({ err: error }, 'CALL_REJOIN error:');
     }
   });
+
+  // ── Appel serveur/communauté (SFU toujours) ──────────────────────────────────
+  socket.on('CALL_INITIATE_SERVER', async (data: {
+    channelId: string; serverId: string; type?: string;
+  }, callback) => {
+    try {
+      logger.info(`CALL_INITIATE_SERVER de ${userId} channel=${data.channelId} serveur=${data.serverId}`);
+
+      if (!data.channelId || !data.serverId) {
+        if (typeof callback === 'function') callback({ error: 'channelId et serverId requis' });
+        return;
+      }
+
+      // Vérifier la limite de participants du serveur
+      const limit = await serviceProxy.calls.getServerLimit(data.serverId);
+      const currentCallSockets = await io.in(`call:${data.serverId}:${data.channelId}`).fetchSockets();
+      if (currentCallSockets.length >= limit) {
+        if (typeof callback === 'function') callback({ error: 'CALL_FULL', maxParticipants: limit });
+        return;
+      }
+
+      const call = await serviceProxy.calls.createServerCall({
+        channelId: data.channelId,
+        serverId: data.serverId,
+        initiatorId: userId,
+        type: data.type || 'voice',
+      }) as { id: string; callCategory: string };
+
+      const callId = call.id;
+      socket.join(`call:${callId}`);
+
+      // Créer la salle SFU
+      try {
+        await serviceProxy.media.createRoom(callId, 'server');
+      } catch (sfuErr) {
+        logger.error('Impossible de créer la salle SFU pour appel serveur:', sfuErr);
+      }
+
+      // Notifier le canal (bannière passive, pas de dialogue modal)
+      io.to(`channel:${data.channelId}`).emit('CALL_INCOMING', {
+        type: 'CALL_INCOMING',
+        payload: {
+          callId,
+          channelId: data.channelId,
+          serverId: data.serverId,
+          callCategory: 'server',
+          isGroup: false,
+          initiatorId: userId,
+          callerName: (socket as any).user?.displayName || (socket as any).user?.username || userId,
+          callType: data.type || 'voice',
+        },
+        timestamp: new Date(),
+      });
+
+      if (typeof callback === 'function') callback({ callId, id: callId });
+    } catch (error) {
+      emitError(socket, 'CALL_ERROR', error);
+      if (typeof callback === 'function') callback({ error: 'Impossible de créer l\'appel serveur' });
+    }
+  });
+
+  // ── SFU Signaling (relay vers media-server) ────────────────────────────────
+  registerSfuHandlers(socket, io, serviceProxy);
 
   // ============ SERVEURS P2P ============
 
@@ -1670,6 +2021,87 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           timestamp: new Date(),
         });
       }
+
+      // Notifier TOUS les sockets de l'user (onglets, appareils) → mise à jour liste serveurs
+      // C'est indispensable quand le join vient de discover-server (HTTP + SERVER_JOIN socket)
+      try {
+        const serverInfo = await serviceProxy.servers.getServer(data.serverId);
+        io.to(`user:${userId}`).emit('SERVER_JOINED', {
+          type: 'SERVER_JOINED',
+          payload: {
+            id: data.serverId,
+            name: serverInfo?.name ?? '',
+            iconUrl: serverInfo?.iconUrl ?? serverInfo?.icon_url ?? undefined,
+            ownerId: serverInfo?.ownerId ?? serverInfo?.owner_id ?? undefined,
+          },
+          timestamp: new Date(),
+        });
+      } catch { /* ne pas bloquer si le fetch server échoue */ }
+    } catch (error) {
+      emitError(socket, 'SERVER_ERROR', error);
+    }
+  });
+
+  // ── SERVER_SELF_JOIN ──────────────────────────────────────────────────────
+  // Émis par le client APRÈS un join HTTP (invite-embed, handleJoin).
+  // Le gateway :
+  //   1. Vérifie la membership
+  //   2. Rejoint les rooms socket server + channels
+  //   3. Émet SERVER_ADDED à TOUS les sockets de l'user (multi-onglet/appareil)
+  socket.on('SERVER_SELF_JOIN', async (data) => {
+    try {
+      const serverId: string | undefined = data?.serverId;
+      if (!serverId) return;
+
+      // Vérifier que l'user est vraiment membre (il vient de rejoindre via HTTP)
+      const isMember = await serviceProxy.servers.isMember(serverId, userId).catch(() => false);
+      if (!isMember) {
+        socket.emit('SERVER_ERROR', { type: 'SERVER_ERROR', error: 'NOT_A_MEMBER', serverId });
+        return;
+      }
+
+      // Rejoindre les rooms socket (si pas déjà dedans)
+      socket.join(`server:${serverId}`);
+
+      let serverInfo: any = null;
+      try {
+        // Charger les channels depuis le node
+        const chResult = await forwardToNode(serverId, 'CHANNEL_LIST', {});
+        if (chResult?.channels) {
+          for (const ch of chResult.channels) {
+            socket.join(`channel:${ch.id}`);
+          }
+        }
+      } catch {
+        // Fallback microservice
+        try {
+          serverInfo = await serviceProxy.servers.getServer(serverId);
+          if (serverInfo?.channels) {
+            for (const ch of serverInfo.channels) {
+              socket.join(`channel:${ch.id}`);
+            }
+          }
+        } catch { /* ignore */ }
+      }
+
+      // Charger les infos serveur si pas encore disponibles
+      if (!serverInfo) {
+        try { serverInfo = await serviceProxy.servers.getServer(serverId); } catch { /* ignore */ }
+      }
+
+      // Notifier TOUS les sockets de l'user (onglets, appareils) → mise à jour liste serveurs
+      io.to(`user:${userId}`).emit('SERVER_JOINED', {
+        type: 'SERVER_ADDED',
+        payload: {
+          id: serverId,
+          name: serverInfo?.name ?? data?.name ?? '',
+          iconUrl: serverInfo?.iconUrl ?? serverInfo?.icon_url ?? data?.iconUrl ?? undefined,
+          ownerId: serverInfo?.ownerId ?? serverInfo?.owner_id ?? undefined,
+        },
+        timestamp: new Date(),
+      });
+
+      logger.info(`${user.username} self-joined server ${serverId} via HTTP → socket rooms updated`);
     } catch (error) {
       emitError(socket, 'SERVER_ERROR', error);
     }
@@ -1783,6 +2215,18 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         type: 'SERVER_MESSAGE_NEW',
         payload: message,
         timestamp: new Date(),
+      });
+
+      // Mentions dans les messages serveur
+      await handleServerMentions({
+        mentionedUserIds: data.mentionedUserIds,
+        senderId: userId,
+        senderName: user.displayName || user.username,
+        senderAvatar: user.avatarUrl || null,
+        channelId,
+        serverId,
+        channelName: data.channelName,
+        content: data.content as string,
       });
     } catch (error) {
       emitError(socket, 'SERVER_MESSAGE_ERROR', error);
@@ -2684,11 +3128,28 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   // Mise à jour de présence
   socket.on('PRESENCE_UPDATE', async (data) => {
     try {
-      await serviceProxy.users.updateStatus(userId, data.status, data.customStatus);
-      await redis.setUserStatus(userId, data.status, data.customStatus ?? null);
-      
+      const VALID_STATUSES = ['online', 'idle', 'dnd', 'invisible'];
+      if (!data?.status || !VALID_STATUSES.includes(data.status)) return;
+
+      const emoji: string | null = data.emoji ? String(data.emoji).trim().slice(0, 2) || null : null;
+      const text: string | null = data.text
+        ? String(data.text).trim().slice(0, 100) || null
+        : (data.customStatus ? String(data.customStatus).trim().slice(0, 100) || null : null);
+
+      await redis.setPresence(userId, {
+        status: data.status,
+        chosenStatus: data.status,
+        emoji,
+        text,
+        lastActivity: Date.now(),
+      });
+
+      // DB write fire-and-forget
+      serviceProxy.users.updateStatus(userId, data.status, text, emoji)
+        .catch((err: unknown) => logger.warn({ err }, `updateStatus DB failed for ${userId}`));
+
       const friends = await serviceProxy.friends.getFriends(userId);
-      broadcastPresenceUpdate(userId, data.status, friends, data.customStatus);
+      broadcastPresenceUpdate(userId, data.status, friends, text, emoji);
     } catch (error) {
       emitError(socket, 'PRESENCE_ERROR', error);
     }
@@ -2727,8 +3188,66 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       } catch (e) {
         logger.warn({ err: e }, 'Erreur notification profil amis:');
       }
+
+      // Notifier les membres de serveur (non-amis) via les rooms du socket
+      try {
+        for (const room of socket.rooms) {
+          if (room.startsWith('server:')) {
+            io.to(room).emit('PROFILE_UPDATE', {
+              type: 'PROFILE_UPDATE',
+              payload: { userId, ...data },
+              timestamp: new Date(),
+            });
+          }
+        }
+      } catch (e) {
+        logger.warn({ err: e }, 'Erreur notification profil serveurs:');
+      }
     } catch (error) {
       emitError(socket, 'PROFILE_UPDATE_ERROR', error);
+    }
+  });
+
+  // Changement de nom d'utilisateur via WebSocket (broadcaste le nouveau username à amis + serveurs)
+  socket.on('CHANGE_USERNAME', async (data) => {
+    try {
+      const { newUsername, password } = data || {};
+      if (!newUsername || !password) {
+        socket.emit('CHANGE_USERNAME_ERROR', { error: 'Données manquantes' });
+        return;
+      }
+      const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
+      const result = await serviceProxy.users.changeUsername(userId, newUsername, password, token) as any;
+      if (!result?.success) {
+        socket.emit('CHANGE_USERNAME_ERROR', { error: result?.error || 'Erreur lors du changement' });
+        return;
+      }
+      // Mettre à jour le user local du socket
+      Object.assign(socket as AuthenticatedSocket, { user: { ...user, username: newUsername } });
+      socket.emit('CHANGE_USERNAME_SUCCESS', { username: newUsername });
+
+      // Broadcaster le nouveau username comme un PROFILE_UPDATE à amis + serveurs
+      const usernamePayload = { userId, username: newUsername };
+      const tsNow = new Date();
+      try {
+        const friends = await serviceProxy.friends.getFriends(userId);
+        for (const friend of friends) {
+          io.to(`user:${friend.friendId || friend.id}`).emit('PROFILE_UPDATE', {
+            type: 'PROFILE_UPDATE', payload: usernamePayload, timestamp: tsNow,
+          });
+        }
+      } catch (e) { logger.warn({ err: e }, 'Erreur notif username amis:'); }
+      try {
+        for (const room of socket.rooms) {
+          if (room.startsWith('server:')) {
+            io.to(room).emit('PROFILE_UPDATE', {
+              type: 'PROFILE_UPDATE', payload: usernamePayload, timestamp: tsNow,
+            });
+          }
+        }
+      } catch (e) { logger.warn({ err: e }, 'Erreur notif username serveurs:'); }
+    } catch (error) {
+      emitError(socket, 'CHANGE_USERNAME_ERROR', error);
     }
   });
 
@@ -3080,27 +3599,54 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Notifier les amis seulement si l'utilisateur est vraiment offline
       const stillOnline = await redis.isUserOnline(userId);
       if (!stillOnline) {
+        // Préserver la clé presence (TTL 24h) pour restauration au reconnect
+        const currentPresence = await redis.getPresence(userId);
+        if (currentPresence) {
+          await redis.setPresence(userId, currentPresence);
+        }
+
         try {
           const friends = await serviceProxy.friends.getFriends(userId);
-          broadcastPresenceUpdate(userId, 'offline', friends);
+          // Broadcast aux amis seulement (plus de broadcast serveur)
+          broadcastPresenceUpdate(userId, 'offline', friends, null, null);
         } catch (friendsError) {
           logger.warn({ err: friendsError }, `Impossible de notifier les amis pour ${userId}:`);
         }
-      }
-      
-      // Mettre à jour last_seen seulement quand vraiment déconnecté
-      if (!stillOnline) {
-        try {
-          await serviceProxy.users.updateLastSeen(userId);
-        } catch (updateError) {
-          logger.warn({ err: updateError }, `Impossible de mettre à jour last_seen pour ${userId}:`);
-        }
+
+        // last_seen + is_online=FALSE fire-and-forget
+        serviceProxy.users.updateLastSeen(userId)
+          .catch((err: unknown) => logger.warn({ err }, `updateLastSeen failed for ${userId}`));
       }
     } catch (error) {
       logger.error({ err: error }, `Erreur lors de la déconnexion de ${userId}:`);
     }
   });
 });
+
+// ============ AUTO-IDLE : détection d'inactivité côté gateway ============
+
+{
+  const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+  const seen = new Set<string>();
+
+  setInterval(async () => {
+    seen.clear();
+    for (const [, client] of connectedClients) {
+      const { userId } = client as { userId: string };
+      if (!userId || seen.has(userId)) continue;
+      seen.add(userId);
+      try {
+        const p = await redis.getPresence(userId);
+        if (!p) continue;
+        if (p.chosenStatus === 'online' && p.status === 'online' && Date.now() - p.lastActivity > IDLE_TIMEOUT_MS) {
+          await redis.setPresence(userId, { ...p, status: 'idle' });
+          const idleFriends = await serviceProxy.friends.getFriends(userId);
+          broadcastPresenceUpdate(userId, 'idle', idleFriends, p.text, p.emoji);
+        }
+      } catch { /* non-bloquant */ }
+    }
+  }, 60_000);
+}
 
 // ============ SERVER NODES NAMESPACE (self-hosted) ============
 
@@ -3185,7 +3731,7 @@ serverNodesNs.on('connection', async (nodeSocket) => {
     for (let i = 0; i < 14; i++) code += chars[bytes[i] % chars.length];
     return code;
   })();
-  await redis.set(`setup_code:${serverId}`, setupCode, 900); // 15 min
+  await redis.setex(`setup_code:${serverId}`, 900, setupCode); // 15 min
   nodeSocket.emit('SETUP_CODE', { code: setupCode, serverId, expiresIn: 900 });
   logger.info(`🔑 Code admin généré pour serverId=${serverId}`);
 
@@ -3415,18 +3961,28 @@ function emitError(socket: Socket, type: string, error: unknown): void {
 async function broadcastPresenceUpdate(
   userId: string,
   status: string,
-  friends: Array<{ friendId: string }>,
-  customStatus?: string | null,
+  friends: Array<{ friendId?: string; id?: string }>,
+  text?: string | null,
+  emoji?: string | null,
 ): Promise<void> {
   // Les amis voient 'offline' quand l'utilisateur est en mode invisible
   const visibleStatus = status === 'invisible' ? 'offline' : status;
+  const presencePayload = {
+    type: 'PRESENCE_UPDATE',
+    payload: {
+      userId,
+      status: visibleStatus,
+      customStatus: text ?? null, // compat ascendante
+      text: text ?? null,
+      emoji: emoji ?? null,
+    },
+    timestamp: new Date(),
+  };
   for (const friend of friends) {
-    io.to(`user:${friend.friendId}`).emit('PRESENCE_UPDATE', {
-      type: 'PRESENCE_UPDATE',
-      payload: { userId, status: visibleStatus, customStatus: customStatus ?? null },
-      timestamp: new Date(),
-    });
+    const fid = friend.friendId ?? (friend as any).id;
+    if (fid) io.to(`user:${fid}`).emit('PRESENCE_UPDATE', presencePayload);
   }
+  // Broadcast serveur supprimé — les member-lists utilisent GET_BULK_PRESENCE à la demande
 }
 
 // ============ DÉMARRAGE ============

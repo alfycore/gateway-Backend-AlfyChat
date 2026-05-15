@@ -173,7 +173,12 @@ export function registerFriendsRoutes(app: Express): void {
         body: JSON.stringify({ userId, blockedUserId: targetId }),
       });
       const data = await safeJson(response);
-      if (response.ok) invalidateBlockCache(userId, targetId);
+      if (response.ok) {
+        invalidateBlockCache(userId, targetId);
+        // Notifier les deux parties en temps réel
+        runtime.io?.to(`user:${userId}`).emit('USER_BLOCKED', { blockedId: targetId });
+        runtime.io?.to(`user:${targetId}`).emit('YOU_WERE_BLOCKED', { byUserId: userId });
+      }
       res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
     } catch (error) {
       logger.error({ err: error }, 'Erreur blockUser:');
@@ -197,7 +202,12 @@ export function registerFriendsRoutes(app: Express): void {
         body: JSON.stringify({ userId }),
       });
       const data = await safeJson(response);
-      if (response.ok) invalidateBlockCache(userId, targetId);
+      if (response.ok) {
+        invalidateBlockCache(userId, targetId);
+        // Notifier les deux parties en temps réel
+        runtime.io?.to(`user:${userId}`).emit('USER_UNBLOCKED', { unblockedId: targetId });
+        runtime.io?.to(`user:${targetId}`).emit('YOU_WERE_UNBLOCKED', { byUserId: userId });
+      }
       res.status(response.status).json({ success: response.ok, ...((data ?? {}) as object) });
     } catch (error) {
       logger.error({ err: error }, 'Erreur unblockUser:');

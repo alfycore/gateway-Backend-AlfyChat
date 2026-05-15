@@ -11,6 +11,14 @@ export interface RedisConfig {
   password?: string;
 }
 
+export interface PresenceData {
+  status: string;       // statut calculé (peut être 'idle' si auto-idle)
+  chosenStatus: string; // choix explicite de l'utilisateur
+  emoji: string | null;
+  text: string | null;
+  lastActivity: number; // timestamp ms
+}
+
 export class RedisClient {
   private client: Redis;
   private subscriber: Redis;
@@ -55,34 +63,85 @@ export class RedisClient {
     return this.client.hget('online:users', userId);
   }
 
-  /** Stores the full presence status (online/idle/dnd/invisible) for a user. */
-  async setUserStatus(userId: string, status: string, customStatus?: string | null): Promise<void> {
-    await this.client.hset('user:status', userId, status);
-    if (customStatus !== undefined) {
-      if (customStatus === null) {
-        await this.client.hdel('user:customstatus', userId);
-      } else {
-        await this.client.hset('user:customstatus', userId, customStatus);
-      }
+  // ============ PRÉSENCE (nouveau système unifié) ============
+
+  /** Set full presence data for a user. TTL = 24h so it survives short disconnects. */
+  async setPresence(userId: string, data: Partial<PresenceData>): Promise<void> {
+    const key = `presence:${userId}`;
+    let current: PresenceData | null = null;
+    const raw = await this.client.get(key);
+    if (raw) {
+      try { current = JSON.parse(raw); } catch { /* ignore */ }
     }
+    const merged: PresenceData = {
+      status: current?.status ?? 'online',
+      chosenStatus: current?.chosenStatus ?? 'online',
+      emoji: current?.emoji ?? null,
+      text: current?.text ?? null,
+      lastActivity: current?.lastActivity ?? Date.now(),
+      ...data,
+    };
+    await this.client.setex(key, 86400, JSON.stringify(merged));
   }
 
-  /** Returns the stored presence status for a user, falling back to online/offline from Redis. */
+  /** Get full presence data for a user. Returns null if absent. */
+  async getPresence(userId: string): Promise<PresenceData | null> {
+    const raw = await this.client.get(`presence:${userId}`);
+    if (!raw) return null;
+    try { return JSON.parse(raw) as PresenceData; } catch { return null; }
+  }
+
+  /** Update only lastActivity timestamp (called from HEARTBEAT). */
+  async touchActivity(userId: string): Promise<void> {
+    const key = `presence:${userId}`;
+    const raw = await this.client.get(key);
+    if (!raw) return;
+    try {
+      const p: PresenceData = JSON.parse(raw);
+      p.lastActivity = Date.now();
+      await this.client.setex(key, 86400, JSON.stringify(p));
+    } catch { /* ignore */ }
+  }
+
+  /** @deprecated Utiliser setPresence() à la place. Conservé pour compatibilité transitoire. */
+  async setUserStatus(userId: string, status: string, customStatus?: string | null): Promise<void> {
+    await this.setPresence(userId, {
+      status,
+      chosenStatus: status,
+      text: customStatus ?? null,
+      lastActivity: Date.now(),
+    });
+  }
+
+  /** @deprecated Utiliser getPresence() à la place. */
   async getUserStatus(userId: string): Promise<{ status: string; customStatus: string | null }> {
     const isOnline = await this.isUserOnline(userId);
     if (!isOnline) return { status: 'offline', customStatus: null };
-    const status = (await this.client.hget('user:status', userId)) || 'online';
-    const customStatus = (await this.client.hget('user:customstatus', userId)) ?? null;
-    return { status, customStatus };
+    const p = await this.getPresence(userId);
+    return { status: p?.status ?? 'online', customStatus: p?.text ?? null };
   }
 
-  /** Returns presence info for multiple users at once. */
-  async getBulkPresence(userIds: string[]): Promise<Array<{ userId: string; status: string; customStatus: string | null }>> {
+  /** Returns presence info for multiple users — uses Redis pipeline (2 cmds per user). */
+  async getBulkPresence(userIds: string[]): Promise<Array<{ userId: string; status: string; customStatus: string | null; emoji: string | null }>> {
     if (userIds.length === 0) return [];
-    return Promise.all(userIds.map(async (userId) => {
-      const { status, customStatus } = await this.getUserStatus(userId);
-      return { userId, status, customStatus };
-    }));
+    const pipeline = this.client.multi();
+    for (const uid of userIds) {
+      pipeline.get(`presence:${uid}`);
+      pipeline.scard(`user:sockets:${uid}`);
+    }
+    const results = await pipeline.exec();
+    return userIds.map((userId, i) => {
+      const raw = results?.[i * 2]?.[1] as string | null;
+      const scount = (results?.[i * 2 + 1]?.[1] as number) || 0;
+      if (!raw || scount === 0) return { userId, status: 'offline', customStatus: null, emoji: null };
+      try {
+        const p: PresenceData = JSON.parse(raw);
+        const visibleStatus = p.status === 'invisible' ? 'offline' : p.status;
+        return { userId, status: visibleStatus, customStatus: p.text, emoji: p.emoji };
+      } catch {
+        return { userId, status: 'offline', customStatus: null, emoji: null };
+      }
+    });
   }
 
   async setSession(userId: string, sessionId: string, data: object, ttl = 86400): Promise<void> {
