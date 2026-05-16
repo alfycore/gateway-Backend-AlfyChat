@@ -297,6 +297,9 @@ app.post('/api/servers/:serverId/claim-admin', async (req: express.Request, res:
   }
 });
 registerServersRoutes(app);
+// Routes OAuth2 (avant /api/bots pour éviter les conflits de pattern)
+app.all('/api/oauth2/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL, 'bots'));
+app.all('/api/oauth2', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL, 'bots'));
 // Routes Bots
 app.all('/api/bots/*', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL, 'bots'));
 app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL), req, res, BOTS_URL, 'bots'));
@@ -1218,6 +1221,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     if (roomId) {
       await socket.join(`conversation:${roomId}`);
       socket.emit('conversation:joined', { conversationId: roomId });
+      // Informer l'utilisateur d'un appel de groupe actif en cours
+      if (!roomId.startsWith('dm_')) {
+        try {
+          const activeCallRaw = await redis.get(`call:active:group:${roomId}`);
+          if (activeCallRaw) {
+            socket.emit('CALL_ACTIVE', JSON.parse(activeCallRaw));
+          }
+        } catch { /* non bloquant */ }
+      }
     }
   });
 
@@ -1589,6 +1601,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       socket.to(`channel:${data.channelId}`).emit('CALL_INCOMING', incomingGroupPayload);
       socket.to(`conversation:${data.channelId}`).emit('CALL_INCOMING', incomingGroupPayload);
 
+      // Persister l'appel actif pour les membres qui rejoignent après le démarrage
+      try {
+        await redis.set(`call:active:group:${data.channelId}`, JSON.stringify({ ...callPayload, callCategory: 'group' }), 4 * 3600);
+        await redis.set(`call:channel:${callId}`, data.channelId, 4 * 3600);
+      } catch { /* non bloquant */ }
+
       logger.info(`Appel groupe créé: ${callId} channel=${data.channelId}`);
     } catch (error) {
       emitError(socket, 'CALL_ERROR', error);
@@ -1762,6 +1780,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
           payload: { callId: data.callId },
           timestamp: new Date(),
         });
+        // Nettoyer l'appel actif Redis + notifier les observateurs
+        try {
+          const channelId = await redis.get(`call:channel:${data.callId}`);
+          if (channelId) {
+            await redis.del(`call:active:group:${channelId}`);
+            await redis.del(`call:channel:${data.callId}`);
+            io.to(`conversation:${channelId}`).emit('CALL_ACTIVE_ENDED', { callId: data.callId });
+          }
+        } catch { /* non bloquant */ }
       }
       logger.info(`${userId} a quitté l'appel ${data.callId}`);
     } catch (error) {
@@ -1779,6 +1806,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       });
       // Éjecter tous les sockets de la room
       io.socketsLeave(`call:${data.callId}`);
+      // Nettoyer l'appel actif Redis + notifier les observateurs
+      try {
+        const channelId = await redis.get(`call:channel:${data.callId}`);
+        if (channelId) {
+          await redis.del(`call:active:group:${channelId}`);
+          await redis.del(`call:channel:${data.callId}`);
+          io.to(`conversation:${channelId}`).emit('CALL_ACTIVE_ENDED', { callId: data.callId });
+        }
+      } catch { /* non bloquant */ }
     } catch (error) {
       emitError(socket, 'CALL_ERROR', error);
     }
