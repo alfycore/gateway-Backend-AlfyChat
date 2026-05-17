@@ -973,6 +973,21 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
             recipientName: user.displayName || user.username,
             recipientAvatar: user.avatarUrl || null,
           });
+
+          // Destinataire hors-ligne → push notification
+          if (!recipientUserRoom || recipientUserRoom.size === 0) {
+            const preview = data.content && !data.content.startsWith('ecdh:')
+              ? (data.content.length > 80 ? data.content.slice(0, 80) + '…' : data.content)
+              : '📎 Nouveau message';
+            serviceProxy.users.sendPushNotification({
+              userId: data.recipientId,
+              title: user.displayName || user.username,
+              body: preview,
+              url: `/channels/me/${userId}`,
+              type: 'message',
+              conversationKey: userId,
+            });
+          }
         }
 
         // Filet de sécurité SENDER : envoyer à tous les autres appareils de l'expéditeur
@@ -1075,6 +1090,14 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
               } else {
                 redis.addPendingPing(mentionedId, conversationId, senderName).catch(() => {});
                 serviceProxy.messages.saveNotification(mentionedId, conversationId, senderName, userId, 'mention').catch(() => {});
+                serviceProxy.users.sendPushNotification({
+                  userId: mentionedId,
+                  title: `${senderName} vous a mentionné`,
+                  body: mentionPayload.payload.preview || 'Nouvelle mention',
+                  url: `/channels/me`,
+                  type: 'mention',
+                  conversationKey: conversationId,
+                });
               }
             }).catch(() => {});
           }

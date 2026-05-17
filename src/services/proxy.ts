@@ -275,6 +275,24 @@ class UsersProxy {
       token,
     });
   }
+
+  async sendPushNotification(payload: {
+    userId: string;
+    title: string;
+    body: string;
+    url?: string;
+    type?: string;
+    conversationKey?: string;
+  }): Promise<void> {
+    try {
+      await fetchService(`${this.baseUrl}/push/send`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // Fire-and-forget — ne pas bloquer l'envoi du message
+    }
+  }
 }
 
 // ============ MESSAGES PROXY ============
