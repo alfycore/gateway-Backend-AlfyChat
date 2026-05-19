@@ -375,6 +375,10 @@ class MessagesProxy {
     });
   }
 
+  async getConversationParticipants(conversationId: string): Promise<Array<{ userId: string }>> {
+    return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants`);
+  }
+
   async addParticipant(conversationId: string, userId: string, token?: string) {
     return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants`, {
       method: 'POST',

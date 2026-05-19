@@ -1015,6 +1015,32 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         }
       }
 
+      // Groupe hors-ligne → push notification pour chaque participant absent de la room
+      if (!data.recipientId && !conversationId.startsWith('dm_')) {
+        const convRoom = io.sockets.adapter.rooms.get(`conversation:${conversationId}`);
+        const senderName = user.displayName || user.username;
+        const preview = data.content && !(data.content as string).startsWith('ecdh:')
+          ? ((data.content as string).length > 80 ? (data.content as string).slice(0, 80) + '…' : data.content as string)
+          : '📎 Nouveau message';
+        serviceProxy.messages.getConversationParticipants(conversationId).then((result: any) => {
+          const participants: Array<{ userId: string }> = result?.participants ?? result ?? [];
+          for (const p of participants) {
+            if (p.userId === userId) continue;
+            const participantRoom = io.sockets.adapter.rooms.get(`user:${p.userId}`);
+            if (!participantRoom || participantRoom.size === 0) {
+              serviceProxy.users.sendPushNotification({
+                userId: p.userId,
+                title: senderName,
+                body: preview,
+                url: `/channels/me/${conversationId}`,
+                type: 'message',
+                conversationKey: conversationId,
+              });
+            }
+          }
+        }).catch(() => {});
+      }
+
       // ── ÉTAPE 3 : Confirmer à l'expéditeur IMMÉDIATEMENT ──
       socket.emit('message:sent', { success: true, message: messageForClient });
 
