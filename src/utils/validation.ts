@@ -190,10 +190,18 @@ export function validateProfile(data: any): Record<string, unknown> {
   // Champs pass-through sûrs (booléens, couleurs, etc.)
   if (data.cardColor !== undefined) out.cardColor = String(data.cardColor).slice(0, 16);
   if (data.showBadges !== undefined) out.showBadges = validateBool(data.showBadges, 'showBadges');
+  const hiddenBadgeIds = validateStringArray(data.hiddenBadgeIds, {
+    field: 'hiddenBadgeIds',
+    max: 50,
+    itemMin: 1,
+    itemMax: 64,
+    dedupe: true,
+  });
+  if (hiddenBadgeIds !== undefined) out.hiddenBadgeIds = hiddenBadgeIds;
   return out;
 }
 
-export function validateGroupInput(data: any): { name?: string; avatarUrl?: string; participantIds?: string[]; addParticipants?: string[]; removeParticipants?: string[] } {
+export function validateGroupInput(data: any): { name?: string; avatarUrl?: string; participantIds?: string[]; addParticipants?: string[]; removeParticipants?: string[]; isOpen?: boolean } {
   const out: any = {};
   out.name = validateText(data.name, { field: 'name', ...LIMITS.groupName, required: !data.groupId });
   const av = validateUrl(data.avatarUrl, 'avatarUrl');
@@ -205,6 +213,7 @@ export function validateGroupInput(data: any): { name?: string; avatarUrl?: stri
       out[key] = data[key].filter((x: unknown) => typeof x === 'string');
     }
   }
+  if (data.isOpen !== undefined) out.isOpen = validateBool(data.isOpen, 'isOpen');
   return out;
 }
 

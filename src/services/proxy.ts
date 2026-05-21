@@ -358,7 +358,7 @@ class MessagesProxy {
     });
   }
 
-  async createConversation(data: { type: string; name?: string; avatarUrl?: string; participants: string[]; createdBy: string }) {
+  async createConversation(data: { type: string; name?: string; avatarUrl?: string; participants: string[]; createdBy: string; isOpen?: boolean }) {
     // Le service messages attend 'participantIds', pas 'participants'
     const { participants, createdBy, ...rest } = data;
     return fetchService(`${this.baseUrl}/conversations`, {
@@ -367,7 +367,7 @@ class MessagesProxy {
     });
   }
 
-  async updateConversation(conversationId: string, data: { name?: string; avatarUrl?: string }, token?: string) {
+  async updateConversation(conversationId: string, data: { name?: string; avatarUrl?: string; isOpen?: boolean }, token?: string) {
     return fetchService(`${this.baseUrl}/conversations/${conversationId}`, {
       method: 'PATCH',
       body: JSON.stringify(data),

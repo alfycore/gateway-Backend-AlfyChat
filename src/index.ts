@@ -3345,10 +3345,11 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const name = clean.name;
       const avatarUrl = clean.avatarUrl;
       const participantIds: string[] = clean.participantIds || data.participantIds || [];
+      const isOpen = clean.isOpen !== false;
 
       // Inclure le créateur dans les participants
       const allParticipants = [userId, ...participantIds.filter((id: string) => id !== userId)];
-      
+
       // Créer la conversation de groupe via le service messages
       const group = await serviceProxy.messages.createConversation({
         type: 'group',
@@ -3356,6 +3357,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         avatarUrl,
         participants: allParticipants,
         createdBy: userId,
+        isOpen,
       });
 
       const groupId = (group as any).id;
@@ -3399,11 +3401,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const avatarUrl = clean.avatarUrl;
       const addParticipants = clean.addParticipants;
       const removeParticipants = clean.removeParticipants;
+      const isOpen = clean.isOpen;
       const token: string | undefined = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
 
-      // Mettre à jour nom/avatar via service messages
-      if (name !== undefined || avatarUrl !== undefined) {
-        await serviceProxy.messages.updateConversation(groupId, { name, avatarUrl }, token);
+      // Mettre à jour nom/avatar/isOpen via service messages
+      if (name !== undefined || avatarUrl !== undefined || isOpen !== undefined) {
+        await serviceProxy.messages.updateConversation(groupId, { name, avatarUrl, isOpen }, token);
       }
 
       // Ajouter des participants
@@ -3445,7 +3448,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Notifier tous les membres restants
       io.to(`conversation:${groupId}`).emit('GROUP_UPDATE', {
         type: 'GROUP_UPDATE',
-        payload: { groupId, name, avatarUrl, addParticipants, removeParticipants, updatedBy: userId },
+        payload: { groupId, name, avatarUrl, isOpen, addParticipants, removeParticipants, updatedBy: userId },
         timestamp: new Date(),
       });
 
