@@ -59,6 +59,7 @@ import { registerFriendsRoutes } from './http/friends.routes';
 import { registerServersRoutes } from './http/servers.routes';
 import { registerMediaRoutes } from './http/media.routes';
 import { registerHealthRoutes } from './http/health.routes';
+import { registerStatsRoutes } from './http/stats.routes';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { RateLimiterRedis } from 'rate-limiter-flexible';
 
@@ -235,6 +236,7 @@ app.all('/api/rgpd/*', (req, res) => proxyRequest(getServiceUrl('users', USERS_U
 // ============ ROUTE MODULES ============
 registerInternalRoutes(app);
 registerLBRoutes(app);
+registerStatsRoutes(app);
 
 registerAdminRoutes(app);
 
