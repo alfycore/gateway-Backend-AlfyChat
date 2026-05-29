@@ -4,7 +4,15 @@ import { connectedClients } from '../state/connections';
 import { INTERNAL_SECRET, USERS_URL, SERVERS_URL } from '../config/env';
 
 const CACHE_TTL = 60_000; // 1 min
-let cache: { data: object; ts: number } | null = null;
+interface StatsData {
+  totalUsers: number | null;
+  onlineUsers: number;
+  totalServers: number | null;
+  totalMembers: number | null;
+  connectedWS: number;
+  generatedAt: string;
+}
+let cache: { data: StatsData; ts: number } | null = null;
 
 export function registerStatsRoutes(app: Express): void {
   /**
