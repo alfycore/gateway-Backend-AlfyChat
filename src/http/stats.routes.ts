@@ -34,8 +34,8 @@ export function registerStatsRoutes(app: Express): void {
       fetch(`${getServiceUrl('servers', SERVERS_URL)}/servers/internal/stats`, { headers }),
     ]);
 
-    const users   = usersRes.status   === 'fulfilled' && usersRes.value.ok   ? await usersRes.value.json()   : null;
-    const servers = serversRes.status === 'fulfilled' && serversRes.value.ok ? await serversRes.value.json() : null;
+    const users   = usersRes.status   === 'fulfilled' && usersRes.value.ok   ? await usersRes.value.json()   as any : null;
+    const servers = serversRes.status === 'fulfilled' && serversRes.value.ok ? await serversRes.value.json() as any : null;
 
     const data = {
       totalUsers:    users?.totalUsers    ?? null,
