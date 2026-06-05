@@ -4,6 +4,7 @@
 // ==========================================
 
 import express from 'express';
+import path from 'path';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
 import cors from 'cors';
@@ -4168,6 +4169,23 @@ httpServer.listen(PORT, async () => {
 });
 
 // Gestion de l'arrêt gracieux
+// -- HTML error pages (browser content-negotiation) --------------------------
+app.get('/', (req, res, next) => {
+  if (req.accepts(['html', 'json']) === 'html')
+    return res.sendFile(path.join(__dirname, '../public/index.html'));
+  next();
+});
+app.use((req, res) => {
+  if (req.accepts(['html', 'json']) === 'html')
+    return res.status(404).sendFile(path.join(__dirname, '../public/errors/404.html'));
+  res.status(404).json({ error: 'Route not found', path: req.path });
+});
+app.use((err: any, req: any, res: any, _next: any) => {
+  if (req.accepts(['html', 'json']) === 'html')
+    return res.status(500).sendFile(path.join(__dirname, '../public/errors/500.html'));
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 process.on('SIGTERM', async () => {
   logger.info('Signal SIGTERM reçu, arrêt gracieux...');
   

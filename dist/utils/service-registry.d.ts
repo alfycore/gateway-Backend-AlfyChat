@@ -1,0 +1,2 @@
+export { lbRegistry as serviceRegistry, lbRegistry, generateServiceKey, hashServiceKey, type ServiceType, type ServiceMetrics, type ServiceEntry as ServiceInstance, type ServiceStatus, } from '../lb/registry';
+//# sourceMappingURL=service-registry.d.ts.map

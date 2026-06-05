@@ -1,0 +1,1 @@
+{"version":3,"file":"service-registry.d.ts","sourceRoot":"","sources":["../../src/utils/service-registry.ts"],"names":[],"mappings":"AACA,OAAO,EACL,UAAU,IAAI,eAAe,EAC7B,UAAU,EACV,kBAAkB,EAClB,cAAc,EACd,KAAK,WAAW,EAChB,KAAK,cAAc,EACnB,KAAK,YAAY,IAAI,eAAe,EACpC,KAAK,aAAa,GACnB,MAAM,gBAAgB,CAAC"}

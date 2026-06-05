@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlfyChat API — v1</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Krona+One&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root, .light, [data-theme="light"] {
+      --accent: oklch(53.54% 0.2791 289.47);
+      --accent-foreground: oklch(99.11% 0 0);
+      --accent-soft: color-mix(in oklab, var(--accent) 15%, transparent);
+      --background: oklch(97.02% 0.0094 289.47);
+      --border: oklch(90.00% 0.0094 289.47);
+      --danger: oklch(65.32% 0.2372 30.02);
+      --danger-soft: color-mix(in oklab, var(--danger) 15%, transparent);
+      --foreground: oklch(21.03% 0.0094 289.47);
+      --muted: oklch(55.17% 0.0188 289.47);
+      --separator: oklch(92.00% 0.0094 289.47);
+      --success: oklch(73.29% 0.1971 155.09);
+      --success-foreground: oklch(21.03% 0.0059 155.09);
+      --success-soft: color-mix(in oklab, var(--success) 15%, transparent);
+      --surface: oklch(100.00% 0.0047 289.47);
+      --surface-secondary: oklch(95.24% 0.0075 289.47);
+      --surface-tertiary: oklch(93.73% 0.0075 289.47);
+      --warning: oklch(78.19% 0.1615 76.61);
+      --warning-soft: color-mix(in oklab, var(--warning) 15%, transparent);
+      --radius: 0.25rem;
+      --field-radius: 0.75rem;
+    }
+
+    .dark, [data-theme="dark"] {
+      color-scheme: dark;
+      --accent: oklch(53.54% 0.2791 289.47);
+      --accent-foreground: oklch(99.11% 0 0);
+      --accent-soft: color-mix(in oklab, var(--accent) 15%, transparent);
+      --background: oklch(12.00% 0.0094 289.47);
+      --border: oklch(28.00% 0.0094 289.47);
+      --danger: oklch(59.40% 0.2004 28.91);
+      --danger-soft: color-mix(in oklab, var(--danger) 15%, transparent);
+      --foreground: oklch(99.11% 0.0094 289.47);
+      --muted: oklch(70.50% 0.0188 289.47);
+      --separator: oklch(25.00% 0.0094 289.47);
+      --success: oklch(73.29% 0.1971 155.09);
+      --success-foreground: oklch(21.03% 0.0059 155.09);
+      --success-soft: color-mix(in oklab, var(--success) 15%, transparent);
+      --surface: oklch(21.03% 0.0188 289.47);
+      --surface-secondary: oklch(25.70% 0.0141 289.47);
+      --surface-tertiary: oklch(27.21% 0.0141 289.47);
+      --warning: oklch(82.03% 0.1414 80.62);
+      --warning-soft: color-mix(in oklab, var(--warning) 15%, transparent);
+      --radius: 0.25rem;
+      --field-radius: 0.75rem;
+    }
+
+    html, body { height: 100%; }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--background);
+      color: var(--foreground);
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Header ── */
+    .header {
+      justify-content: center;
+      
+      padding: 4rem clamp(2rem, 10vw, 8rem) 3.5rem;
+      border-bottom: 1px solid var(--separator);
+      background: var(--surface);
+      height: 100%;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--success-soft);
+      border: 1px solid color-mix(in oklab, var(--success) 30%, transparent);
+      border-radius: 9999px;
+      padding: 0.3rem 0.875rem;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--success);
+      margin-bottom: 2rem;
+    }
+    .status-dot {
+      width: 6px; height: 6px;
+      border-radius: 9999px;
+      background: currentColor;
+    }
+    @keyframes pulse-green {
+      0%,100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .status-dot { animation: pulse-green 2.5s ease-in-out infinite; }
+
+    .api-label {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+      opacity: 0.6;
+      margin-bottom: 0.875rem;
+      letter-spacing: 0.05em;
+    }
+
+    .api-title {
+      font-family: 'Krona One', sans-serif;
+      font-size: clamp(2.5rem, 6vw, 5rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1;
+      color: var(--foreground);
+      margin-bottom: 1.25rem;
+    }
+
+    .api-title span {
+      color: var(--accent);
+    }
+
+    .api-desc {
+      font-size: clamp(0.9rem, 1.5vw, 1.0625rem);
+      color: var(--muted);
+      line-height: 1.65;
+      max-width: 54ch;
+    }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      margin-top: 2rem;
+      flex-wrap: wrap;
+    }
+    .meta-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+      opacity: 0.55;
+    }
+
+
+
+    .section-header {
+      
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .section-label {
+      font-size: 0.6875rem;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      opacity: 0.5;
+    }
+    .section-count {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.6875rem;
+      color: var(--accent);
+      opacity: 0.7;
+    }
+
+    /* ── Grid ── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 0.875rem;
+    }
+
+    .service-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--field-radius) * 1.1);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.625rem;
+      transition: border-color 200ms, background 200ms;
+      cursor: default;
+    }
+    .service-card:hover {
+      border-color: color-mix(in oklab, var(--accent) 35%, var(--border));
+      background: var(--surface-secondary);
+    }
+
+    .service-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+
+    .service-left {
+      display: flex;
+      align-items: center;
+      gap: 0.625rem;
+    }
+
+    .service-icon {
+      width: 32px; height: 32px;
+      border-radius: var(--radius);
+      background: var(--accent-soft);
+      border: 1px solid color-mix(in oklab, var(--accent) 20%, transparent);
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      color: var(--accent);
+    }
+    .service-icon.green {
+      background: var(--success-soft);
+      border-color: color-mix(in oklab, var(--success) 20%, transparent);
+      color: var(--success);
+    }
+    .service-icon.warn {
+      background: var(--warning-soft);
+      border-color: color-mix(in oklab, var(--warning) 20%, transparent);
+      color: var(--warning);
+    }
+    .service-icon.red {
+      background: var(--danger-soft);
+      border-color: color-mix(in oklab, var(--danger) 20%, transparent);
+      color: var(--danger);
+    }
+
+    .service-name {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      color: var(--foreground);
+    }
+
+    .port-chip {
+      font-family: 'JetBrains Mono', ui-monospace, monospace;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid color-mix(in oklab, var(--accent) 22%, transparent);
+      border-radius: var(--radius);
+      padding: 0.2rem 0.5rem;
+      white-space: nowrap;
+      flex-shrink: 0;
+      align-self: flex-start;
+    }
+    .port-chip.green {
+      background: var(--success-soft);
+      color: var(--success);
+      border-color: color-mix(in oklab, var(--success) 22%, transparent);
+    }
+    .port-chip.muted {
+      background: transparent;
+      color: var(--muted);
+      border-color: var(--border);
+      opacity: 0.7;
+    }
+
+    .category-tag {
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: var(--muted);
+      opacity: 0.5;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-left: calc(32px + 0.625rem);
+    }
+
+    .service-desc {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .service-footer {
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+      margin-top: 0.25rem;
+    }
+    .online-dot {
+      width: 6px; height: 6px;
+      border-radius: 9999px;
+      background: var(--success);
+      flex-shrink: 0;
+    }
+    .online-dot.unknown {
+      background: var(--muted);
+      opacity: 0.4;
+    }
+    .online-label {
+      font-size: 0.6875rem;
+      color: var(--muted);
+      opacity: 0.5;
+    }
+
+    /* Divider between sections */
+    .section-sep {
+      height: 1px;
+      background: var(--separator);
+      margin: 2.5rem 0;
+    }
+
+    /* ── Footer ── */
+    .footer {
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--muted);
+      opacity: 0.3;
+      padding: 1.25rem;
+      border-top: 1px solid var(--separator);
+      background: var(--surface);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="status-pill">
+      <span class="status-dot"></span>
+      All systems operational
+    </div>
+
+    <div class="api-label">GET / · AlfyChat API</div>
+    <h1 class="api-title">Alfy<span>Chat</span> API</h1>
+    <p class="api-desc">Real-time messaging platform API. Handles authentication, messaging, calls, server communities, and media delivery across a distributed microservice architecture.</p>
+
+    <div class="header-meta">
+      <span class="meta-chip">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>
+        version 1.0
+      </span>
+      <span class="meta-chip">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        Socket.IO · REST
+      </span>
+      <span class="meta-chip">
+        <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/></svg>
+        <span id="hostname">localhost</span>
+      </span>
+    </div>
+  </header>
+
+ 
+  <footer class="footer">
+    AlfyChat API &mdash; v1 &nbsp;&middot;&nbsp; <span id="ts"></span>
+  </footer>
+
+  <script>
+    document.getElementById('hostname').textContent = window.location.hostname;
+    document.getElementById('ts').textContent = new Date().toISOString().slice(0, 10);
+  </script>
+</body>
+</html>

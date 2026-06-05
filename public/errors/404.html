@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>404 — Not Found · AlfyChat API</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Krona+One&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root,
+    .light,
+    [data-theme="light"] {
+      --accent: oklch(53.54% 0.2791 289.47);
+      --accent-foreground: oklch(99.11% 0 0);
+      --accent-soft: color-mix(in oklab, var(--accent) 15%, transparent);
+      --background: oklch(97.02% 0.0094 289.47);
+      --border: oklch(90.00% 0.0094 289.47);
+      --danger: oklch(65.32% 0.2372 30.02);
+      --danger-foreground: oklch(99.11% 0 0);
+      --danger-soft: color-mix(in oklab, var(--danger) 15%, transparent);
+      --foreground: oklch(21.03% 0.0094 289.47);
+      --muted: oklch(55.17% 0.0188 289.47);
+      --separator: oklch(92.00% 0.0094 289.47);
+      --success: oklch(73.29% 0.1971 155.09);
+      --success-soft: color-mix(in oklab, var(--success) 15%, transparent);
+      --surface: oklch(100.00% 0.0047 289.47);
+      --surface-secondary: oklch(95.24% 0.0075 289.47);
+      --surface-tertiary: oklch(93.73% 0.0075 289.47);
+      --warning: oklch(78.19% 0.1615 76.61);
+      --radius: 0.25rem;
+      --field-radius: 0.75rem;
+      --overlay-shadow: 0 0 0 1px oklch(0% 0 0 / 0.06) inset;
+    }
+
+    .dark,
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --accent: oklch(53.54% 0.2791 289.47);
+      --accent-foreground: oklch(99.11% 0 0);
+      --accent-soft: color-mix(in oklab, var(--accent) 15%, transparent);
+      --background: oklch(12.00% 0.0094 289.47);
+      --border: oklch(28.00% 0.0094 289.47);
+      --danger: oklch(59.40% 0.2004 28.91);
+      --danger-foreground: oklch(99.11% 0 0);
+      --danger-soft: color-mix(in oklab, var(--danger) 15%, transparent);
+      --foreground: oklch(99.11% 0.0094 289.47);
+      --muted: oklch(70.50% 0.0188 289.47);
+      --separator: oklch(25.00% 0.0094 289.47);
+      --success: oklch(73.29% 0.1971 155.09);
+      --success-soft: color-mix(in oklab, var(--success) 15%, transparent);
+      --surface: oklch(21.03% 0.0188 289.47);
+      --surface-secondary: oklch(25.70% 0.0141 289.47);
+      --surface-tertiary: oklch(27.21% 0.0141 289.47);
+      --warning: oklch(82.03% 0.1414 80.62);
+      --radius: 0.25rem;
+      --field-radius: 0.75rem;
+      --overlay-shadow: 0 0 1px 0 oklch(100% 0 0 / 0.3) inset;
+    }
+
+    html, body {
+      height: 100%;
+    }
+
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--background);
+      color: var(--foreground);
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .page {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+    }
+
+    /* Card */
+    .card {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: flex-start;
+      padding: 5rem clamp(2rem, 10vw, 8rem);
+      background: var(--surface);
+      border: none;
+      border-radius: 0;
+    }
+
+    /* Badge */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--accent-soft);
+      border: 1px solid color-mix(in oklab, var(--accent) 30%, transparent);
+      border-radius: 9999px;
+      padding: 0.35rem 1rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 2.5rem;
+    }
+    .badge-dot {
+      width: 7px; height: 7px;
+      border-radius: 9999px;
+      background: currentColor;
+      opacity: 0.8;
+    }
+
+    /* Code */
+    .code-number {
+      font-family: 'Krona One', sans-serif;
+      font-size: clamp(6rem, 14vw, 12rem);
+      font-weight: 400;
+      line-height: 1;
+      letter-spacing: -0.03em;
+      color: var(--foreground);
+      margin-bottom: 1rem;
+    }
+
+    h1 {
+      font-family: 'Krona One', sans-serif;
+      font-size: clamp(1.1rem, 2.5vw, 1.5rem);
+      font-weight: 400;
+      color: var(--foreground);
+      margin-bottom: 0.75rem;
+    }
+    p {
+      font-size: clamp(0.9rem, 1.5vw, 1.0625rem);
+      color: var(--muted);
+      line-height: 1.65;
+      max-width: 42ch;
+    }
+
+    /* Separator */
+    .sep {
+      height: 1px;
+      background: var(--separator);
+      margin: 2.5rem 0;
+      max-width: 520px;
+    }
+
+    /* Debug block */
+    .debug {
+      background: color-mix(in oklab, var(--background) 60%, var(--surface));
+      border: 1px solid var(--border);
+      border-radius: var(--field-radius);
+      padding: 1.25rem 1.5rem;
+      font-family: 'SF Mono', ui-monospace, monospace;
+      font-size: 0.8125rem;
+      margin-bottom: 2rem;
+      max-width: 520px;
+    }
+    .debug-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+      margin-bottom: 1rem;
+    }
+    .dot { width: 11px; height: 11px; border-radius: 9999px; }
+    .dot-r { background: var(--danger) / 0.6; background: color-mix(in oklab, var(--danger) 60%, transparent); }
+    .dot-y { background: color-mix(in oklab, var(--warning) 60%, transparent); }
+    .dot-g { background: color-mix(in oklab, var(--success) 60%, transparent); }
+    .debug-label { margin-left: 0.5rem; color: var(--muted); opacity: 0.4; font-size: 0.6875rem; }
+    .debug-row { display: flex; gap: 1rem; margin-bottom: 0.5rem; }
+    .debug-key { color: var(--muted); opacity: 0.5; width: 5rem; flex-shrink: 0; }
+    .debug-val-accent { color: var(--accent); }
+    .debug-val-muted { color: var(--muted); }
+    .debug-val-warn { color: var(--warning); }
+
+    /* Buttons */
+    .actions { display: flex; gap: 0.875rem; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.625rem 1.25rem;
+      border-radius: var(--field-radius);
+      font-size: 0.9375rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      text-decoration: none;
+      transition: background 150ms, color 150ms, border-color 150ms;
+      font-family: inherit;
+    }
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .btn-ghost:hover {
+      background: var(--surface-secondary);
+      color: var(--foreground);
+      border-color: var(--surface-tertiary);
+    }
+    .btn-accent {
+      background: var(--accent);
+      color: var(--accent-foreground);
+    }
+    .btn-accent:hover {
+      background: color-mix(in oklab, var(--accent) 88%, var(--accent-foreground) 12%);
+    }
+    .btn svg { flex-shrink: 0; }
+
+    /* Footer */
+    .footer {
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--muted);
+      opacity: 0.35;
+      padding: 1rem;
+      border-top: 1px solid var(--separator);
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="card">
+      <div class="badge">
+        <span class="badge-dot"></span>
+        HTTP 404
+      </div>
+
+      <div class="code-number">404</div>
+      <h1>Route not found</h1>
+      <p>The endpoint you requested does not exist on this service. Check the path and HTTP method.</p>
+
+      <div class="sep"></div>
+
+      <div class="debug">
+        <div class="debug-bar">
+          <span class="dot dot-r"></span>
+          <span class="dot dot-y"></span>
+          <span class="dot dot-g"></span>
+          <span class="debug-label">request</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-key">METHOD</span>
+          <span class="debug-val-warn" id="method">GET</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-key">PATH</span>
+          <span class="debug-val-accent" id="path">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-key">HOST</span>
+          <span class="debug-val-muted" id="host">—</span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-ghost" onclick="history.back()">
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+          </svg>
+          Back
+        </button>
+        <a href="/" class="btn btn-accent">
+          API root
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+          </svg>
+        </a>
+      </div>
+    </div>
+    <div class="footer">AlfyChat API &mdash; v1</div>
+  </div>
+
+  <script>
+    document.getElementById('path').textContent = window.location.pathname || '/';
+    document.getElementById('host').textContent = window.location.hostname;
+  </script>
+</body>
+</html>
