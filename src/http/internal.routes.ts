@@ -6,7 +6,7 @@ import { logger } from '../utils/logger';
 import { validateServiceSecret, bannedServiceIds, allowedServiceIds } from '../state/service-keys';
 import { INTERNAL_SECRET, IP_ENDPOINT_RE } from '../config/env';
 
-function safeCompare(a: string, b: string): boolean {
+function safeCompare(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
