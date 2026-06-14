@@ -192,12 +192,14 @@ async function fetchService<T = unknown>(url: string, options?: RequestInit & { 
   return fetchWithFailover<T>(url, null, options);
 }
 
-// Résout dynamiquement l'endpoint d'un service depuis le registry (en priorité sur l'env var).
-// Si le registry n'a aucune instance saine pour ce type, retourne le fallback.
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// En production, le LB est la seule source de vérité — pas de fallback .env.
+// En dev / test, fallback sur l'URL fournie si le LB n'a pas d'instance saine.
 function resolveServiceUrl(serviceType: ServiceType, fallbackUrl: string): string {
   const best = serviceRegistry.selectBest(serviceType);
   if (best) return best.endpoint;
-  return fallbackUrl;
+  return IS_PRODUCTION ? '' : fallbackUrl;
 }
 
 export class ServiceProxy {

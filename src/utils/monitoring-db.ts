@@ -223,6 +223,35 @@ class MonitoringDB {
         logger.info('MonitoringDB: migration m004 — colonne gateway_id ajoutée');
       }
 
+      // Migration m005 : s'assurer que les deux serveurs (talos + 1) ont bien leurs entrées.
+      // talos = serveur principal, 1.* = second serveur — les deux coexistent.
+      const [m005] = await conn.execute<mysql.RowDataPacket[]>(
+        `SELECT id FROM gateway_migrations WHERE id = 'm005-talos-add'`
+      );
+      if (!(m005 as any[]).length) {
+        // Ajouter les instances talos si absentes (INSERT IGNORE = ne pas écraser si déjà présentes)
+        await conn.execute(`
+          INSERT IGNORE INTO service_instances (id, service_type, endpoint, domain, location) VALUES
+            ('users-talos',    'users',    'https://talos.users.alfychat.eu',    'talos.users.alfychat.eu',    'EU'),
+            ('messages-talos', 'messages', 'https://talos.messages.alfychat.eu', 'talos.messages.alfychat.eu', 'EU'),
+            ('friends-talos',  'friends',  'https://talos.friends.alfychat.eu',  'talos.friends.alfychat.eu',  'EU'),
+            ('calls-talos',    'calls',    'https://talos.calls.alfychat.eu',    'talos.calls.alfychat.eu',    'EU'),
+            ('servers-talos',  'servers',  'https://talos.servers.alfychat.eu',  'talos.servers.alfychat.eu',  'EU'),
+            ('bots-talos',     'bots',     'https://talos.bots.alfychat.eu',     'talos.bots.alfychat.eu',     'EU'),
+            ('media-talos',    'media',    'https://talos.media.alfychat.eu',    'talos.media.alfychat.eu',    'EU')
+        `);
+        // Corriger les entrées *-default encore pointées vers *.s.backend.* (ancien domaine mort)
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.users.alfychat.eu',    domain='1.users.alfychat.eu'    WHERE id='users-default'    AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.messages.alfychat.eu', domain='1.messages.alfychat.eu' WHERE id='messages-default' AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.friends.alfychat.eu',  domain='1.friends.alfychat.eu'  WHERE id='friends-default'  AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.calls.alfychat.eu',    domain='1.calls.alfychat.eu'    WHERE id='calls-default'    AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.servers.alfychat.eu',  domain='1.servers.alfychat.eu'  WHERE id='servers-default'  AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.bots.alfychat.eu',     domain='1.bots.alfychat.eu'     WHERE id='bots-default'     AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`UPDATE service_instances SET endpoint='https://1.media.alfychat.eu',    domain='1.media.alfychat.eu'    WHERE id='media-default'    AND endpoint LIKE '%.s.backend.%'`);
+        await conn.execute(`INSERT IGNORE INTO gateway_migrations (id) VALUES ('m005-talos-add')`);
+        logger.info('MonitoringDB: migration m005 — instances talos ajoutées, endpoints *.s.backend.* corrigés vers 1.*');
+      }
+
     } finally {
       conn.release();
     }

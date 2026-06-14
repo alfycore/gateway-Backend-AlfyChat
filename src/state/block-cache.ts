@@ -3,6 +3,7 @@
 // ==========================================
 
 import { FRIENDS_URL } from '../config/env';
+import { getServiceUrl } from '../http/helpers';
 
 interface BlockCacheEntry {
   aBlockedB: boolean;
@@ -27,7 +28,7 @@ export async function isDmBlocked(senderId: string, recipientId: string): Promis
     return cached.aBlockedB || cached.bBlockedA;
   }
   try {
-    const res = await fetch(`${FRIENDS_URL}/friends/${senderId}/block-status/${recipientId}`, {
+    const res = await fetch(`${getServiceUrl('friends', FRIENDS_URL)}/friends/${senderId}/block-status/${recipientId}`, {
       method: 'GET',
     });
     if (!res.ok) return false;

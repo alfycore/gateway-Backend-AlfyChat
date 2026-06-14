@@ -21,7 +21,11 @@ export function registerServersRoutes(app: Express): void {
   app.get('/api/servers', async (req, res) => {
     try {
       const userId = extractUserIdFromJWT(req.headers.authorization);
-      const url = `${getServiceUrl('servers', SERVERS_URL)}/servers?userId=${userId || ''}`;
+      const serviceUrl = getServiceUrl('servers', SERVERS_URL);
+      if (!serviceUrl) {
+        return res.status(503).json({ error: 'Service indisponible — aucune instance active' });
+      }
+      const url = `${serviceUrl}/servers?userId=${userId || ''}`;
       const response = await fetch(url, {
         method: 'GET',
         headers: {

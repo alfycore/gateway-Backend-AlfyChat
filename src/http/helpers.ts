@@ -4,7 +4,7 @@
 
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { JWT_SECRET, TRUSTED_PROXIES, IS_DEV, IP_ENDPOINT_RE } from '../config/env';
+import { JWT_SECRET, TRUSTED_PROXIES, IS_PRODUCTION } from '../config/env';
 import { serviceRegistry, ServiceType } from '../utils/service-registry';
 
 /** Extract client IP, trusting X-Forwarded-For only from known proxies */
@@ -37,16 +37,15 @@ export async function safeJson(response: Response): Promise<any> {
 }
 
 /**
- * Best-effort service URL via registry. Falls back to env-var URL.
- * In dev, always returns the fallback (.env / localhost).
+ * Résout l'URL d'un service.
+ * - Dev / test : retourne directement le fallback (.env / localhost).
+ * - Production : retourne l'endpoint du meilleur nœud LB.
+ *                Si le LB n'a aucune instance saine → '' (→ 503 côté appelant).
  */
 export function getServiceUrl(serviceType: ServiceType, fallback: string): string {
-  if (IS_DEV) return fallback;
+  if (!IS_PRODUCTION) return fallback;
   const best = serviceRegistry.selectBest(serviceType);
-  if (!best) return fallback;
-  const isLocalEndpoint = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(best.endpoint);
-  if (isLocalEndpoint || IP_ENDPOINT_RE.test(best.endpoint)) return fallback;
-  return best.endpoint;
+  return best?.endpoint ?? '';
 }
 
 /** Rewrite Express URL for a server-node: /api/servers/:id/X → /X */

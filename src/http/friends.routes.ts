@@ -1,6 +1,8 @@
 import type { Express } from 'express';
 import { runtime } from '../state/runtime';
 import { extractUserIdFromJWT, safeJson, getServiceUrl } from './helpers';
+
+function friendsUrl() { return getServiceUrl('friends', FRIENDS_URL); }
 import { proxyRequest } from './proxy';
 import { invalidateBlockCache } from '../state/block-cache';
 import { logger } from '../utils/logger';
@@ -11,7 +13,7 @@ export function registerFriendsRoutes(app: Express): void {
   app.post('/api/friends/request', async (req, res) => {
     const fromUserId = extractUserIdFromJWT(req.headers.authorization);
     try {
-      const url = `${FRIENDS_URL}/friends/request`;
+      const url = `${friendsUrl()}/friends/request`;
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -42,7 +44,7 @@ export function registerFriendsRoutes(app: Express): void {
     const acceptorUserId = extractUserIdFromJWT(req.headers.authorization);
     const { requestId } = req.params;
     try {
-      const url = `${FRIENDS_URL}/friends/requests/${requestId}/accept`;
+      const url = `${friendsUrl()}/friends/requests/${requestId}/accept`;
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -71,7 +73,7 @@ export function registerFriendsRoutes(app: Express): void {
     const userId = extractUserIdFromJWT(req.headers.authorization);
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/`, {
+      const response = await fetch(`${friendsUrl()}/friends/`, {
         headers: {
           'Content-Type': 'application/json',
           ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -91,7 +93,7 @@ export function registerFriendsRoutes(app: Express): void {
     const userId = extractUserIdFromJWT(req.headers.authorization);
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/requests`, {
+      const response = await fetch(`${friendsUrl()}/friends/requests`, {
         headers: {
           'Content-Type': 'application/json',
           ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -115,7 +117,7 @@ export function registerFriendsRoutes(app: Express): void {
     const userId = extractUserIdFromJWT(req.headers.authorization);
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/blocked`, {
+      const response = await fetch(`${friendsUrl()}/friends/blocked`, {
         headers: {
           'Content-Type': 'application/json',
           ...(req.headers.authorization && { authorization: req.headers.authorization }),
@@ -136,7 +138,7 @@ export function registerFriendsRoutes(app: Express): void {
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     const { friendId } = req.params;
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/${friendId}`, {
+      const response = await fetch(`${friendsUrl()}/friends/${friendId}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
@@ -163,7 +165,7 @@ export function registerFriendsRoutes(app: Express): void {
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     const { targetId } = req.params;
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/block`, {
+      const response = await fetch(`${friendsUrl()}/friends/${targetId}/block`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -192,7 +194,7 @@ export function registerFriendsRoutes(app: Express): void {
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     const { targetId } = req.params;
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/${targetId}/unblock`, {
+      const response = await fetch(`${friendsUrl()}/friends/${targetId}/unblock`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -221,7 +223,7 @@ export function registerFriendsRoutes(app: Express): void {
     if (!userId) return res.status(401).json({ error: 'Non authentifié' });
     const { requestId } = req.params;
     try {
-      const response = await fetch(`${FRIENDS_URL}/friends/requests/${requestId}/decline`, {
+      const response = await fetch(`${friendsUrl()}/friends/requests/${requestId}/decline`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

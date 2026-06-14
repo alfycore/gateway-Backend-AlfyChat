@@ -4,7 +4,7 @@
 
 import express from 'express';
 import { extractUserIdFromJWT, safeJson } from './helpers';
-import { allowedOrigins } from '../config/env';
+import { allowedOrigins, IS_PRODUCTION } from '../config/env';
 import { logger } from '../utils/logger';
 import { serviceRegistry, type ServiceType } from '../utils/service-registry';
 
@@ -70,6 +70,11 @@ export async function proxyRequest(
   };
 
   // Construire la liste des URLs à essayer : primaire + autres instances du registry
+  if (!targetUrl) {
+    logger.error(`[Proxy] Aucune instance LB disponible pour ${serviceType ?? req.originalUrl}`);
+    res.status(503).json({ error: 'Service indisponible — aucune instance active' });
+    return;
+  }
   const urlsToTry: string[] = [targetUrl];
   if (serviceType) {
     const others = serviceRegistry.getInstances(serviceType)
@@ -78,7 +83,8 @@ export async function proxyRequest(
       .map((i) => i.endpoint);
     urlsToTry.push(...others);
   }
-  if (fallbackUrl && !urlsToTry.includes(fallbackUrl)) {
+  // En production, le LB est la seule source — pas de fallback .env.
+  if (!IS_PRODUCTION && fallbackUrl && !urlsToTry.includes(fallbackUrl)) {
     urlsToTry.push(fallbackUrl);
   }
 
