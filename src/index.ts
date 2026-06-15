@@ -840,12 +840,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     const isActive = data?.active !== false;
     if (isActive) {
       redis.touchActivity(userId).catch(() => {});
-      // Si l'utilisateur était passé en auto-idle → restaurer son statut choisi
+      // Si l'utilisateur était passé en auto-idle → restaurer son statut choisi.
+      // On restaure dès que l'absence est automatique (autoIdle), ou — pour les
+      // anciens enregistrements sans ce flag — quand le choix reste 'online'.
       redis.getPresence(userId).then(async (p) => {
-        if (p && p.status === 'idle' && p.chosenStatus === 'online') {
-          await redis.setPresence(userId, { ...p, status: 'online', lastActivity: Date.now() });
+        if (p && p.status === 'idle' && (p.autoIdle || p.chosenStatus === 'online')) {
+          const restored = p.chosenStatus && p.chosenStatus !== 'idle' ? p.chosenStatus : 'online';
+          await redis.setPresence(userId, { ...p, status: restored, autoIdle: false, lastActivity: Date.now() });
           const restoreFriends = await serviceProxy.friends.getFriends(userId);
-          broadcastPresenceUpdate(userId, 'online', restoreFriends, p.text, p.emoji);
+          broadcastPresenceUpdate(userId, restored, restoreFriends, p.text, p.emoji);
         }
       }).catch(() => {});
     }
@@ -3224,12 +3227,34 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         ? String(data.text).trim().slice(0, 100) || null
         : (data.customStatus ? String(data.customStatus).trim().slice(0, 100) || null : null);
 
+      // `auto: true` → transition automatique (auto-idle / retour d'activité).
+      // Dans ce cas on ne touche PAS au choix explicite de l'utilisateur
+      // (chosenStatus) ni à la DB : seul `status` change, et `autoIdle` retient
+      // que l'absence est automatique afin que le heartbeat puisse la lever.
+      const isAuto = data.auto === true;
+
+      if (isAuto) {
+        // setPresence conserve `chosenStatus` existant (non fourni ici).
+        await redis.setPresence(userId, {
+          status: data.status,
+          emoji,
+          text,
+          lastActivity: Date.now(),
+          autoIdle: data.status === 'idle',
+        });
+        const friends = await serviceProxy.friends.getFriends(userId);
+        broadcastPresenceUpdate(userId, data.status, friends, text, emoji);
+        return;
+      }
+
+      // Choix explicite de l'utilisateur → met à jour le statut choisi + DB.
       await redis.setPresence(userId, {
         status: data.status,
         chosenStatus: data.status,
         emoji,
         text,
         lastActivity: Date.now(),
+        autoIdle: false,
       });
 
       // DB write fire-and-forget
@@ -3730,7 +3755,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         const p = await redis.getPresence(userId);
         if (!p) continue;
         if (p.chosenStatus === 'online' && p.status === 'online' && Date.now() - p.lastActivity > IDLE_TIMEOUT_MS) {
-          await redis.setPresence(userId, { ...p, status: 'idle' });
+          await redis.setPresence(userId, { ...p, status: 'idle', autoIdle: true });
           const idleFriends = await serviceProxy.friends.getFriends(userId);
           broadcastPresenceUpdate(userId, 'idle', idleFriends, p.text, p.emoji);
         }

@@ -17,6 +17,7 @@ export interface PresenceData {
   emoji: string | null;
   text: string | null;
   lastActivity: number; // timestamp ms
+  autoIdle?: boolean;   // true si le statut 'idle' est automatique (≠ choix utilisateur)
 }
 
 export class RedisClient {
@@ -79,6 +80,7 @@ export class RedisClient {
       emoji: current?.emoji ?? null,
       text: current?.text ?? null,
       lastActivity: current?.lastActivity ?? Date.now(),
+      autoIdle: current?.autoIdle ?? false,
       ...data,
     };
     await this.client.setex(key, 86400, JSON.stringify(merged));
