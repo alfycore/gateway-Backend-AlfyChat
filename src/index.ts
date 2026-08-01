@@ -351,6 +351,33 @@ app.post('/internal/call-quality', express.json(), (req, res) => {
   res.json({ success: true });
 });
 
+// ── Endpoint interne : le service users applique une sanction en direct ──
+// Un ban/kick doit couper la session immédiatement, sans attendre l'expiration du JWT.
+app.post('/internal/moderation/enforce', express.json(), (req, res) => {
+  const secret = req.headers['x-internal-secret'];
+  if (!secret || secret !== INTERNAL_SECRET) {
+    return res.status(401).json({ error: 'Accès interne requis' });
+  }
+  const { userId, type, reason, expiresAt } = req.body ?? {};
+  if (!userId || !type) {
+    return res.status(400).json({ error: 'userId et type requis' });
+  }
+
+  // Le cache mémoire doit être purgé, sinon un mute mettrait 30 s à s'appliquer
+  moderationCache.delete(userId);
+
+  if (type === 'ban' || type === 'kick') {
+    io.to(`user:${userId}`).emit('MODERATION_ENFORCED', { type, reason, expiresAt });
+    // Laisser le temps à l'event de partir avant de couper les sockets
+    setTimeout(() => io.in(`user:${userId}`).disconnectSockets(true), 250);
+  } else {
+    io.to(`user:${userId}`).emit('MODERATION_ENFORCED', { type, reason, expiresAt });
+  }
+
+  logger.warn(`[MODÉRATION] ${type} appliqué en direct sur ${userId}`);
+  res.json({ success: true });
+});
+
 // Adaptateur Redis pour Socket.IO (scaling multi-instances)
 const _ioRedisPub = redis.getRawClient();
 const _ioRedisSub = _ioRedisPub.duplicate();
@@ -381,6 +408,18 @@ interface AuthenticatedSocket extends Socket {
   userId?: string;
   sessionId?: string;
   user?: User;
+  /** Statut de modération résolu à la connexion (ban déjà refusé ici) */
+  moderation?: ModerationStatus;
+}
+
+interface ModerationStatus {
+  banned: boolean;
+  bannedUntil: string | null;
+  banReason: string | null;
+  muted: boolean;
+  mutedUntil: string | null;
+  muteReason: string | null;
+  warnings: number;
 }
 
 // ============ MIDDLEWARE D'AUTHENTIFICATION ============
@@ -394,17 +433,32 @@ io.use(async (socket: AuthenticatedSocket, next) => {
     }
 
     const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
-    
-    // Vérifier l'utilisateur via le service users
-    const user = await serviceProxy.users.getUser(decoded.userId) as User | null;
-    
+
+    // Vérifier l'utilisateur et son statut de modération via le service users
+    const [user, moderation] = await Promise.all([
+      serviceProxy.users.getUser(decoded.userId) as Promise<User | null>,
+      serviceProxy.users.getModerationStatus(decoded.userId).catch(() => null),
+    ]);
+
     if (!user) {
       return next(new Error('Utilisateur non trouvé'));
+    }
+
+    // Compte banni → connexion refusée
+    if (moderation?.banned) {
+      const until = moderation.bannedUntil
+        ? ` jusqu'au ${new Date(moderation.bannedUntil).toLocaleString('fr-FR')}`
+        : ' définitivement';
+      logger.warn(`Connexion WS refusée — compte banni: ${decoded.userId}`);
+      const err = new Error(`Ce compte est banni${until}. Motif : ${moderation.banReason ?? 'non précisé'}`);
+      (err as any).data = { banned: true, bannedUntil: moderation.bannedUntil };
+      return next(err);
     }
 
     socket.userId = decoded.userId;
     socket.sessionId = uuidv4();
     socket.user = user;
+    socket.moderation = moderation ?? undefined;
 
     // Détection d'anomalies WS — suit les événements non-triviaux après auth
     attachAnomalyWsHooks(socket, decoded.userId);
@@ -415,6 +469,37 @@ io.use(async (socket: AuthenticatedSocket, next) => {
     next(new Error('Token invalide'));
   }
 });
+
+// ============ MODÉRATION — MUTE GLOBAL ============
+
+/** Cache mémoire du statut de modération : évite un appel HTTP par message */
+const moderationCache = new Map<string, { status: ModerationStatus | null; fetchedAt: number }>();
+const MODERATION_CACHE_TTL = 30_000;
+
+/**
+ * Retourne le mute actif d'un utilisateur, ou null s'il peut écrire.
+ * Une sanction prise en cours de session s'applique en moins de 30 s.
+ */
+async function getActiveMute(userId: string): Promise<{ until: string | null; reason: string | null } | null> {
+  const cached = moderationCache.get(userId);
+  let status = cached?.status ?? null;
+
+  if (!cached || Date.now() - cached.fetchedAt > MODERATION_CACHE_TTL) {
+    status = await serviceProxy.users.getModerationStatus(userId).catch(() => cached?.status ?? null);
+    moderationCache.set(userId, { status, fetchedAt: Date.now() });
+  }
+
+  if (!status?.muted) return null;
+  return { until: status.mutedUntil, reason: status.muteReason };
+}
+
+/** Message affichable expliquant la réduction au silence */
+function muteMessage(mute: { until: string | null; reason: string | null }): string {
+  const until = mute.until
+    ? `jusqu'au ${new Date(mute.until).toLocaleString('fr-FR')}`
+    : 'de façon permanente';
+  return `Vous êtes réduit au silence ${until}. Motif : ${mute.reason ?? 'non précisé'}`;
+}
 
 // ============ GESTION DES CONNEXIONS ============
 
@@ -903,6 +988,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
       recent.push(now);
       messageRateLimit.set(userId, recent);
+
+      // ── Mute global (modération plateforme) ──
+      const mute = await getActiveMute(userId);
+      if (mute) {
+        socket.emit('message:error', { error: 'MUTED', message: muteMessage(mute) });
+        return;
+      }
 
       // ── Validation contenu ──
       try {
@@ -2259,6 +2351,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       // Permission SEND (0x2) — inclut déjà le check de membership côté server.
       if (!(await checkServerPermission(userId, serverId, 0x2))) {
         emitError(socket, 'SERVER_MESSAGE_ERROR', new Error('PERMISSION_DENIED'));
+        return;
+      }
+      // Mute global (modération plateforme) — prime sur les permissions du serveur
+      const mute = await getActiveMute(userId);
+      if (mute) {
+        socket.emit('SERVER_MESSAGE_ERROR', { error: 'MUTED', message: muteMessage(mute) });
         return;
       }
       const v = validateMessageContent(data?.content, data?.attachments);

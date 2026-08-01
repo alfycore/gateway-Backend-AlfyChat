@@ -232,6 +232,22 @@ class UsersProxy {
     return fetchService(`${this.baseUrl}/users/${userId}`);
   }
 
+  /**
+   * Statut de modération global (ban / mute). Endpoint interne : les motifs
+   * de sanction ne transitent jamais par le profil public.
+   */
+  async getModerationStatus(userId: string) {
+    return fetchService<{
+      banned: boolean;
+      bannedUntil: string | null;
+      banReason: string | null;
+      muted: boolean;
+      mutedUntil: string | null;
+      muteReason: string | null;
+      warnings: number;
+    }>(`${this.baseUrl}/internal/moderation/${userId}`);
+  }
+
   async updateStatus(userId: string, status: string, customStatus?: string | null, emoji?: string | null) {
     return fetchService(`${this.baseUrl}/users/${userId}/status`, {
       method: 'PATCH',
@@ -471,9 +487,12 @@ class FriendsProxy {
 
   async getFriends(userId: string): Promise<any[]> {
     try {
-      // Pour l'instant, retourner un tableau vide car le service Friends
-      // nécessite un token JWT et nous n'avons pas accès au token ici
-      return [];
+      // Le middleware du service Friends accepte le bypass interne
+      // (X-Internal-Secret, injecté automatiquement par fetchWithFailover)
+      // + x-user-id pour s'authentifier sans le JWT de l'utilisateur.
+      return await fetchService<any[]>(`${this.baseUrl}/friends`, {
+        headers: { 'x-user-id': userId },
+      });
     } catch (error) {
       logger.warn(`Impossible de récupérer les amis pour ${userId}`);
       return [];
@@ -837,6 +856,7 @@ class ServersProxy {
   async kickMember(serverId: string, memberUserId: string, requesterId: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}/kick`, {
       method: 'POST',
+      headers: { 'x-user-id': requesterId },
       body: JSON.stringify({ requesterId }),
     });
   }
@@ -844,6 +864,7 @@ class ServersProxy {
   async banMember(serverId: string, memberUserId: string, requesterId: string, reason?: string) {
     return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}/ban`, {
       method: 'POST',
+      headers: { 'x-user-id': requesterId },
       body: JSON.stringify({ requesterId, reason }),
     });
   }
