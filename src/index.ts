@@ -1098,9 +1098,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
             }
           }
         }
-        // Notifier les autres appareils de l'expéditeur qu'une nouvelle conversation existe
-        // (async, on récupère le profil du destinataire en arrière-plan)
-        if (senderUserRoom && senderUserRoom.size > 1) {
+        // Notifier l'expéditeur qu'une conversation existe désormais, pour que
+        // SA PROPRE liste de MP se mette à jour sans refresh.
+        // L'ancien `senderUserRoom.size > 1` ne le faisait que si un 2e appareil
+        // était connecté (ex: mobile) : dans le cas normal — un seul onglet —
+        // celui qui vient d'envoyer le tout premier message à quelqu'un ne
+        // voyait donc jamais apparaître la conversation dans sa propre sidebar.
+        if (senderUserRoom) {
           serviceProxy.users.getUser(data.recipientId).then((recipientUser: any) => {
             io.to(`user:${userId}`).emit('CONVERSATION_CREATE', {
               id: conversationId,
@@ -4192,9 +4196,27 @@ async function broadcastPresenceUpdate(
     },
     timestamp: new Date(),
   };
+
+  const recipients = new Set<string>();
   for (const friend of friends) {
     const fid = friend.friendId ?? (friend as any).id;
-    if (fid) io.to(`user:${fid}`).emit('PRESENCE_UPDATE', presencePayload);
+    if (fid) recipients.add(fid);
+  }
+
+  // Sans amitié, la liste des MP d'un utilisateur ne recevait jamais ses mises
+  // à jour de présence (le broadcast ne visait que la liste d'amis) : le
+  // statut affiché restait figé à sa valeur de chargement initial pour tout
+  // contact avec qui on discute sans être ami. On ajoute donc les
+  // destinataires de ses conversations privées.
+  try {
+    const conversations = await serviceProxy.messages.getConversations(userId);
+    for (const conv of conversations as Array<{ type?: string; recipientId?: string }>) {
+      if (conv.type === 'dm' && conv.recipientId) recipients.add(conv.recipientId);
+    }
+  } catch { /* non bloquant — la présence reste diffusée aux amis au minimum */ }
+
+  for (const fid of recipients) {
+    io.to(`user:${fid}`).emit('PRESENCE_UPDATE', presencePayload);
   }
   // Broadcast serveur supprimé — les member-lists utilisent GET_BULK_PRESENCE à la demande
 }

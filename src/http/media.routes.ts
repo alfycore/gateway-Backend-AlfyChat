@@ -69,8 +69,24 @@ export function registerMediaRoutes(app: Express): void {
     const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
     const mediaPath = `/uploads/${folder}/${filename}`;
 
+    const tryFetch = async (endpoint: string) => {
+      const response = await fetch(`${endpoint}${mediaPath}`);
+      return response;
+    };
+
     try {
-      const response = await fetch(`${targetEndpoint}${mediaPath}`);
+      let response = await tryFetch(targetEndpoint);
+      // Une entrée du registre peut être enregistrée sous cet id mais pointer
+      // vers une instance obsolète/cassée (déploiement remplacé, endpoint
+      // changé…) — le health-check est volontairement ignoré ci-dessus pour
+      // ne pas bloquer la récupération de fichiers déjà uploadés, donc rien
+      // n'empêchait normalement de s'accrocher indéfiniment à cette entrée
+      // périmée. Si elle échoue et que MEDIA_URL diffère, on retente dessus
+      // avant d'abandonner : c'est le seul endpoint garanti à jour.
+      if (!response.ok && instance && targetEndpoint !== MEDIA_URL) {
+        logger.warn(`MediaProxy: ${targetEndpoint}${mediaPath} → ${response.status}, nouvel essai via MEDIA_URL`);
+        response = await tryFetch(MEDIA_URL);
+      }
       if (!response.ok) {
         res.status(response.status).json({ error: 'Fichier non trouvé' });
         return;

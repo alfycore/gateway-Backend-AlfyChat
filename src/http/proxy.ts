@@ -4,7 +4,7 @@
 
 import express from 'express';
 import { extractUserIdFromJWT, safeJson } from './helpers';
-import { allowedOrigins, IS_PRODUCTION } from '../config/env';
+import { allowedOrigins, IS_PRODUCTION, INTERNAL_SECRET } from '../config/env';
 import { logger } from '../utils/logger';
 import { serviceRegistry, type ServiceType } from '../utils/service-registry';
 
@@ -134,11 +134,15 @@ export async function proxyToNode(
       bodyToSend = { ...req.body, userId, ownerId: userId };
     }
 
+    // Le node vérifie son propre JWT_SECRET local — jamais le même que le token de
+    // session du client. On ne transmet donc pas l'Authorization du client (le node la
+    // rejetterait avec 401 sans jamais retomber sur le fallback x-user-id/x-internal-secret) :
+    // le gateway a déjà authentifié l'utilisateur, on le prouve au node via le secret interne.
     const response = await fetch(url, {
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
-        ...(req.headers.authorization && { authorization: req.headers.authorization }),
+        'x-internal-secret': INTERNAL_SECRET,
         ...(userId && { 'X-User-Id': userId }),
       },
       ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
@@ -183,10 +187,13 @@ export async function proxyToNodeMultipart(
     req.on('end', async () => {
       try {
         const body = Buffer.concat(chunks);
-        const headers: Record<string, string> = {};
+        // Comme dans proxyToNode: le node ne peut pas vérifier le JWT de session du
+        // client (secret local différent) — on prouve l'identité au node via le secret
+        // interne + X-User-Id plutôt que de forwarder l'Authorization du client.
+        const headers: Record<string, string> = { 'x-internal-secret': INTERNAL_SECRET };
         if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'] as string;
-        if (req.headers.authorization) headers['authorization'] = req.headers.authorization;
         if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'] as string;
+        if (userId) headers['x-user-id'] = userId;
 
         const response = await fetch(finalUrl, { method: req.method, headers, body });
         const contentType = response.headers.get('content-type');
