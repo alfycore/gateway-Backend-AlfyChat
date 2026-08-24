@@ -19,6 +19,10 @@ export const LIMITS = {
   customStatus:     { min: 0, max: 100 },
   interests:        { maxItems: 10, itemMin: 1, itemMax: 24 },
   messageContent:   { min: 1, max: 4000 },
+  // Un ciphertext Signal (surtout un PreKey/ECDH initial) dépasse largement
+  // 4 000 caractères. Le service messages accepte 131 072 octets ; le gateway
+  // coupait à 4 000 et rejetait donc des messages que le back-end savait traiter.
+  cipherContent:    { min: 1, max: 131072 },
   groupName:        { min: 1, max: 64 },
   serverName:       { min: 1, max: 64 },
   serverDescription:{ min: 0, max: 500 },
@@ -44,24 +48,35 @@ const BAD_WORDS = [
 
 const LEET: Record<string, string> = { '0':'o','1':'i','3':'e','4':'a','5':'s','7':'t','@':'a','$':'s','!':'i' };
 
-function normalize(s: string): string {
-  return s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+/**
+ * Normalise pour la comparaison, en CONSERVANT les separateurs.
+ *
+ * L'ancienne version supprimait tout caractere non alphabetique, espaces
+ * compris : deux mots legitimes accoles formaient alors un mot interdit
+ * (probleme de Scunthorpe). On remplace les separateurs par une espace et on
+ * exige ensuite une frontiere de mot.
+ */
+function normalize(value: string): string {
+  return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[0134579@$!]/g, (c) => LEET[c] || c)
-    .replace(/[^a-z]/g, '');
+    .replace(/[^a-z]+/g, ' ')
+    .trim();
 }
+
+// Alternance compilee une seule fois : sanitizeText reconstruisait une trentaine
+// de RegExp a chaque appel.
+const BOUNDARY = '\\b';
+const BAD_WORDS_RE = new RegExp(`${BOUNDARY}(?:${BAD_WORDS.join('|')})${BOUNDARY}`, 'i');
+const BAD_WORDS_RE_GLOBAL = new RegExp(`${BOUNDARY}(?:${BAD_WORDS.join('|')})${BOUNDARY}`, 'gi');
 
 export function containsProfanity(text: string): boolean {
   const n = normalize(text);
   if (!n) return false;
-  return BAD_WORDS.some((w) => n.includes(w));
+  return BAD_WORDS_RE.test(n);
 }
 
 export function sanitizeText(text: string): string {
-  let out = text;
-  for (const w of BAD_WORDS) {
-    out = out.replace(new RegExp(w, 'gi'), (m) => '*'.repeat(m.length));
-  }
-  return out;
+  return text.replace(BAD_WORDS_RE_GLOBAL, (m) => '*'.repeat(m.length));
 }
 
 // ── Primitives ──────────────────────────────────────────────────────
@@ -274,12 +289,18 @@ export function validateMemberUpdate(data: any): { nickname?: string; roleIds?: 
   return out;
 }
 
-export function validateMessageContent(content: unknown, attachments?: unknown): { content: string; attachments?: string[] } {
+export function validateMessageContent(
+  content: unknown,
+  attachments?: unknown,
+  /** Renseigné pour un message chiffré de bout en bout — plafond bien plus haut. */
+  e2eeType?: unknown,
+): { content: string; attachments?: string[] } {
   const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+  const isCiphertext = e2eeType === 1 || e2eeType === 3;
   const c = validateText(content, {
     field: 'content',
     min: hasAttachments ? 0 : LIMITS.messageContent.min,
-    max: LIMITS.messageContent.max,
+    max: isCiphertext ? LIMITS.cipherContent.max : LIMITS.messageContent.max,
     required: !hasAttachments,
     allowProfanity: true, // messages privés/chat: pas de filtre contenu (libre expression)
   });

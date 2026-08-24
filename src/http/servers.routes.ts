@@ -84,7 +84,7 @@ export function registerServersRoutes(app: Express): void {
     const query = req.originalUrl.includes('?') ? '?' + req.originalUrl.split('?')[1] : '';
 
     if (node?.endpoint) {
-      proxyToNodeMultipart(node.endpoint, `/files${query}`, req, res);
+      proxyToNodeMultipart(node.endpoint, `/files${query}`, req, res, serverId);
       return;
     }
     // Fallback sans node : vers le servers microservice
@@ -130,11 +130,11 @@ export function registerServersRoutes(app: Express): void {
       const contentType = req.headers['content-type'] || '';
       // Multipart/form-data → proxy brut (fichiers)
       if (contentType.includes('multipart/form-data')) {
-        proxyToNodeMultipart(node.endpoint, rewriteNodePath(req, serverId), req, res);
+        proxyToNodeMultipart(node.endpoint, rewriteNodePath(req, serverId), req, res, serverId);
         return;
       }
       const nodePath = rewriteNodePath(req, serverId);
-      proxyToNode(node.endpoint, nodePath, req, res);
+      proxyToNode(node.endpoint, nodePath, req, res, serverId);
       return;
     }
 
@@ -148,7 +148,7 @@ export function registerServersRoutes(app: Express): void {
     const node = connectedNodes.get(serverId);
 
     if (node?.endpoint) {
-      proxyToNode(node.endpoint, '/server', req, res);
+      proxyToNode(node.endpoint, '/server', req, res, serverId);
       return;
     }
 

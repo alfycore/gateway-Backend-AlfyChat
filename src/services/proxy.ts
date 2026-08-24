@@ -381,6 +381,7 @@ class MessagesProxy {
     const { participants, createdBy, ...rest } = data;
     return fetchService(`${this.baseUrl}/conversations`, {
       method: 'POST',
+      headers: { 'x-user-id': createdBy },
       body: JSON.stringify({ ...rest, participantIds: participants }),
     });
   }
@@ -932,6 +933,17 @@ class ServersProxy {
     return result.isMember === true;
   }
 
+  /**
+   * Permissions cumulées d'un membre — un entier, calculé côté SQL.
+   * Remplace le trio getServer + getMembers + getRoles qui rapatriait toute la
+   * liste des membres à chaque vérification de permission.
+   */
+  async getMemberPermissions(serverId: string, userId: string) {
+    return fetchService<{ isMember: boolean; isOwner: boolean; permissions: number }>(
+      `${this.baseUrl}/servers/${serverId}/members/${userId}/permissions`,
+    );
+  }
+
   async getRoles(serverId: string) {
     return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/roles`);
   }
@@ -990,10 +1002,11 @@ class ServersProxy {
     });
   }
 
-  async registerNode(name?: string) {
+  async registerNode(name?: string, ownerId?: string) {
     return fetchService(`${this.baseUrl}/servers/nodes/register`, {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      headers: ownerId ? { 'x-user-id': ownerId } : undefined,
+      body: JSON.stringify({ name, ownerId }),
     });
   }
 }

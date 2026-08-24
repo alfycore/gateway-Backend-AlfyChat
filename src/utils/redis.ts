@@ -60,6 +60,20 @@ export class RedisClient {
     return (await this.client.sismember('online:list', userId)) === 1;
   }
 
+  /**
+   * Sous-ensemble d'utilisateurs actuellement en ligne, en UNE commande.
+   * Remplace les boucles `isUserOnline` par membre : une liste de 1 000 membres
+   * déclenchait 1 000 allers-retours Redis.
+   */
+  async getOnlineSet(userIds: string[]): Promise<Set<string>> {
+    const online = new Set<string>();
+    const ids = userIds.filter(Boolean);
+    if (ids.length === 0) return online;
+    const flags = await this.client.smismember('online:list', ...ids);
+    ids.forEach((id, i) => { if (flags[i] === 1) online.add(id); });
+    return online;
+  }
+
   async getUserSocketId(userId: string): Promise<string | null> {
     return this.client.hget('online:users', userId);
   }
@@ -200,6 +214,26 @@ export class RedisClient {
 
   async del(key: string): Promise<void> {
     await this.client.del(key);
+  }
+
+  /**
+   * Supprime toutes les clés correspondant à un motif.
+   * Utilise SCAN, jamais KEYS : `KEYS` parcourt tout l'espace de clés en
+   * BLOQUANT le serveur Redis — or ce Redis est partagé par le gateway
+   * (adapter Socket.IO, présence, rate limiting) et tous les microservices.
+   */
+  async deleteByPattern(pattern: string, batchSize = 200): Promise<number> {
+    let cursor = '0';
+    let deleted = 0;
+    do {
+      const [next, keys] = await this.client.scan(cursor, 'MATCH', pattern, 'COUNT', batchSize);
+      cursor = next;
+      if (keys.length > 0) {
+        await this.client.del(...keys);
+        deleted += keys.length;
+      }
+    } while (cursor !== '0');
+    return deleted;
   }
 
   // ============ USER ROOMS (persistance reconnexion) ============
