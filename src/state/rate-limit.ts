@@ -117,6 +117,56 @@ export function checkInviteVerifyRate(userId: string): boolean {
   return consume(inviteWindow, userId);
 }
 
+// ── Débit par socket (tous événements) ─────────────────────────────────────
+// Fenêtre fixe par socket, en mémoire : la socket vit sur une seule instance,
+// le compteur aussi. Deux paliers : un plafond général, et un plafond serré
+// pour les événements qui déclenchent des appels HTTP coûteux ou notifient
+// des tiers.
+
+const SOCKET_WINDOW_MS = 10_000;
+const SOCKET_MAX_EVENTS = 150;      // tous événements confondus / 10 s
+const SOCKET_MAX_EXPENSIVE = 20;    // événements coûteux / 10 s
+
+const EXPENSIVE_EVENTS = new Set([
+  'CALL_INITIATE', 'CALL_INITIATE_GROUP', 'CALL_INITIATE_SERVER', 'CALL_JOIN', 'CALL_ACCEPT',
+  'CALL_REJECT', 'CALL_END', 'CALL_REJOIN',
+  'FRIEND_REQUEST', 'FRIEND_ACCEPT',
+  'GROUP_CREATE', 'GROUP_UPDATE', 'GROUP_DELETE', 'GROUP_LEAVE',
+  'INVITE_CREATE', 'INVITE_DELETE', 'INVITE_LIST',
+  'GET_BULK_PRESENCE', 'MEMBER_LIST', 'ROLE_LIST',
+  'e2ee:history-request', 'e2ee:history-response',
+  'DM_ARCHIVE_REQUEST', 'DM_ARCHIVE_PEER_RESPONSE', 'DM_ARCHIVE_CONFIRM', 'DM_ARCHIVE_STATUS',
+  'CHANNEL_CREATE', 'CHANNEL_UPDATE', 'CHANNEL_DELETE', 'CHANNEL_PERMS_SET',
+  'ROLE_CREATE', 'ROLE_UPDATE', 'ROLE_DELETE', 'MEMBER_UPDATE', 'MEMBER_KICK', 'MEMBER_BAN',
+  'SERVER_UPDATE_NODE', 'PROFILE_UPDATE', 'CHANGE_USERNAME', 'SFU_CREATE_TRANSPORT',
+]);
+
+interface SocketLike {
+  use(fn: (packet: unknown[], next: (err?: Error) => void) => void): unknown;
+}
+
+export function attachSocketRateLimit(socket: SocketLike): void {
+  let windowStart = Date.now();
+  let total = 0;
+  let expensive = 0;
+  socket.use((packet, next) => {
+    const now = Date.now();
+    if (now - windowStart > SOCKET_WINDOW_MS) {
+      windowStart = now;
+      total = 0;
+      expensive = 0;
+    }
+    total++;
+    const event = Array.isArray(packet) ? String(packet[0]) : '';
+    if (EXPENSIVE_EVENTS.has(event)) expensive++;
+    if (total > SOCKET_MAX_EVENTS || expensive > SOCKET_MAX_EXPENSIVE) {
+      next(new Error('RATE_LIMITED'));
+      return;
+    }
+    next();
+  });
+}
+
 // ── Enregistrement de server-node ──────────────────────────────────────────
 // Créer un serveur écrit 5 lignes en base : à brider même pour un compte valide.
 

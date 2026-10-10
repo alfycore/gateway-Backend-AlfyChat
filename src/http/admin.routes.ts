@@ -441,7 +441,8 @@ export function registerAdminRoutes(app: Express): void {
     const { sendMail } = await import('../utils/mailer');
     const { ADMIN_ALERT_EMAILS, INTERNAL_SECRET: SECRET } = await import('../config/env');
     const internalSecret = req.headers['x-internal-secret'] as string | undefined;
-    if (!internalSecret || internalSecret !== SECRET) {
+    const { safeSecretEqual } = await import('../utils/node-endpoint');
+    if (!safeSecretEqual(internalSecret, SECRET)) {
       return res.status(401).json({ error: 'Non autorisé' });
     }
     const { serviceId, errorType, message, stack, severity } = req.body as {

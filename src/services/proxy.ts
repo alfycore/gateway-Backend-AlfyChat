@@ -36,16 +36,38 @@ function getBreaker(url: string): InstanceType<typeof CircuitBreaker> {
   return _breakers.get(host)!;
 }
 
+// ── Segments d'URL ──────────────────────────────────────────────────────────
+// Les identifiants interpolés dans les URL internes viennent très souvent du
+// client (payload WebSocket). Non validés, un `../` suffisait à viser une autre
+// route du microservice — avec le secret interne attaché. Tout identifiant
+// passe donc par `seg()` : alphabet restreint, puis encodage.
+const SEGMENT_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function seg(value: unknown): string {
+  if (typeof value !== 'string' || !SEGMENT_RE.test(value)) {
+    const err = new Error('INVALID_ID');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+  return encodeURIComponent(value);
+}
+
 // ── Retry exponentiel (2 tentatives, backoff x2) ────────────────────────────
+// Uniquement pour les méthodes idempotentes, et jamais sur une réponse 4xx :
+// rejouer un POST après un timeout créait des doublons (le service avait pu
+// committer avant que la réponse ne se perde).
 async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 300): Promise<T> {
   try {
     return await fn();
-  } catch (error) {
-    if (retries <= 0) throw error;
+  } catch (error: any) {
+    const status = Number(error?.statusCode);
+    if (retries <= 0 || (status >= 400 && status < 500)) throw error;
     await new Promise(r => setTimeout(r, delayMs));
     return withRetry(fn, retries - 1, delayMs * 2);
   }
 }
+
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']);
 
 interface ServiceUrls {
   users: string;
@@ -118,9 +140,12 @@ async function fetchWithFailover<T = unknown>(
     return response.json() as Promise<T>;
   };
 
+  const method = String(fetchOptions?.method || 'GET').toUpperCase();
+  const retryable = IDEMPOTENT_METHODS.has(method);
+
   const tryFetch = async (url: string): Promise<T> => {
     const breaker = getBreaker(url);
-    return await breaker.fire(() => withRetry(doRequest.bind(null, url))) as T;
+    return await breaker.fire(() => (retryable ? withRetry(doRequest.bind(null, url)) : doRequest(url))) as T;
   };
 
   // Tentative primaire
@@ -130,7 +155,7 @@ async function fetchWithFailover<T = unknown>(
     const isPrimary5xx = (primaryErr?.statusCode >= 500) || /Breaker is open|503|502|500/.test(String(primaryErr?.message));
 
     // Pas un 5XX (ex: 400, 401, 404) → ne pas basculer, propager l'erreur
-    if (!isPrimary5xx || !serviceType) {
+    if (!isPrimary5xx || !serviceType || !retryable) {
       logger.error({ err: primaryErr }, `Fetch error for ${primaryUrl}`);
       throw primaryErr;
     }
@@ -229,7 +254,7 @@ class UsersProxy {
   private get baseUrl(): string { return resolveServiceUrl('users', this._fallbackUrl); }
 
   async getUser(userId: string) {
-    return fetchService(`${this.baseUrl}/users/${userId}`);
+    return fetchService(`${this.baseUrl}/users/${seg(userId)}`);
   }
 
   /**
@@ -245,11 +270,11 @@ class UsersProxy {
       mutedUntil: string | null;
       muteReason: string | null;
       warnings: number;
-    }>(`${this.baseUrl}/internal/moderation/${userId}`);
+    }>(`${this.baseUrl}/internal/moderation/${seg(userId)}`);
   }
 
   async updateStatus(userId: string, status: string, customStatus?: string | null, emoji?: string | null) {
-    return fetchService(`${this.baseUrl}/users/${userId}/status`, {
+    return fetchService(`${this.baseUrl}/users/${seg(userId)}/status`, {
       method: 'PATCH',
       body: JSON.stringify({
         status,
@@ -262,7 +287,7 @@ class UsersProxy {
 
   async updateLastSeen(userId: string) {
     try {
-      return fetchService(`${this.baseUrl}/users/${userId}/last-seen`, {
+      return fetchService(`${this.baseUrl}/users/${seg(userId)}/last-seen`, {
         method: 'PATCH',
         headers: { 'x-user-id': userId },
       });
@@ -273,13 +298,13 @@ class UsersProxy {
   }
 
   async getPreferences(userId: string, _token?: string) {
-    return fetchService(`${this.baseUrl}/users/${userId}/preferences`, {
+    return fetchService(`${this.baseUrl}/users/${seg(userId)}/preferences`, {
       headers: { 'x-user-id': userId },
     });
   }
 
   async updateProfile(userId: string, data: Record<string, unknown>, _token?: string) {
-    return fetchService(`${this.baseUrl}/users/${userId}`, {
+    return fetchService(`${this.baseUrl}/users/${seg(userId)}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
       headers: { 'x-user-id': userId },
@@ -287,7 +312,7 @@ class UsersProxy {
   }
 
   async changeUsername(userId: string, newUsername: string, password: string, token?: string) {
-    return fetchService(`${this.baseUrl}/users/${userId}/change-username`, {
+    return fetchService(`${this.baseUrl}/users/${seg(userId)}/change-username`, {
       method: 'POST',
       body: JSON.stringify({ newUsername, password }),
       token,
@@ -330,7 +355,7 @@ class MessagesProxy {
   async isParticipant(conversationId: string, userId: string): Promise<boolean> {
     try {
       const result = await fetchService<{ isParticipant: boolean }>(
-        `${this.baseUrl}/conversations/${conversationId}/participants/${userId}/check`,
+        `${this.baseUrl}/conversations/${seg(conversationId)}/participants/${seg(userId)}/check`,
         { method: 'GET' },
       );
       return (result as any)?.isParticipant === true;
@@ -347,7 +372,7 @@ class MessagesProxy {
   }
 
   async updateMessage(messageId: string, content: string, userId: string, senderContent?: string, e2eeType?: number) {
-    return fetchWithFailover(`${this.baseUrl}/messages/${messageId}`, 'messages', {
+    return fetchWithFailover(`${this.baseUrl}/messages/${seg(messageId)}`, 'messages', {
       method: 'PATCH',
       body: JSON.stringify({ content, ...(senderContent !== undefined && { senderContent }), ...(e2eeType !== undefined && { e2eeType }) }),
       headers: { 'x-user-id': userId },
@@ -355,14 +380,14 @@ class MessagesProxy {
   }
 
   async deleteMessage(messageId: string, userId: string) {
-    return fetchWithFailover(`${this.baseUrl}/messages/${messageId}`, 'messages', {
+    return fetchWithFailover(`${this.baseUrl}/messages/${seg(messageId)}`, 'messages', {
       method: 'DELETE',
       headers: { 'x-user-id': userId },
     });
   }
 
   async addReaction(messageId: string, userId: string, emoji: string) {
-    return fetchService(`${this.baseUrl}/messages/${messageId}/reactions`, {
+    return fetchService(`${this.baseUrl}/messages/${seg(messageId)}/reactions`, {
       method: 'POST',
       body: JSON.stringify({ emoji }),
       headers: { 'x-user-id': userId },
@@ -370,7 +395,7 @@ class MessagesProxy {
   }
 
   async removeReaction(messageId: string, userId: string, emoji: string) {
-    return fetchService(`${this.baseUrl}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`, {
+    return fetchService(`${this.baseUrl}/messages/${seg(messageId)}/reactions/${encodeURIComponent(String(emoji))}`, {
       method: 'DELETE',
       headers: { 'x-user-id': userId },
     });
@@ -387,19 +412,19 @@ class MessagesProxy {
   }
 
   async updateConversation(conversationId: string, data: { name?: string; avatarUrl?: string; isOpen?: boolean }, token?: string) {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}`, {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
       token,
     });
   }
 
-  async getConversationParticipants(conversationId: string): Promise<Array<{ userId: string }>> {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants`);
+  async getConversationParticipants(conversationId: string): Promise<{ participants?: Array<{ userId: string }> } | Array<{ userId: string }>> {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}/participants`);
   }
 
   async addParticipant(conversationId: string, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants`, {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}/participants`, {
       method: 'POST',
       body: JSON.stringify({ userId }),
       token,
@@ -407,14 +432,14 @@ class MessagesProxy {
   }
 
   async removeParticipant(conversationId: string, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}/participants/${userId}`, {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}/participants/${seg(userId)}`, {
       method: 'DELETE',
       token,
     });
   }
 
   async leaveConversation(conversationId: string, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}/leave`, {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}/leave`, {
       method: 'POST',
       token,
       headers: { 'x-user-id': userId } as any,
@@ -422,7 +447,7 @@ class MessagesProxy {
   }
 
   async deleteConversation(conversationId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/conversations/${conversationId}`, {
+    return fetchService(`${this.baseUrl}/conversations/${seg(conversationId)}`, {
       method: 'DELETE',
       token,
     });
@@ -431,15 +456,15 @@ class MessagesProxy {
   // ===== SYSTÈME HYBRIDE DM =====
 
   async getArchiveStatus(conversationId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/archive/status/${conversationId}`, { token });
+    return fetchService(`${this.baseUrl}/archive/status/${seg(conversationId)}`, { token });
   }
 
   async getArchiveStats(conversationId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/archive/stats/${conversationId}`, { token });
+    return fetchService(`${this.baseUrl}/archive/stats/${seg(conversationId)}`, { token });
   }
 
   async checkArchiveQuota(conversationId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/archive/quota/${conversationId}`, { token });
+    return fetchService(`${this.baseUrl}/archive/quota/${seg(conversationId)}`, { token });
   }
 
   async confirmArchive(conversationId: string, archiveLogId: string, token?: string) {
@@ -451,7 +476,7 @@ class MessagesProxy {
   }
 
   async getCachedArchivedMessage(messageId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/archive/message/${messageId}`, { token });
+    return fetchService(`${this.baseUrl}/archive/message/${seg(messageId)}`, { token });
   }
 
   async cacheArchivedMessages(messages: any[]) {
@@ -503,20 +528,23 @@ class FriendsProxy {
   async sendFriendRequest(fromUserId: string, toUserId: string, message?: string) {
     return fetchService(`${this.baseUrl}/friends/requests`, {
       method: 'POST',
-      body: JSON.stringify({ fromUserId, toUserId, message }),
+      headers: { 'x-user-id': fromUserId },
+      body: JSON.stringify({ toUserId, message }),
     });
   }
 
   async acceptFriendRequest(requestId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/friends/requests/${requestId}/accept`, {
+    return fetchService(`${this.baseUrl}/friends/requests/${seg(requestId)}/accept`, {
       method: 'POST',
+      headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
     });
   }
 
   async declineFriendRequest(requestId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/friends/requests/${requestId}/decline`, {
+    return fetchService(`${this.baseUrl}/friends/requests/${seg(requestId)}/decline`, {
       method: 'POST',
+      headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
     });
   }
@@ -526,23 +554,23 @@ class FriendsProxy {
   }
 
   async removeFriend(userId: string, friendId: string) {
-    return fetchService(`${this.baseUrl}/friends/${friendId}`, {
+    return fetchService(`${this.baseUrl}/friends/${seg(friendId)}`, {
       method: 'DELETE',
-      body: JSON.stringify({ userId }),
+      headers: { 'x-user-id': userId },
     });
   }
 
   async blockUser(userId: string, blockedUserId: string) {
-    return fetchService(`${this.baseUrl}/friends/block`, {
+    return fetchService(`${this.baseUrl}/friends/${seg(blockedUserId)}/block`, {
       method: 'POST',
-      body: JSON.stringify({ userId, blockedUserId }),
+      headers: { 'x-user-id': userId },
     });
   }
 
   async unblockUser(userId: string, blockedUserId: string) {
-    return fetchService(`${this.baseUrl}/friends/unblock`, {
+    return fetchService(`${this.baseUrl}/friends/${seg(blockedUserId)}/unblock`, {
       method: 'POST',
-      body: JSON.stringify({ userId, blockedUserId }),
+      headers: { 'x-user-id': userId },
     });
   }
 }
@@ -583,7 +611,7 @@ class CallsProxy {
   }
 
   async joinCall(callId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/calls/${callId}/join`, {
+    return fetchService(`${this.baseUrl}/calls/${seg(callId)}/join`, {
       method: 'POST',
       headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
@@ -592,7 +620,7 @@ class CallsProxy {
 
   async getCall(callId: string): Promise<{ id: string; participants: string[]; status: string } | null> {
     try {
-      return await fetchService<{ id: string; participants: string[]; status: string }>(`${this.baseUrl}/calls/${callId}`, {
+      return await fetchService<{ id: string; participants: string[]; status: string }>(`${this.baseUrl}/calls/${seg(callId)}`, {
         method: 'GET',
         headers: this.internalHeaders(),
       });
@@ -602,7 +630,7 @@ class CallsProxy {
   }
 
   async rejectCall(callId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/calls/${callId}/reject`, {
+    return fetchService(`${this.baseUrl}/calls/${seg(callId)}/reject`, {
       method: 'POST',
       headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
@@ -610,7 +638,7 @@ class CallsProxy {
   }
 
   async endCall(callId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/calls/${callId}/end`, {
+    return fetchService(`${this.baseUrl}/calls/${seg(callId)}/end`, {
       method: 'POST',
       headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
@@ -618,7 +646,7 @@ class CallsProxy {
   }
 
   async leaveCall(callId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/calls/${callId}/leave`, {
+    return fetchService(`${this.baseUrl}/calls/${seg(callId)}/leave`, {
       method: 'POST',
       headers: this.internalHeaders(userId),
       body: JSON.stringify({ userId }),
@@ -648,7 +676,7 @@ class CallsProxy {
 
   async getCallQuality(callId: string) {
     return fetchService<{ callId: string; tier: number; participantCount: number; callCategory: string }>(
-      `${this.baseUrl}/calls/${callId}/quality`,
+      `${this.baseUrl}/calls/${seg(callId)}/quality`,
       { method: 'GET', headers: this.internalHeaders() },
     );
   }
@@ -656,7 +684,7 @@ class CallsProxy {
   async getServerLimit(serverId: string) {
     try {
       const res = await fetchService<{ maxParticipants: number }>(
-        `${this.baseUrl}/calls/limits/${serverId}`,
+        `${this.baseUrl}/calls/limits/${seg(serverId)}`,
         { method: 'GET', headers: this.internalHeaders() },
       );
       return res.maxParticipants;
@@ -683,6 +711,7 @@ class MediaServerProxy {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
@@ -706,11 +735,11 @@ class MediaServerProxy {
   }
 
   async destroyRoom(callId: string) {
-    return this.del(`/internal/rooms/${callId}`);
+    return this.del(`/internal/rooms/${seg(callId)}`);
   }
 
   async getRtpCapabilities(callId: string) {
-    return this.get<{ rtpCapabilities: unknown }>(`/internal/rooms/${callId}/capabilities`);
+    return this.get<{ rtpCapabilities: unknown }>(`/internal/rooms/${seg(callId)}/capabilities`);
   }
 
   async createTransport(callId: string, userId: string, direction: 'send' | 'recv') {
@@ -719,15 +748,15 @@ class MediaServerProxy {
       iceParameters: unknown;
       iceCandidates: unknown;
       dtlsParameters: unknown;
-    }>(`/internal/rooms/${callId}/transports`, { userId, direction });
+    }>(`/internal/rooms/${seg(callId)}/transports`, { userId, direction });
   }
 
-  async connectTransport(callId: string, transportId: string, dtlsParameters: unknown) {
-    return this.post(`/internal/rooms/${callId}/connect`, { transportId, dtlsParameters });
+  async connectTransport(callId: string, transportId: string, dtlsParameters: unknown, userId: string) {
+    return this.post(`/internal/rooms/${seg(callId)}/connect`, { transportId, dtlsParameters, userId });
   }
 
   async produce(callId: string, transportId: string, kind: string, rtpParameters: unknown, userId: string, appData?: unknown) {
-    return this.post<{ producerId: string }>(`/internal/rooms/${callId}/produce`, {
+    return this.post<{ producerId: string }>(`/internal/rooms/${seg(callId)}/produce`, {
       transportId, kind, rtpParameters, userId, appData,
     });
   }
@@ -735,24 +764,24 @@ class MediaServerProxy {
   async consume(callId: string, recvTransportId: string, producerId: string, rtpCapabilities: unknown, userId: string) {
     return this.post<{
       consumerId: string; producerId: string; kind: string; rtpParameters: unknown; paused: boolean;
-    }>(`/internal/rooms/${callId}/consume`, { recvTransportId, producerId, rtpCapabilities, userId });
+    }>(`/internal/rooms/${seg(callId)}/consume`, { recvTransportId, producerId, rtpCapabilities, userId });
   }
 
-  async resumeConsumer(callId: string, consumerId: string) {
-    return this.post(`/internal/rooms/${callId}/resume`, { consumerId });
+  async resumeConsumer(callId: string, consumerId: string, userId: string) {
+    return this.post(`/internal/rooms/${seg(callId)}/resume`, { consumerId, userId });
   }
 
-  async closeProducer(callId: string, producerId: string) {
-    return this.post(`/internal/rooms/${callId}/close-producer`, { producerId });
+  async closeProducer(callId: string, producerId: string, userId: string) {
+    return this.post(`/internal/rooms/${seg(callId)}/close-producer`, { producerId, userId });
   }
 
   async getRoomStats(callId: string) {
-    return this.get<{ participantCount: number; tier: number }>(`/internal/rooms/${callId}/stats`);
+    return this.get<{ participantCount: number; tier: number }>(`/internal/rooms/${seg(callId)}/stats`);
   }
 
   async getProducers(callId: string) {
     return this.get<{ producers: { producerId: string; userId: string; kind: string }[] }>(
-      `/internal/rooms/${callId}/producers`,
+      `/internal/rooms/${seg(callId)}/producers`,
     );
   }
 }
@@ -764,31 +793,31 @@ class ServersProxy {
   private get baseUrl(): string { return resolveServiceUrl('servers', this._fallbackUrl); }
 
   async getUserServers(userId: string, token?: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${userId}`, token ? { token } : undefined);
+    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${seg(userId)}`, token ? { token } : undefined);
   }
 
   async getServer(serverId: string) {
-    return fetchService<any>(`${this.baseUrl}/servers/${serverId}`);
+    return fetchService<any>(`${this.baseUrl}/servers/${seg(serverId)}`);
   }
 
   async getServerChannels(serverId: string, userId?: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/channels`, {
+    return fetchService<any[]>(`${this.baseUrl}/servers/${seg(serverId)}/channels`, {
       headers: {
         ...(userId ? { 'x-user-id': userId } : {}),
       },
     });
   }
 
-  async joinServer(serverId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/join`, {
+  async joinServer(serverId: string, userId: string, inviteCode?: string) {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/join`, {
       method: 'POST',
       headers: { 'x-user-id': userId },
-      body: JSON.stringify({ userId }),
+      body: JSON.stringify({ userId, ...(inviteCode ? { inviteCode } : {}) }),
     });
   }
 
   async leaveServer(serverId: string, userId: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/leave`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/leave`, {
       method: 'POST',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
@@ -810,7 +839,7 @@ class ServersProxy {
   }
 
   async updateServer(serverId: string, updates: any, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}`, {
       method: 'PATCH',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ ...updates, userId }),
@@ -819,7 +848,7 @@ class ServersProxy {
   }
 
   async deleteServer(serverId: string, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}`, {
       method: 'DELETE',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
@@ -828,7 +857,7 @@ class ServersProxy {
   }
 
   async createChannel(serverId: string, data: { name: string; type: string; parentId?: string }, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/channels`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels`, {
       method: 'POST',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ ...data, userId }),
@@ -837,7 +866,7 @@ class ServersProxy {
   }
 
   async updateChannel(serverId: string, channelId: string, updates: any, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}`, {
       method: 'PATCH',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ ...updates, userId }),
@@ -846,7 +875,7 @@ class ServersProxy {
   }
 
   async deleteChannel(serverId: string, channelId: string, userId: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}`, {
       method: 'DELETE',
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
@@ -855,7 +884,7 @@ class ServersProxy {
   }
 
   async kickMember(serverId: string, memberUserId: string, requesterId: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}/kick`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/members/${seg(memberUserId)}/kick`, {
       method: 'POST',
       headers: { 'x-user-id': requesterId },
       body: JSON.stringify({ requesterId }),
@@ -863,7 +892,7 @@ class ServersProxy {
   }
 
   async banMember(serverId: string, memberUserId: string, requesterId: string, reason?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}/ban`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/members/${seg(memberUserId)}/ban`, {
       method: 'POST',
       headers: { 'x-user-id': requesterId },
       body: JSON.stringify({ requesterId, reason }),
@@ -872,43 +901,48 @@ class ServersProxy {
 
   // ============ MESSAGES SERVEUR ============
 
-  async getChannelMessages(serverId: string, channelId: string, limit = 50, before?: string) {
-    let url = `${this.baseUrl}/servers/${serverId}/channels/${channelId}/messages?limit=${limit}`;
-    if (before) url += `&before=${before}`;
-    return fetchService<any[]>(url);
+  async getChannelMessages(serverId: string, channelId: string, limit = 50, before?: string, userId?: string) {
+    let url = `${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/messages?limit=${Math.min(Math.max(Number(limit) || 50, 1), 100)}`;
+    if (before) url += `&before=${encodeURIComponent(String(before))}`;
+    return fetchService<any[]>(url, userId ? { headers: { 'x-user-id': userId } } : undefined);
   }
 
   async createServerMessage(serverId: string, channelId: string, data: { senderId: string; content: string; attachments?: string[]; replyToId?: string; tags?: string[] }) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/channels/${channelId}/messages`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/messages`, {
       method: 'POST',
+      headers: { 'x-user-id': data.senderId },
       body: JSON.stringify(data),
     });
   }
 
   async editServerMessage(serverId: string, messageId: string, content: string, senderId: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/messages/${messageId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/messages/${seg(messageId)}`, {
       method: 'PATCH',
+      headers: { 'x-user-id': senderId },
       body: JSON.stringify({ content, senderId }),
     });
   }
 
   async deleteServerMessage(serverId: string, messageId: string, senderId: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/messages/${messageId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/messages/${seg(messageId)}`, {
       method: 'DELETE',
+      headers: { 'x-user-id': senderId },
       body: JSON.stringify({ senderId }),
     });
   }
 
   async addServerReaction(serverId: string, messageId: string, userId: string, emoji: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/messages/${messageId}/reactions`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/messages/${seg(messageId)}/reactions`, {
       method: 'POST',
+      headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId, emoji }),
     });
   }
 
   async removeServerReaction(serverId: string, messageId: string, userId: string, emoji: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/messages/${seg(messageId)}/reactions/${encodeURIComponent(String(emoji))}`, {
       method: 'DELETE',
+      headers: { 'x-user-id': userId },
       body: JSON.stringify({ userId }),
     });
   }
@@ -916,11 +950,11 @@ class ServersProxy {
   // ============ MEMBRES ============
 
   async getMembers(serverId: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/members`);
+    return fetchService<any[]>(`${this.baseUrl}/servers/${seg(serverId)}/members`);
   }
 
   async updateMember(serverId: string, memberUserId: string, data: { roleIds?: string[]; nickname?: string }, actorId?: string, token?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/members/${memberUserId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/members/${seg(memberUserId)}`, {
       method: 'PATCH',
       headers: actorId ? { 'x-user-id': actorId } : undefined,
       body: JSON.stringify(data),
@@ -929,7 +963,7 @@ class ServersProxy {
   }
 
   async isMember(serverId: string, userId: string): Promise<boolean> {
-    const result = await fetchService<{ isMember: boolean }>(`${this.baseUrl}/servers/${serverId}/members/${userId}/check`);
+    const result = await fetchService<{ isMember: boolean }>(`${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/check`);
     return result.isMember === true;
   }
 
@@ -940,16 +974,16 @@ class ServersProxy {
    */
   async getMemberPermissions(serverId: string, userId: string) {
     return fetchService<{ isMember: boolean; isOwner: boolean; permissions: number }>(
-      `${this.baseUrl}/servers/${serverId}/members/${userId}/permissions`,
+      `${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/permissions`,
     );
   }
 
   async getRoles(serverId: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/roles`);
+    return fetchService<any[]>(`${this.baseUrl}/servers/${seg(serverId)}/roles`);
   }
 
   async createRole(serverId: string, data: { name: string; color?: string; permissions?: any }, userId?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/roles`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/roles`, {
       method: 'POST',
       headers: userId ? { 'x-user-id': userId } : undefined,
       body: JSON.stringify(data),
@@ -957,7 +991,7 @@ class ServersProxy {
   }
 
   async updateRole(serverId: string, roleId: string, data: any, userId?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/roles/${seg(roleId)}`, {
       method: 'PATCH',
       headers: userId ? { 'x-user-id': userId } : undefined,
       body: JSON.stringify(data),
@@ -965,7 +999,7 @@ class ServersProxy {
   }
 
   async deleteRole(serverId: string, roleId: string, userId?: string) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/roles/${roleId}`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/roles/${seg(roleId)}`, {
       method: 'DELETE',
       headers: userId ? { 'x-user-id': userId } : undefined,
     });
@@ -974,18 +1008,26 @@ class ServersProxy {
   // ============ INVITATIONS ============
 
   async createInvite(serverId: string, data: { creatorId: string; maxUses?: number; expiresIn?: number; customSlug?: string; isPermanent?: boolean; code?: string; id?: string }) {
-    return fetchService(`${this.baseUrl}/servers/${serverId}/invites`, {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/invites`, {
       method: 'POST',
+      headers: { 'x-user-id': data.creatorId },
       body: JSON.stringify(data),
     });
   }
 
+  async deleteInvite(inviteId: string, userId: string) {
+    return fetchService(`${this.baseUrl}/servers/invites/${seg(inviteId)}`, {
+      method: 'DELETE',
+      headers: { 'x-user-id': userId },
+    });
+  }
+
   async getInvites(serverId: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers/${serverId}/invites`);
+    return fetchService<any[]>(`${this.baseUrl}/servers/${seg(serverId)}/invites`);
   }
 
   async resolveInvite(code: string) {
-    return fetchService(`${this.baseUrl}/servers/invite/${code}`);
+    return fetchService(`${this.baseUrl}/servers/invite/${seg(code)}`);
   }
 
   async joinByInvite(inviteCode: string, userId: string) {
@@ -1018,7 +1060,7 @@ class BotsProxy {
   private get baseUrl(): string { return resolveServiceUrl('bots', this._fallbackUrl); }
 
   async getBot(botId: string) {
-    return fetchService(`${this.baseUrl}/bots/${botId}`);
+    return fetchService(`${this.baseUrl}/bots/${seg(botId)}`);
   }
 
   async validateBotToken(token: string) {

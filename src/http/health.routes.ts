@@ -32,7 +32,7 @@ export function registerHealthRoutes(app: Express): void {
 
     if (token) {
       try {
-        const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+        const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as { userId: string };
         tokenValid = true;
         userId = decoded.userId;
       } catch {}

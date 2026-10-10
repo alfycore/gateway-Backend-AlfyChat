@@ -10,6 +10,7 @@ import { gatewayRegistry } from '../lb/gateway-registry';
 import { monitoringDB } from '../utils/monitoring-db';
 import { logger } from '../utils/logger';
 import { INTERNAL_SECRET } from '../config/env';
+import { safeSecretEqual } from '../utils/node-endpoint';
 
 const GATEWAY_ID           = process.env.GATEWAY_ID || 'gateway-default';
 const HEARTBEAT_INTERVAL   = 30_000;
@@ -36,7 +37,7 @@ export function registerLBRoutes(app: Express): void {
 
     // Fallback : INTERNAL_SECRET + serviceId dans le body (SERVICE_KEY absent)
     if (!key?.startsWith('sk_')) {
-      if (!internalSecret || internalSecret !== INTERNAL_SECRET) {
+      if (!safeSecretEqual(internalSecret, INTERNAL_SECRET)) {
         return res.status(401).json({ error: 'X-Service-Key requis (format sk_...) ou X-Internal-Secret valide' });
       }
       if (!bodyServiceId || typeof bodyServiceId !== 'string') {
@@ -80,7 +81,7 @@ export function registerLBRoutes(app: Express): void {
 
     if (key) {
       serviceId = lbRegistry.validateKey(key);
-    } else if (internalSecret === INTERNAL_SECRET) {
+    } else if (safeSecretEqual(internalSecret, INTERNAL_SECRET)) {
       serviceId = (req.body?.serviceId as string) ?? null;
     }
 
@@ -112,7 +113,7 @@ export function registerLBRoutes(app: Express): void {
     let serviceId: string | null = null;
     if (key) {
       serviceId = lbRegistry.validateKey(key);
-    } else if (internalSecret === INTERNAL_SECRET) {
+    } else if (safeSecretEqual(internalSecret, INTERNAL_SECRET)) {
       serviceId = (req.body?.serviceId as string) ?? null;
     }
 

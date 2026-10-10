@@ -3,7 +3,7 @@
 // ==========================================
 
 import express from 'express';
-import { extractUserIdFromJWT, safeJson } from './helpers';
+import { extractUserIdFromJWT, safeJson, apiPath, clientIpHeaders, setSafeFileHeaders } from './helpers';
 import { allowedOrigins, IS_PRODUCTION } from '../config/env';
 import { logger } from '../utils/logger';
 import { serviceRegistry, type ServiceType } from '../utils/service-registry';
@@ -78,17 +78,19 @@ export async function proxyRequest(
 ) {
   const SKIP_USERID_INJECT = ['/friends/request'];
   const userId = extractUserIdFromJWT(req.headers.authorization);
-  const skipInject = SKIP_USERID_INJECT.some(path => req.originalUrl.replace(/^\/api/, '').startsWith(path));
+  const servicePath = apiPath(req).replace(/^\/api/, '');
+  const skipInject = SKIP_USERID_INJECT.some(path => servicePath.toLowerCase().startsWith(path));
   let bodyToSend = req.body;
-  if (userId && req.method !== 'GET' && req.method !== 'HEAD' && !skipInject) {
-    // `ownerId` n'est plus injecté : aucun service ne le lit dans le corps (tous
-    // dérivent le propriétaire de req.userId), et l'injecter partout aurait fait
-    // du premier service qui s'y fierait une prise de contrôle silencieuse.
-    bodyToSend = { ...req.body, userId };
+  if (req.method !== 'GET' && req.method !== 'HEAD' && !skipInject && bodyToSend && typeof bodyToSend === 'object' && !Array.isArray(bodyToSend)) {
+    // Le `userId` du corps est TOUJOURS celui du jeton : sans jeton, il est
+    // retiré (il passait auparavant tel que fourni par le client). `ownerId`
+    // n'est jamais transmis : aucun service ne doit le lire dans le corps.
+    const { userId: _clientUserId, ownerId: _clientOwnerId, ...rest } = bodyToSend as Record<string, unknown>;
+    bodyToSend = userId ? { ...rest, userId } : rest;
   }
 
   const doFetch = async (baseUrl: string) => {
-    const url = `${baseUrl}${req.originalUrl.replace(/^\/api/, '')}`;
+    const url = `${baseUrl}${servicePath}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15_000);
     try {
@@ -98,6 +100,8 @@ export async function proxyRequest(
           'Content-Type': 'application/json',
           ...(req.headers.authorization && { authorization: req.headers.authorization }),
           ...(userId && { 'X-User-Id': userId }),
+          ...clientIpHeaders(req),
+          ...(req.headers['user-agent'] && { 'user-agent': String(req.headers['user-agent']).slice(0, 512) }),
         },
         ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
         signal: controller.signal,
@@ -227,7 +231,8 @@ export async function proxyToNode(
       res.status(response.status).json(data);
     } else if (contentType && (contentType.startsWith('image/') || contentType.startsWith('video/') || contentType.startsWith('audio/') || contentType.startsWith('application/octet-stream') || contentType.startsWith('application/pdf'))) {
       const buffer = Buffer.from(await response.arrayBuffer());
-      res.setHeader('Content-Type', contentType);
+      // Contenu fourni par un node tiers : jamais rendu tel quel (SVG, etc.).
+      setSafeFileHeaders(res, contentType);
       const cacheControl = response.headers.get('cache-control');
       if (cacheControl) res.setHeader('Cache-Control', cacheControl);
       res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
@@ -372,7 +377,7 @@ export async function proxyToMedia(
       contentType.startsWith('audio/') ||
       contentType.startsWith('application/octet-stream')
     ) {
-      res.setHeader('Content-Type', contentType);
+      setSafeFileHeaders(res, contentType);
       res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       const cc = response.headers.get('cache-control');
@@ -383,11 +388,54 @@ export async function proxyToMedia(
       // Diffusion en flux : ne jamais charger un média entier en mémoire.
       await pipeResponseBody(response, res);
     } else {
-      res.status(response.status).send(await response.text());
+      // Tout autre type (text/html, image/svg+xml…) est servi en pièce jointe.
+      setSafeFileHeaders(res, contentType);
+      res.status(response.status).send(Buffer.from(await response.arrayBuffer()));
     }
   } catch (err) {
     logger.error({ err: err }, 'Erreur proxy média:');
     if (!res.headersSent) res.status(502).json({ error: 'Service média indisponible' });
+  }
+}
+
+/**
+ * Relaie un webhook de paiement SANS toucher au corps : les prestataires signent
+ * les octets exacts (Stripe : `stripe-signature`, Tebex : `x-signature`, PayPal :
+ * `paypal-*`). L'ancien proxy JSON réencodait le corps et perdait ces en-têtes.
+ */
+const WEBHOOK_HEADERS = [
+  'content-type', 'stripe-signature', 'x-signature',
+  'paypal-transmission-id', 'paypal-transmission-time', 'paypal-transmission-sig',
+  'paypal-cert-url', 'paypal-auth-algo', 'user-agent',
+];
+
+export async function proxyRawWebhook(targetUrl: string, req: express.Request, res: express.Response) {
+  let body: Buffer;
+  try {
+    body = await readRawBody(req, 2 * 1024 * 1024);
+  } catch (err) {
+    return sendBodyError(res, err, 'Erreur lecture webhook:');
+  }
+  try {
+    const headers: Record<string, string> = {};
+    for (const h of WEBHOOK_HEADERS) {
+      const v = req.headers[h];
+      if (typeof v === 'string') headers[h] = v;
+    }
+    const response = await fetch(`${targetUrl}${apiPath(req).replace(/^\/api/, '')}`, {
+      method: req.method,
+      headers,
+      ...(req.method !== 'GET' && req.method !== 'HEAD' ? { body } : {}),
+      signal: AbortSignal.timeout(NODE_TIMEOUT_MS),
+    });
+    const text = await response.text();
+    res.status(response.status);
+    const ct = response.headers.get('content-type');
+    if (ct) res.setHeader('Content-Type', ct);
+    res.send(text);
+  } catch (err) {
+    logger.error({ err }, 'Erreur proxy webhook:');
+    if (!res.headersSent) res.status(502).json({ error: 'Service indisponible' });
   }
 }
 

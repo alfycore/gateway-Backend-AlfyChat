@@ -12,6 +12,8 @@ import { emitError } from '../utils/emit';
 // Redis key : call:mode:<callId> → 'p2p' | 'sfu'
 export const GROUP_SFU_THRESHOLD = parseInt(process.env.GROUP_SFU_THRESHOLD || '10');
 
+const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
 export function registerSfuHandlers(
   socket: AuthenticatedSocket,
   io: Server,
@@ -19,9 +21,23 @@ export function registerSfuHandlers(
 ): void {
   const userId = socket.userId!;
 
+  /**
+   * Le socket doit avoir rejoint l'appel (CALL_JOIN / CALL_ACCEPT /
+   * CALL_INITIATE_*, qui vérifient la participation). Aucun handler SFU ne le
+   * vérifiait : connaître un callId suffisait à consommer l'audio et la vidéo
+   * des participants, ou à couper leurs producers.
+   */
+  const inCall = (callId: unknown): callId is string =>
+    typeof callId === 'string' && ID_RE.test(callId) && socket.rooms.has(`call:${callId}`);
+
+  const deny = (callback: unknown) => {
+    if (typeof callback === 'function') callback({ error: 'NOT_IN_CALL' });
+  };
+
   // ── RTP Capabilities ────────────────────────────────────────────────────────
   // Client a besoin des codecs supportés par le router pour créer son Device mediasoup-client
   socket.on('SFU_GET_RTP_CAPABILITIES', async (data: { callId: string }, callback) => {
+    if (!inCall(data?.callId)) return deny(callback);
     try {
       const result = await serviceProxy.media.getRtpCapabilities(data.callId);
       if (typeof callback === 'function') callback(result);
@@ -36,6 +52,7 @@ export function registerSfuHandlers(
     data: { callId: string; direction: 'send' | 'recv' },
     callback,
   ) => {
+    if (!inCall(data?.callId)) return deny(callback);
     try {
       const result = await serviceProxy.media.createTransport(data.callId, userId, data.direction);
       if (typeof callback === 'function') callback(result);
@@ -50,8 +67,9 @@ export function registerSfuHandlers(
     data: { callId: string; transportId: string; dtlsParameters: unknown },
     callback,
   ) => {
+    if (!inCall(data?.callId)) return deny(callback);
     try {
-      await serviceProxy.media.connectTransport(data.callId, data.transportId, data.dtlsParameters);
+      await serviceProxy.media.connectTransport(data.callId, data.transportId, data.dtlsParameters, userId);
       if (typeof callback === 'function') callback({ success: true });
     } catch (error) {
       emitError(socket, 'SFU_ERROR', error);
@@ -64,6 +82,8 @@ export function registerSfuHandlers(
     data: { callId: string; transportId: string; kind: 'audio' | 'video'; rtpParameters: unknown; appData?: unknown },
     callback,
   ) => {
+    if (!inCall(data?.callId)) return deny(callback);
+    if (data.kind !== 'audio' && data.kind !== 'video') return deny(callback);
     try {
       const result = await serviceProxy.media.produce(
         data.callId, data.transportId, data.kind, data.rtpParameters, userId, data.appData,
@@ -92,8 +112,10 @@ export function registerSfuHandlers(
   socket.on('SFU_CLOSE_PRODUCER', async (
     data: { callId: string; producerId: string },
   ) => {
+    if (!inCall(data?.callId)) return;
     try {
-      await serviceProxy.media.closeProducer(data.callId, data.producerId);
+      // Le media-server vérifie que ce producer appartient bien à `userId`.
+      await serviceProxy.media.closeProducer(data.callId, data.producerId, userId);
       socket.to(`call:${data.callId}`).emit('SFU_PRODUCER_CLOSED', {
         type: 'SFU_PRODUCER_CLOSED',
         payload: { callId: data.callId, producerId: data.producerId, userId },
@@ -109,6 +131,7 @@ export function registerSfuHandlers(
     data: { callId: string; producerId: string; rtpCapabilities: unknown; recvTransportId: string },
     callback,
   ) => {
+    if (!inCall(data?.callId)) return deny(callback);
     try {
       const result = await serviceProxy.media.consume(
         data.callId, data.recvTransportId, data.producerId, data.rtpCapabilities, userId,
@@ -125,8 +148,9 @@ export function registerSfuHandlers(
     data: { callId: string; consumerId: string },
     callback,
   ) => {
+    if (!inCall(data?.callId)) return deny(callback);
     try {
-      await serviceProxy.media.resumeConsumer(data.callId, data.consumerId);
+      await serviceProxy.media.resumeConsumer(data.callId, data.consumerId, userId);
       if (typeof callback === 'function') callback({ success: true });
     } catch (error) {
       emitError(socket, 'SFU_ERROR', error);
@@ -135,6 +159,7 @@ export function registerSfuHandlers(
 
   // ── Raise / Lower hand (appels serveur) ─────────────────────────────────────
   socket.on('CALL_RAISE_HAND', (data: { callId: string }) => {
+    if (!inCall(data?.callId)) return;
     socket.to(`call:${data.callId}`).emit('CALL_HAND_RAISED', {
       type: 'CALL_HAND_RAISED',
       payload: { callId: data.callId, userId },
@@ -143,6 +168,7 @@ export function registerSfuHandlers(
   });
 
   socket.on('CALL_LOWER_HAND', (data: { callId: string }) => {
+    if (!inCall(data?.callId)) return;
     socket.to(`call:${data.callId}`).emit('CALL_HAND_LOWERED', {
       type: 'CALL_HAND_LOWERED',
       payload: { callId: data.callId, userId },

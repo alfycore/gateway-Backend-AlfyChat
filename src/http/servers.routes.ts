@@ -1,10 +1,12 @@
 import type { Express } from 'express';
 import { proxyRequest, proxyToNode, proxyToNodeMultipart, proxyMultipartToService } from './proxy';
-import { extractUserIdFromJWT, getServiceUrl, rewriteNodePath } from './helpers';
+import { extractUserIdFromJWT, getServiceUrl, rewriteNodePath, setSafeFileHeaders, isSafeFileSegment } from './helpers';
 import { forwardToNode } from '../services/forward';
 import { connectedNodes } from '../state/connections';
 import { logger } from '../utils/logger';
 import { SERVERS_URL, allowedOrigins } from '../config/env';
+
+const SERVER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function registerServersRoutes(app: Express): void {
   // Routes Servers — proxy intelligent : redirige vers le server-node si connecté
@@ -21,11 +23,12 @@ export function registerServersRoutes(app: Express): void {
   app.get('/api/servers', async (req, res) => {
     try {
       const userId = extractUserIdFromJWT(req.headers.authorization);
+      if (!userId) return res.status(401).json({ error: 'Authentification requise' });
       const serviceUrl = getServiceUrl('servers', SERVERS_URL);
       if (!serviceUrl) {
         return res.status(503).json({ error: 'Service indisponible — aucune instance active' });
       }
-      const url = `${serviceUrl}/servers?userId=${userId || ''}`;
+      const url = `${serviceUrl}/servers?userId=${encodeURIComponent(userId)}`;
       const response = await fetch(url, {
         method: 'GET',
         headers: {
@@ -80,6 +83,7 @@ export function registerServersRoutes(app: Express): void {
   // Route spécifique upload fichiers serveur (avant le catch-all /:serverId/*)
   app.post('/api/servers/:serverId/files', (req, res) => {
     const { serverId } = req.params;
+    if (!SERVER_ID_RE.test(serverId)) { res.status(400).json({ error: 'serverId invalide' }); return; }
     const node = connectedNodes.get(serverId);
     const query = req.originalUrl.includes('?') ? '?' + req.originalUrl.split('?')[1] : '';
 
@@ -94,15 +98,20 @@ export function registerServersRoutes(app: Express): void {
   // Serve fichiers uploadés (fallback sans node)
   app.get('/api/servers/:serverId/files/:filename', async (req, res) => {
     const { serverId, filename } = req.params;
+    // Paramètres décodés par Express : `..%2F` devenait `../` et visait
+    // d'autres routes du microservice, sans authentification.
+    if (!SERVER_ID_RE.test(serverId) || !isSafeFileSegment(filename)) {
+      res.status(400).json({ error: 'Chemin invalide' });
+      return;
+    }
     const node = connectedNodes.get(serverId);
 
     if (node?.endpoint) {
       // Proxy vers le node
       try {
-        const response = await fetch(`${node.endpoint}/files/${filename}`);
+        const response = await fetch(`${node.endpoint}/files/${encodeURIComponent(filename)}`, { signal: AbortSignal.timeout(20_000) });
         if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
-        const ct = response.headers.get('content-type');
-        if (ct) res.setHeader('Content-Type', ct);
+        setSafeFileHeaders(res, response.headers.get('content-type'));
         res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
         res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
         res.send(Buffer.from(await response.arrayBuffer()));
@@ -111,10 +120,9 @@ export function registerServersRoutes(app: Express): void {
     }
     // Fallback vers le servers microservice
     try {
-      const response = await fetch(`${getServiceUrl('servers', SERVERS_URL)}/servers/${serverId}/files/${filename}`);
+      const response = await fetch(`${getServiceUrl('servers', SERVERS_URL)}/servers/${encodeURIComponent(serverId)}/files/${encodeURIComponent(filename)}`, { signal: AbortSignal.timeout(20_000) });
       if (!response.ok) { res.status(response.status).json({ error: 'Fichier non trouvé' }); return; }
-      const ct = response.headers.get('content-type');
-      if (ct) res.setHeader('Content-Type', ct);
+      setSafeFileHeaders(res, response.headers.get('content-type'));
       res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0] || 'http://localhost:4000');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       res.send(Buffer.from(await response.arrayBuffer()));

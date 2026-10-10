@@ -5,6 +5,7 @@
 
 import { lbRegistry, generateServiceKey as _gen, hashServiceKey } from '../lb/registry';
 import { INTERNAL_SECRET } from '../config/env';
+import { safeSecretEqual } from '../utils/node-endpoint';
 
 export { generateServiceKey } from '../lb/registry';
 
@@ -36,5 +37,5 @@ export function validateServiceSecret(id: string, secret: string): boolean {
   if (secret.startsWith('sk_')) {
     return lbRegistry.validateKey(secret) === id;
   }
-  return secret === INTERNAL_SECRET;
+  return safeSecretEqual(secret, INTERNAL_SECRET);
 }

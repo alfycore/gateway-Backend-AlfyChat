@@ -40,19 +40,28 @@ export const RATE_LIMIT_WINDOW = 1;
 
 export const RATE_LIMIT_AUTH_POINTS = parseInt(process.env.RATE_LIMIT_AUTH_POINTS || '30');
 export const RATE_LIMIT_AUTH_WINDOW = parseInt(process.env.RATE_LIMIT_AUTH_WINDOW || '300');
+// Chemins comparés en MINUSCULES (Express route sans tenir compte de la casse :
+// `/api/AUTH/login` atteignait le login sans passer par ce limiteur).
 export const AUTH_BRUTEFORCE_PATHS = [
   '/api/auth/login',
   '/api/auth/register',
+  '/api/auth/2fa/login',          // vraie route du code 2FA (l'ancienne entrée « verify-2fa » n'existait pas)
   '/api/auth/verify-2fa',
   '/api/auth/forgot-password',
   '/api/auth/reset-password',
   '/api/auth/resend-verification-email',
+  '/api/auth/remote/init',
+  '/api/helpdesk/public/tickets',  // ticket invité → e-mail envoyé à une adresse arbitraire
+  '/api/archive/external-db',      // connexion sortante vers un hôte fourni par l'utilisateur
 ];
 
-// Patterns brute-forçables (codes/tokens courts) — le middleware applique le même
-// rate-limit aux chemins qui matchent l'une de ces regex.
+// Patterns brute-forçables (codes/tokens courts, vérifications de mot de passe) —
+// le middleware applique le même rate-limit aux chemins qui matchent.
 export const AUTH_BRUTEFORCE_REGEX: RegExp[] = [
-  /^\/api\/servers\/[^/]+\/claim-admin$/, // code à 8 caractères (~40 bits)
+  /^\/api\/servers\/[^/]+\/claim-admin$/,
+  /^\/api\/users\/[^/]+\/change-password$/,
+  /^\/api\/users\/[^/]+\/change-username$/,
+  /^\/api\/auth\/2fa\/(enable|disable)$/,
 ];
 
 // ── Trusted reverse-proxy IPs ───────────────────────────────────────

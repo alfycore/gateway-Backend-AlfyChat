@@ -3,6 +3,7 @@ import { proxyToMedia } from './proxy';
 import { serviceRegistry } from '../utils/service-registry';
 import { logger } from '../utils/logger';
 import { MEDIA_URL, allowedOrigins } from '../config/env';
+import { apiPath, setSafeFileHeaders, isSafeFileSegment } from './helpers';
 
 /** Résout l'endpoint d'un service média en ignorant les instances localhost quand MEDIA_URL est distant. */
 const LOCAL_HOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/;
@@ -37,6 +38,13 @@ export function registerMediaRoutes(app: Express): void {
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
     const { location, serviceId, folder, filename } = req.params;
+    // Les paramètres sont DÉCODÉS par Express : `..%2F..` devenait `../..` et
+    // permettait d'atteindre d'autres routes, sur n'importe quel service
+    // enregistré (users, servers…), sans authentification.
+    if (!isSafeFileSegment(folder) || !isSafeFileSegment(filename) || !/^[A-Za-z]{1,8}$/.test(location)) {
+      res.status(400).json({ error: 'Chemin invalide' });
+      return;
+    }
 
     // Détermine si une instance doit être ignorée car son endpoint localhost
     // est injoignable depuis le gateway en environnement Docker/distribué,
@@ -47,7 +55,9 @@ export function registerMediaRoutes(app: Express): void {
       !!inst?.isLocal && mediaUrlIsDistant;
 
     // 1. Chercher l'instance par serviceId dans le registre (même si unhealthy — pour les fichiers déjà uploadés, le statut de santé ne doit pas bloquer la récupération)
+    // Uniquement une instance du service MÉDIA : l'identifiant venait de l'URL.
     let instance = serviceRegistry.getById(serviceId);
+    if (instance && instance.serviceType !== 'media') instance = undefined;
     if (isUnreachableLocal(instance)) {
       logger.warn(`MediaProxy: instance ${serviceId} a un endpoint local (${instance!.endpoint}), fallback sur endpoint distant`);
       instance = undefined;
@@ -67,7 +77,7 @@ export function registerMediaRoutes(app: Express): void {
 
     // Si toutes les instances connues sont locales et MEDIA_URL est distant → utiliser MEDIA_URL directement
     const targetEndpoint = instance?.endpoint ?? MEDIA_URL;
-    const mediaPath = `/uploads/${folder}/${filename}`;
+    const mediaPath = `/uploads/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
 
     const tryFetch = async (endpoint: string) => {
       const response = await fetch(`${endpoint}${mediaPath}`);
@@ -93,7 +103,7 @@ export function registerMediaRoutes(app: Express): void {
       }
       const contentType = response.headers.get('content-type');
       const cacheControl = response.headers.get('cache-control');
-      if (contentType) res.setHeader('Content-Type', contentType);
+      setSafeFileHeaders(res, contentType);
       if (cacheControl) res.setHeader('Cache-Control', cacheControl);
       res.send(Buffer.from(await response.arrayBuffer()));
     } catch (err) {
@@ -111,7 +121,7 @@ export function registerMediaRoutes(app: Express): void {
     const targetEndpoint = resolveMediaEndpoint(preferredLocation);
 
     // Réécrire l'URL vers /media/upload/:type (le préfixe /api est retiré)
-    const mediaPath = req.originalUrl.replace(/^\/api/, '');
+    const mediaPath = apiPath(req).replace(/^\/api/, '');
     proxyToMedia(targetEndpoint, mediaPath, req, res);
   });
 
@@ -120,7 +130,7 @@ export function registerMediaRoutes(app: Express): void {
     const preferredLocation = (req.headers['x-media-location'] as string | undefined)
       ?? (req.query.location as string | undefined);
     const targetEndpoint = resolveMediaEndpoint(preferredLocation);
-    const mediaPath = req.originalUrl.replace(/^\/api/, '');
+    const mediaPath = apiPath(req).replace(/^\/api/, '');
     proxyToMedia(targetEndpoint, mediaPath, req, res);
   });
 
@@ -135,7 +145,12 @@ export function registerMediaRoutes(app: Express): void {
       const targetEndpoint = (rawInstance && rawInstance.isLocal && MEDIA_URL && !LOCAL_HOST_RE.test(MEDIA_URL))
         ? MEDIA_URL
         : (rawInstance?.endpoint ?? MEDIA_URL);
-      const url = `${targetEndpoint}${req.originalUrl}`;
+      const segments = req.path.replace(/^\/uploads\//, '').split('/');
+      if (segments.length < 1 || segments.length > 4 || !segments.every(isSafeFileSegment)) {
+        res.status(400).json({ error: 'Chemin invalide' });
+        return;
+      }
+      const url = `${targetEndpoint}/uploads/${segments.map(encodeURIComponent).join('/')}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -145,7 +160,7 @@ export function registerMediaRoutes(app: Express): void {
 
       const contentType = response.headers.get('content-type');
       const cacheControl = response.headers.get('cache-control');
-      if (contentType) res.setHeader('Content-Type', contentType);
+      setSafeFileHeaders(res, contentType);
       if (cacheControl) res.setHeader('Cache-Control', cacheControl);
 
       const buffer = Buffer.from(await response.arrayBuffer());
