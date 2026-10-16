@@ -102,6 +102,9 @@ export async function proxyRequest(
           ...(userId && { 'X-User-Id': userId }),
           ...clientIpHeaders(req),
           ...(req.headers['user-agent'] && { 'user-agent': String(req.headers['user-agent']).slice(0, 512) }),
+          // Origine du navigateur (déjà filtrée par le CORS du gateway) : le SSO
+          // de users vérifie que le code est échangé par le site qui l'a demandé.
+          ...(req.headers.origin && { 'x-client-origin': String(req.headers.origin).slice(0, 256) }),
         },
         ...(req.method !== 'GET' && req.method !== 'HEAD' && { body: JSON.stringify(bodyToSend) }),
         signal: controller.signal,

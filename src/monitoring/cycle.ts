@@ -8,8 +8,14 @@ import { monitoringDB } from '../utils/monitoring-db';
 import { serviceRegistry } from '../utils/service-registry';
 import { handleStatusTransition } from './kener-client';
 
+// FRONTEND_URL est une liste d'origines (CORS) : on sonde la première.
+const firstOrigin = (list: string | undefined, fallback: string) =>
+  (list || fallback).split(',')[0].trim() || fallback;
+
 export const MONITORED_SERVICES: { name: string; url: string }[] = [
-  { name: 'website',  url: `${process.env.FRONTEND_URL         || 'https://alfychat.app'}` },
+  { name: 'website',  url: firstOrigin(process.env.FRONTEND_URL, 'https://alfychat.app') },
+  { name: 'site',     url: process.env.SITE_URL || 'https://alfychat.com' },
+  { name: 'links',    url: `${process.env.LINKS_SERVICE_URL    || 'https://alfy.chat'}/health` },
   { name: 'users',    url: `${process.env.USERS_SERVICE_URL    || 'http://localhost:3001'}/health` },
   { name: 'messages', url: `${process.env.MESSAGES_SERVICE_URL || 'http://localhost:3002'}/health` },
   { name: 'friends',  url: `${process.env.FRIENDS_SERVICE_URL  || 'http://localhost:3003'}/health` },
