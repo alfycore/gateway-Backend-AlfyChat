@@ -70,6 +70,24 @@ import { RateLimiterRedis } from 'rate-limiter-flexible';
 const app = express();
 const httpServer = createServer(app);
 
+/**
+ * Webhooks entrants (POST /api/servers/webhooks/:id/:token) : appelés par des
+ * scripts, des CI… et des pages web. Le jeton dans l'URL est le seul secret
+ * (comme chez Discord), aucun cookie n'est lu : le CORS y est ouvert à toute
+ * origine. Posé AVANT le CORS global, qui refusait le préflight (403).
+ */
+const WEBHOOK_PATH = /^\/api\/servers\/webhooks\/[^/]+\/[^/]+\/?$/;
+app.use((req, res, next) => {
+  if (!WEBHOOK_PATH.test(req.path)) return next();
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Expose-Headers', 'Retry-After');
+  res.setHeader('Access-Control-Max-Age', '600');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
 const corsOptions = {
   origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
     // Autoriser les requêtes sans origin (apps natives, Postman…)
@@ -95,7 +113,8 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
     origin &&
     IS_PRODUCTION &&
     !allowedOrigins.includes(origin) &&
-    !/^http:\/\/localhost(:\d+)?$/.test(origin)
+    !/^http:\/\/localhost(:\d+)?$/.test(origin) &&
+    !WEBHOOK_PATH.test(req.path)
   ) {
     logger.warn(`CORS: origine non autorisée — ${origin}`);
     return res.status(403).json({ error: 'Origine non autorisée' });
@@ -321,6 +340,58 @@ app.post('/api/servers/:serverId/claim-admin', async (req: express.Request, res:
     res.json(data);
   } catch (err: any) {
     logger.error({ err }, 'Erreur claim-admin gateway hook:');
+    res.status(502).json({ error: 'Service indisponible' });
+  }
+});
+
+// ── Webhook entrant : débit borné + diffusion en direct ──────────────────────
+// Le service servers persiste le message ; il ne parle pas aux sockets, donc
+// le message n'apparaissait qu'au rechargement du salon. La passerelle le
+// diffuse au salon dès la réponse. Débit : 5 messages / 2 s par webhook
+// (l'ordre de grandeur de Discord), au-delà 429 + Retry-After.
+const WEBHOOK_BURST = 5;
+const WEBHOOK_WINDOW_MS = 2_000;
+const webhookHits = new Map<string, number[]>();
+app.post('/api/servers/webhooks/:webhookId/:token', async (req: express.Request, res: express.Response) => {
+  const { webhookId, token } = req.params;
+  if (!isId(webhookId) || !/^[A-Za-z0-9]{16,128}$/.test(token)) {
+    return res.status(401).json({ error: 'Webhook invalide', code: 'WEBHOOK_INVALID' });
+  }
+
+  const now = Date.now();
+  const hits = (webhookHits.get(webhookId) ?? []).filter((t) => now - t < WEBHOOK_WINDOW_MS);
+  if (hits.length >= WEBHOOK_BURST) {
+    const retryAfterMs = WEBHOOK_WINDOW_MS - (now - hits[0]);
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+    webhookHits.set(webhookId, hits);
+    return res.status(429).json({ error: 'Trop de messages — ralentis', code: 'RATE_LIMITED', retryAfterMs });
+  }
+  hits.push(now);
+  webhookHits.set(webhookId, hits);
+  if (webhookHits.size > 10_000) webhookHits.clear(); // borne mémoire (fenêtres de 2 s)
+
+  try {
+    const base = getServiceUrl('servers', SERVERS_URL);
+    const response = await fetch(`${base}/servers/webhooks/${encodeURIComponent(webhookId)}/${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body ?? {}),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = (await safeJson(response)) ?? { error: 'Réponse vide' };
+    if (!response.ok) return res.status(response.status).json(data);
+
+    const message = data as { serverId?: unknown; channelId?: unknown };
+    if (isId(message.serverId) && isId(message.channelId)) {
+      runtime.io.to(chRoom(message.serverId, message.channelId)).emit('SERVER_MESSAGE_NEW', {
+        type: 'SERVER_MESSAGE_NEW',
+        payload: data,
+        timestamp: new Date(),
+      });
+    }
+    res.status(201).json(data);
+  } catch (err: any) {
+    logger.error({ err }, 'Erreur webhook entrant:');
     res.status(502).json({ error: 'Service indisponible' });
   }
 });
