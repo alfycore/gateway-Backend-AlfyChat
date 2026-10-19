@@ -5830,6 +5830,15 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Route not found', path: req.path });
 });
 app.use((err: any, req: any, res: any, _next: any) => {
+  // Erreurs du client levées par le parseur JSON (corps illisible, trop gros…) :
+  // elles portent déjà leur statut 4xx. Elles finissaient en 500, comme une panne.
+  const status = Number(err?.status ?? err?.statusCode);
+  if (status >= 400 && status < 500) {
+    const message = err?.type === 'entity.parse.failed' ? 'JSON invalide'
+      : err?.type === 'entity.too.large' ? 'Corps de requête trop volumineux'
+      : 'Requête invalide';
+    return res.status(status).json({ error: message, code: String(err?.type ?? 'BAD_REQUEST').toUpperCase().replace(/[.-]/g, '_') });
+  }
   if (req.accepts(['html', 'json']) === 'html')
     return res.status(500).sendFile(path.join(__dirname, '../public/errors/500.html'));
   res.status(500).json({ error: 'Internal server error' });
