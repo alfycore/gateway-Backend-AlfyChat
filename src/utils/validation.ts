@@ -4,6 +4,8 @@
 // Source de vérité pour les entrées utilisateur.
 // Le frontend peut mentir — jamais le gateway.
 
+import { ALL_PERMS_MASK } from './permissions';
+
 export class ValidationError extends Error {
   constructor(public field: string, message: string) {
     super(`${field}: ${message}`);
@@ -243,23 +245,56 @@ export function validateServerInput(data: any): { name?: string; description?: s
   return out;
 }
 
-export function validateChannelInput(data: any): { name?: string; topic?: string; type?: string; parentId?: string } {
-  const out: any = {};
+export interface CleanChannelInput {
+  name?: string;
+  topic?: string;
+  type?: string;
+  parentId?: string | null;
+  isNsfw?: boolean;
+  slowMode?: number;
+  userLimit?: number;
+  position?: number;
+  isPrivate?: boolean;
+}
+
+export function validateChannelInput(data: any): CleanChannelInput {
+  const out: CleanChannelInput = {};
   if (data.name !== undefined) out.name = validateText(data.name, { field: 'name', ...LIMITS.channelName, required: true });
   if (data.topic !== undefined) out.topic = validateText(data.topic, { field: 'topic', ...LIMITS.channelTopic });
   if (data.type !== undefined) {
     if (!['text', 'voice', 'forum', 'announcement', 'stage', 'category', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia'].includes(data.type)) throw new ValidationError('type', 'invalid channel type');
     out.type = data.type;
   }
-  if (data.parentId !== undefined && typeof data.parentId === 'string') out.parentId = data.parentId;
+  if (data.parentId !== undefined) {
+    // `null` = sortir le salon de sa catégorie (glisser-déposer hors catégorie).
+    if (data.parentId === null || data.parentId === '') out.parentId = null;
+    else if (typeof data.parentId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(data.parentId)) out.parentId = data.parentId;
+    else throw new ValidationError('parentId', 'invalid id');
+  }
+  if (data.isNsfw !== undefined) out.isNsfw = validateBool(data.isNsfw, 'isNsfw');
+  // Mode lent : 0 à 6 h, comme Discord.
+  if (data.slowMode !== undefined) out.slowMode = validateInt(data.slowMode, 'slowMode', 0, 21_600);
+  // Limite d'utilisateurs d'un salon vocal : 0 = illimité.
+  if (data.userLimit !== undefined) out.userLimit = validateInt(data.userLimit, 'userLimit', 0, 99);
+  if (data.position !== undefined) out.position = validateInt(data.position, 'position', 0, 100_000);
+  if (data.isPrivate !== undefined) out.isPrivate = validateBool(data.isPrivate, 'isPrivate');
   return out;
 }
 
-// Bitmask de permissions valides (doit rester aligné avec PERM dans gateway/servers).
-// READ|SEND|REACT|MANAGE_MESSAGES|KICK|BAN|ADMIN|MANAGE_CHANNELS|MANAGE_ROLES|KICK_MEMBERS|BAN_MEMBERS
-const ALL_PERMS_MASK = 0xFFF;
+/** Réorganisation par lot (glisser-déposer) : au plus 500 salons. */
+export function validateChannelReorder(data: any): { id: string; position: number; parentId?: string | null }[] {
+  if (!Array.isArray(data) || data.length === 0 || data.length > 500) throw new ValidationError('positions', 'must be a non-empty array (max 500)');
+  return data.map((row: any, i: number) => {
+    if (typeof row?.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(row.id)) throw new ValidationError(`positions[${i}].id`, 'invalid id');
+    const clean = validateChannelInput({ position: row.position, ...(row.parentId !== undefined ? { parentId: row.parentId } : {}) });
+    if (clean.position === undefined) throw new ValidationError(`positions[${i}].position`, 'required');
+    return { id: row.id, position: clean.position, ...(clean.parentId !== undefined ? { parentId: clean.parentId } : {}) };
+  });
+}
 
-export function validateRoleInput(data: any): { name?: string; color?: string; permissions?: number; mentionable?: boolean } {
+// Bitmask de permissions valides : ALL_PERMS_MASK (utils/permissions.ts, extension v2 incluse).
+
+export function validateRoleInput(data: any): { name?: string; color?: string; permissions?: number; mentionable?: boolean; hoist?: boolean; iconEmoji?: string | null } {
   const out: any = {};
   if (data.name !== undefined) out.name = validateText(data.name, { field: 'name', ...LIMITS.roleName, required: true });
   if (data.color !== undefined) {
@@ -275,6 +310,11 @@ export function validateRoleInput(data: any): { name?: string; color?: string; p
     out.permissions = n & ALL_PERMS_MASK;
   }
   if (data.mentionable !== undefined) out.mentionable = validateBool(data.mentionable, 'mentionable');
+  // « Afficher les membres ayant ce rôle séparément » (hoist Discord).
+  if (data.hoist !== undefined) out.hoist = validateBool(data.hoist, 'hoist');
+  if (data.iconEmoji !== undefined) {
+    out.iconEmoji = data.iconEmoji === null || data.iconEmoji === '' ? null : validateText(data.iconEmoji, { field: 'iconEmoji', min: 1, max: 16 });
+  }
   return out;
 }
 

@@ -24,10 +24,40 @@ export const PERM = {
   MANAGE_ROLES:    0x100,
   KICK_MEMBERS:    0x400,
   BAN_MEMBERS:     0x800,
+  // ── Extension « Discord » (2026-10-19) ──────────────────────────────────
+  // Les bits « de base » (CONNECT, SPEAK, VIDEO, CREATE_INVITE, ATTACH_FILES,
+  // CHANGE_NICKNAME, MENTION_EVERYONE) ont été accordés une fois pour toutes
+  // au rôle par défaut existant (migration `perm_bits_v2`) : un serveur déjà
+  // en place ne perd aucun droit à l'apparition de ces bits.
+  CONNECT:          0x1000,
+  SPEAK:            0x2000,
+  VIDEO:            0x4000,
+  CREATE_INVITE:    0x8000,
+  MANAGE_SERVER:    0x10000,
+  MENTION_EVERYONE: 0x20000,
+  ATTACH_FILES:     0x40000,
+  CHANGE_NICKNAME:  0x80000,
+  MANAGE_NICKNAMES: 0x100000,
+  MUTE_MEMBERS:     0x200000,
+  MOVE_MEMBERS:     0x400000,
+  VIEW_AUDIT_LOG:   0x800000,
+  MANAGE_EMOJIS:    0x1000000,
+  MANAGE_WEBHOOKS:  0x2000000,
+  MANAGE_EVENTS:    0x4000000,
 } as const;
 
 /** Tous les bits valides. Sert à masquer `permissions: -1` ou 0x80000000. */
-export const ALL_PERMS_MASK = 0xFFF;
+export const ALL_PERMS_MASK = 0x7FFFFFF;
+
+/** Droits accordés par défaut au rôle @everyone d'un nouveau serveur. */
+export const DEFAULT_EVERYONE_PERMS =
+  PERM.READ | PERM.SEND | PERM.REACT | PERM.CONNECT | PERM.SPEAK | PERM.VIDEO
+  | PERM.CREATE_INVITE | PERM.ATTACH_FILES | PERM.CHANGE_NICKNAME | PERM.MENTION_EVERYONE;
+
+/** Bits ajoutés par l'extension v2 et accordés une fois au rôle par défaut existant. */
+export const V2_BASELINE_GRANT =
+  PERM.CONNECT | PERM.SPEAK | PERM.VIDEO | PERM.CREATE_INVITE | PERM.ATTACH_FILES
+  | PERM.CHANGE_NICKNAME | PERM.MENTION_EVERYONE;
 
 /** Expulser : l'une ou l'autre des deux paires historiques suffit. */
 export const KICK_ANY = PERM.KICK | PERM.KICK_MEMBERS;

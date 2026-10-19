@@ -856,7 +856,12 @@ class ServersProxy {
     });
   }
 
-  async createChannel(serverId: string, data: { name: string; type: string; parentId?: string }, userId: string, token?: string) {
+  async createChannel(
+    serverId: string,
+    data: { name: string; type: string; parentId?: string | null; topic?: string; isNsfw?: boolean; slowMode?: number; userLimit?: number; isPrivate?: boolean },
+    userId: string,
+    token?: string,
+  ) {
     return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels`, {
       method: 'POST',
       headers: { 'x-user-id': userId },
@@ -871,6 +876,60 @@ class ServersProxy {
       headers: { 'x-user-id': userId },
       body: JSON.stringify({ ...updates, userId }),
       token,
+    });
+  }
+
+  /** Réorganisation par lot (glisser-déposer). */
+  async reorderChannels(serverId: string, positions: { id: string; position: number; parentId?: string | null }[], userId: string) {
+    return fetchService<{ serverId: string; channels: any[] }>(`${this.baseUrl}/servers/${seg(serverId)}/channels`, {
+      method: 'PATCH',
+      headers: { 'x-user-id': userId },
+      body: JSON.stringify({ positions }),
+    });
+  }
+
+  /** Règles AutoMod actives du serveur — `blocked` si le message doit être refusé. */
+  async automodCheck(serverId: string, content: string, userId: string) {
+    return fetchService<{ blocked: boolean; reason: string | null; action?: string }>(
+      `${this.baseUrl}/servers/${seg(serverId)}/automod/check`,
+      { method: 'POST', body: JSON.stringify({ content, userId }) },
+    );
+  }
+
+  async getChannelOverrides(serverId: string, channelId: string) {
+    return fetchService<{ channelId: string; parentId: string | null; synced: boolean; overrides: any[] }>(
+      `${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/overrides`,
+    );
+  }
+
+  async setChannelOverride(serverId: string, channelId: string, data: { targetType: 'role' | 'member'; targetId: string; allow: number; deny: number }, userId: string) {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/overrides`, {
+      method: 'PUT',
+      headers: { 'x-user-id': userId },
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteChannelOverride(serverId: string, channelId: string, targetType: 'role' | 'member', targetId: string, userId: string) {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/overrides/${seg(targetType)}/${seg(targetId)}`, {
+      method: 'DELETE',
+      headers: { 'x-user-id': userId },
+    });
+  }
+
+  async syncChannelOverrides(serverId: string, channelId: string, userId: string) {
+    return fetchService(`${this.baseUrl}/servers/${seg(serverId)}/channels/${seg(channelId)}/overrides/sync`, {
+      method: 'POST',
+      headers: { 'x-user-id': userId },
+      body: JSON.stringify({}),
+    });
+  }
+
+  async reorderRoles(serverId: string, positions: { id: string; position: number }[], userId: string) {
+    return fetchService<{ serverId: string; roles: any[] }>(`${this.baseUrl}/servers/${seg(serverId)}/roles`, {
+      method: 'PATCH',
+      headers: { 'x-user-id': userId },
+      body: JSON.stringify({ positions }),
     });
   }
 
@@ -972,9 +1031,10 @@ class ServersProxy {
    * Remplace le trio getServer + getMembers + getRoles qui rapatriait toute la
    * liste des membres à chaque vérification de permission.
    */
-  async getMemberPermissions(serverId: string, userId: string) {
+  async getMemberPermissions(serverId: string, userId: string, channelId?: string) {
+    const query = channelId ? `?channelId=${encodeURIComponent(channelId)}` : '';
     return fetchService<{ isMember: boolean; isOwner: boolean; permissions: number }>(
-      `${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/permissions`,
+      `${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/permissions${query}`,
     );
   }
 

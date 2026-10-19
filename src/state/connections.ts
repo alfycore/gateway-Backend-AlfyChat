@@ -22,11 +22,25 @@ export interface VoiceParticipant {
   socketId: string;
   userId: string;
   username: string;
+  displayName?: string;
   avatarUrl?: string;
+  /** Micro coupé par l'utilisateur. */
   muted: boolean;
+  /** Son coupé par l'utilisateur. */
   deafened: boolean;
   serverId: string;
+  /** Caméra active. */
+  video?: boolean;
+  /** Partage d'écran en cours (« EN DIRECT »). */
+  streaming?: boolean;
+  /** Rendu muet / sourd par un modérateur. */
+  serverMuted?: boolean;
+  serverDeafened?: boolean;
+  joinedAt?: number;
 }
+
+/** Statut libre d'un salon vocal (« Définir un statut de salon ») : channelId → texte. */
+export const voiceChannelStatus = new Map<string, string>();
 
 /** Active WebSocket clients: socket.id → ConnectedClient */
 export const connectedClients = new Map<string, ConnectedClient>();
