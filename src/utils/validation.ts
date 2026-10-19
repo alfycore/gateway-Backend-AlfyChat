@@ -336,7 +336,8 @@ export function validateMessageContent(
   e2eeType?: unknown,
 ): { content: string; attachments?: string[] } {
   const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
-  const isCiphertext = e2eeType === 1 || e2eeType === 3;
+  // 1 / 3 : formats Signal (MP), 4 : enveloppe multi-destinataires (groupes).
+  const isCiphertext = e2eeType === 1 || e2eeType === 3 || e2eeType === 4;
   const c = validateText(content, {
     field: 'content',
     min: hasAttachments ? 0 : LIMITS.messageContent.min,

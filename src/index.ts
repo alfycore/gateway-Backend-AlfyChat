@@ -1658,9 +1658,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
 
           // Destinataire hors-ligne → push notification
           if (!recipientUserRoom || recipientUserRoom.size === 0) {
-            const preview = data.content && !data.content.startsWith('ecdh:')
+            // Message chiffré : rien de son contenu ne sort (ni texte, ni ciphertext).
+            const preview = !data.e2eeType && data.content && !data.content.startsWith('ecdh:')
               ? (data.content.length > 80 ? data.content.slice(0, 80) + '…' : data.content)
-              : '📎 Nouveau message';
+              : 'Nouveau message';
             serviceProxy.users.sendPushNotification({
               userId: data.recipientId,
               title: user.displayName || user.username,
@@ -1705,9 +1706,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       if (!data.recipientId && !conversationId.startsWith('dm_')) {
         const convRoom = io.sockets.adapter.rooms.get(`conversation:${conversationId}`);
         const senderName = user.displayName || user.username;
-        const preview = data.content && !(data.content as string).startsWith('ecdh:')
+        const preview = !data.e2eeType && data.content && !(data.content as string).startsWith('ecdh:')
           ? ((data.content as string).length > 80 ? (data.content as string).slice(0, 80) + '…' : data.content as string)
-          : '📎 Nouveau message';
+          : 'Nouveau message';
         serviceProxy.messages.getConversationParticipants(conversationId).then((result: any) => {
           const participants: Array<{ userId: string }> = result?.participants ?? result ?? [];
           for (const p of participants) {
@@ -1728,7 +1729,10 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
 
       // ── ÉTAPE 3 : Confirmer à l'expéditeur IMMÉDIATEMENT ──
-      socket.emit('message:sent', { success: true, message: messageForClient });
+      // `clientNonce` (renvoyé tel quel, jamais diffusé) : le client associe
+      // l'accusé à SON message en attente sans deviner par l'ordre d'envoi.
+      const clientNonce = typeof data.clientNonce === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(data.clientNonce) ? data.clientNonce : undefined;
+      socket.emit('message:sent', { success: true, message: messageForClient, clientNonce });
 
       // ── ÉTAPE 4 : Écriture DB en arrière-plan (fire-and-forget) ──
       serviceProxy.messages.createMessage({
@@ -1806,7 +1810,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
                 senderId: userId,
                 senderName,
                 senderAvatar: user.avatarUrl || null,
-                preview: (data.content as string)?.substring(0, 80) ?? '',
+                // Jamais le ciphertext d'un message chiffré dans un aperçu de mention.
+                preview: data.e2eeType ? '' : ((data.content as string)?.substring(0, 80) ?? ''),
                 notificationType: 'mention' as const,
               },
               timestamp: new Date(),
@@ -1883,7 +1888,13 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const conversationId = updated.conversationId;
       io.to(`conversation:${conversationId}`).emit('message:edited', {
         messageId: updated.id,
+        conversationId,
+        senderId: updated.senderId ?? userId,
         content: updated.content,
+        // Copie expéditeur (MP chiffré) : sans elle, l'auteur ne relisait pas
+        // sa propre modification sur ses autres appareils.
+        senderContent: updated.senderContent ?? data.senderContent,
+        e2eeType: updated.e2eeType ?? data.e2eeType,
         updatedAt: updated.updatedAt,
         isEdited: true,
       });
@@ -1940,8 +1951,8 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       }
     }
     // Toujours émettre de façon optimiste — le client a déjà retiré le message localement.
-    io.to(room).emit('message:deleted', { messageId: data.messageId });
-    socket.emit('message:deleted', { messageId: data.messageId });
+    io.to(room).emit('message:deleted', { messageId: data.messageId, conversationId: data.conversationId });
+    socket.emit('message:deleted', { messageId: data.messageId, conversationId: data.conversationId });
   });
 
   // Rejoindre une conversation (DM ou channel)
@@ -2095,7 +2106,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       
       io.to(`conversation:${data.conversationId}`).emit('REACTION_ADD', {
         type: 'REACTION_ADD',
-        payload: { messageId: data.messageId, userId, emoji: data.emoji },
+        payload: { messageId: data.messageId, userId, emoji: data.emoji, conversationId: data.conversationId },
         timestamp: new Date(),
       });
     } catch (error) {
@@ -2113,7 +2124,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       
       io.to(`conversation:${data.conversationId}`).emit('REACTION_REMOVE', {
         type: 'REACTION_REMOVE',
-        payload: { messageId: data.messageId, userId, emoji: data.emoji },
+        payload: { messageId: data.messageId, userId, emoji: data.emoji, conversationId: data.conversationId },
         timestamp: new Date(),
       });
     } catch (error) {
