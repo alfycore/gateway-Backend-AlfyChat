@@ -27,6 +27,10 @@ function getBreaker(url: string): InstanceType<typeof CircuitBreaker> {
       errorThresholdPercentage: 75,  // ouvre après 75 % d'erreurs (plus tolérant)
       resetTimeout: 10_000,          // demi-ouverture après 10 s (récupère plus vite)
       volumeThreshold: 10,           // évalue après 10 requêtes minimum
+      // Un 4xx est une réponse normale du service (refus, conflit, introuvable),
+      // pas une panne : les compter ouvrait le circuit après quelques refus et
+      // coupait TOUT le service (ex. 409 « appel déjà actif » → plus d'appels).
+      errorFilter: (err: any) => typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500,
     });
     breaker.on('open',     () => logger.warn(`Circuit OUVERT: ${host}`));
     breaker.on('halfOpen', () => logger.info(`Circuit HALF-OPEN: ${host}`));
@@ -793,7 +797,14 @@ class ServersProxy {
   private get baseUrl(): string { return resolveServiceUrl('servers', this._fallbackUrl); }
 
   async getUserServers(userId: string, token?: string) {
-    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${seg(userId)}`, token ? { token } : undefined);
+    // Le service servers ne lit QUE `x-user-id` sur un appel interne (le
+    // paramètre d'URL est ignoré) : sans cet en-tête il cherchait les serveurs
+    // de « internal », la liste revenait vide et aucune socket ne rejoignait
+    // les rooms serveur / salon — plus aucune diffusion en direct.
+    return fetchService<any[]>(`${this.baseUrl}/servers?userId=${seg(userId)}`, {
+      ...(token ? { token } : {}),
+      headers: { 'x-user-id': userId },
+    });
   }
 
   async getServer(serverId: string) {
@@ -1024,6 +1035,13 @@ class ServersProxy {
   async isMember(serverId: string, userId: string): Promise<boolean> {
     const result = await fetchService<{ isMember: boolean }>(`${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/check`);
     return result.isMember === true;
+  }
+
+  /** Fiche minimale d'un membre (rôles, pseudo, date d'arrivée) — même route que `isMember`. */
+  async getMemberRecord(serverId: string, userId: string) {
+    return fetchService<{ isMember: boolean; nickname?: string | null; roleIds?: string[]; joinedAt?: string | null }>(
+      `${this.baseUrl}/servers/${seg(serverId)}/members/${seg(userId)}/check`,
+    );
   }
 
   /**

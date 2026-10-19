@@ -1124,6 +1124,15 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     return;
   }
 
+  // Les gestionnaires ne sont posés qu'après l'initialisation (rooms, présence,
+  // notifications). Socket.IO jette sans bruit tout évènement qui n'a pas encore
+  // d'écouteur : les premières requêtes du client (infos serveur, salons,
+  // membres, état vocal…) se perdaient et n'expiraient qu'au bout de 10 s.
+  // Les paquets reçus d'ici là attendent, puis sont distribués normalement.
+  let releaseHandlers: () => void = () => {};
+  const handlersReady = new Promise<void>((resolve) => { releaseHandlers = resolve; });
+  socket.use((_packet, next) => { void handlersReady.then(() => next()); });
+
   logger.info(`Connexion: ${user.username} (${userId})`);
 
   // Enregistrer la connexion
@@ -1150,103 +1159,112 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
   const userRooms = Array.from(socket.rooms);
   logger.info(`Socket ${socket.id} rooms après join: [${userRooms.join(', ')}]`);
 
-  // Joindre automatiquement toutes les conversations DM de l'utilisateur
-  try {
-    const friends = await serviceProxy.friends.getFriends(userId);
-    if (friends && Array.isArray(friends)) {
-      for (const friend of friends) {
-        const sortedIds = [userId, friend.id].sort();
-        const dmConversationId = `dm_${sortedIds[0]}_${sortedIds[1]}`;
-        socket.join(`conversation:${dmConversationId}`);
-      }
-    }
-  } catch (error) {
-    logger.warn({ err: error }, 'Erreur join des rooms DM');
-  }
+  // Les trois jonctions (MP, groupes, serveurs) sont indépendantes : elles
+  // partent en parallèle au lieu de s'enchaîner. La liste d'amis est gardée
+  // pour annoncer la présence (elle était masquée par un tableau vide).
+  let friendList: any[] = [];
 
-  // Joindre automatiquement toutes les conversations de groupe de l'utilisateur
-  try {
-    const groupConversations = await serviceProxy.messages.getConversations(userId);
-    if (groupConversations && Array.isArray(groupConversations)) {
-      for (const conv of groupConversations) {
-        const convId = conv.id || conv.conversationId;
-        if (convId && !String(convId).startsWith('dm_')) {
-          socket.join(`conversation:${convId}`);
-        }
-      }
-      const groupCount = groupConversations.filter((c: any) => {
-        const cid = c.id || c.conversationId;
-        return cid && !String(cid).startsWith('dm_');
-      }).length;
-      if (groupCount > 0) logger.info(`${user.username} auto-joined ${groupCount} group conversation rooms`);
-    }
-  } catch (error) {
-    logger.warn({ err: error }, 'Erreur join des rooms de groupe');
-  }
-
-  // Joindre automatiquement tous les serveurs dont l'utilisateur est membre
-  try {
-    // ── Chemin rapide : restaurer depuis le cache Redis (évite NOT_A_CHANNEL_MEMBER au redémarrage) ──
+  const joinDmRooms = async () => {
     try {
-      const cached = await redis.getUserRooms(userId);
-      if (cached) {
-        for (const sid of cached.serverIds) if (isId(sid)) socket.join(`server:${sid}`);
-        // Format courant : "<serverId>:<channelId>". Les anciennes entrées
-        // (channelId seul) sont ignorées — le chemin lent les reconstruit.
-        for (const key of cached.channelIds) {
-          const [sid, cid] = String(key).split(':');
-          if (isId(sid) && isId(cid)) socket.join(chRoom(sid, cid));
+      const friends = await serviceProxy.friends.getFriends(userId);
+      if (friends && Array.isArray(friends)) {
+        friendList = friends;
+        for (const friend of friends) {
+          const sortedIds = [userId, friend.id].sort();
+          const dmConversationId = `dm_${sortedIds[0]}_${sortedIds[1]}`;
+          socket.join(`conversation:${dmConversationId}`);
         }
-        logger.info(`${user.username} restored ${cached.serverIds.length} servers + ${cached.channelIds.length} channels from Redis cache`);
       }
-    } catch { /* non bloquant */ }
-
-    // ── Chemin lent : rafraîchir depuis les microservices (met à jour le cache) ──
-    const userServers = await serviceProxy.servers.getUserServers(userId, token);
-    if (userServers && Array.isArray(userServers)) {
-      const allServerIds: string[] = [];
-      const allChannelIds: string[] = [];
-
-      await Promise.all(userServers.map(async (srv: any) => {
-        const sid = srv.id || srv.server_id;
-        if (!isId(sid)) return;
-        socket.join(`server:${sid}`);
-        allServerIds.push(sid);
-
-        // Notifier le node (fire-and-forget, non bloquant)
-        forwardToNode(sid, 'MEMBER_JOIN', {
-          userId,
-          username: user.username,
-          displayName: user.displayName || user.username,
-          avatarUrl: user.avatarUrl || null,
-        }).catch(() => {});
-
-        // Charger les channels (attendu pour éviter la race condition)
-        try {
-          let channels: any[] = [];
-          try {
-            // userId : le node ne renvoie que les salons visibles par ce membre.
-            const chResult = await forwardToNode(sid, 'CHANNEL_LIST', { userId });
-            channels = chResult?.channels || [];
-          } catch {
-            // Liste filtrée par permissions : un salon privé n'est pas rejoint.
-            channels = (await serviceProxy.servers.getServerChannels(sid, userId)) || [];
-          }
-          for (const ch of channels) {
-            if (!isId(ch?.id)) continue;
-            socket.join(chRoom(sid, ch.id));
-            allChannelIds.push(`${sid}:${ch.id}`);
-          }
-        } catch { /* ignore */ }
-      }));
-
-      // Persister en Redis pour la prochaine reconnexion
-      redis.saveUserRooms(userId, allServerIds, allChannelIds).catch(() => {});
-      logger.info(`${user.username} auto-joined ${allServerIds.length} server rooms, ${allChannelIds.length} channel rooms`);
+    } catch (error) {
+      logger.warn({ err: error }, 'Erreur join des rooms DM');
     }
-  } catch (error) {
-    logger.warn({ err: error }, 'Erreur join des rooms serveur');
-  }
+  };
+
+  const joinGroupRooms = async () => {
+    try {
+      const groupConversations = await serviceProxy.messages.getConversations(userId);
+      if (groupConversations && Array.isArray(groupConversations)) {
+        let groupCount = 0;
+        for (const conv of groupConversations) {
+          const convId = conv.id || conv.conversationId;
+          if (convId && !String(convId).startsWith('dm_')) {
+            socket.join(`conversation:${convId}`);
+            groupCount++;
+          }
+        }
+        if (groupCount > 0) logger.info(`${user.username} auto-joined ${groupCount} group conversation rooms`);
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Erreur join des rooms de groupe');
+    }
+  };
+
+  const joinServerRooms = async () => {
+    try {
+      // ── Chemin rapide : restaurer depuis le cache Redis (évite NOT_A_CHANNEL_MEMBER au redémarrage) ──
+      try {
+        const cached = await redis.getUserRooms(userId);
+        if (cached) {
+          for (const sid of cached.serverIds) if (isId(sid)) socket.join(`server:${sid}`);
+          // Format courant : "<serverId>:<channelId>". Les anciennes entrées
+          // (channelId seul) sont ignorées — le chemin lent les reconstruit.
+          for (const key of cached.channelIds) {
+            const [sid, cid] = String(key).split(':');
+            if (isId(sid) && isId(cid)) socket.join(chRoom(sid, cid));
+          }
+          logger.info(`${user.username} restored ${cached.serverIds.length} servers + ${cached.channelIds.length} channels from Redis cache`);
+        }
+      } catch { /* non bloquant */ }
+
+      // ── Chemin lent : rafraîchir depuis les microservices (met à jour le cache) ──
+      const userServers = await serviceProxy.servers.getUserServers(userId, token);
+      if (userServers && Array.isArray(userServers)) {
+        const allServerIds: string[] = [];
+        const allChannelIds: string[] = [];
+
+        await Promise.all(userServers.map(async (srv: any) => {
+          const sid = srv.id || srv.server_id;
+          if (!isId(sid)) return;
+          socket.join(`server:${sid}`);
+          allServerIds.push(sid);
+
+          // Notifier le node (fire-and-forget, non bloquant)
+          forwardToNode(sid, 'MEMBER_JOIN', {
+            userId,
+            username: user.username,
+            displayName: user.displayName || user.username,
+            avatarUrl: user.avatarUrl || null,
+          }).catch(() => {});
+
+          // Charger les channels (attendu pour éviter la race condition)
+          try {
+            let channels: any[] = [];
+            try {
+              // userId : le node ne renvoie que les salons visibles par ce membre.
+              const chResult = await forwardToNode(sid, 'CHANNEL_LIST', { userId });
+              channels = chResult?.channels || [];
+            } catch {
+              // Liste filtrée par permissions : un salon privé n'est pas rejoint.
+              channels = (await serviceProxy.servers.getServerChannels(sid, userId)) || [];
+            }
+            for (const ch of channels) {
+              if (!isId(ch?.id)) continue;
+              socket.join(chRoom(sid, ch.id));
+              allChannelIds.push(`${sid}:${ch.id}`);
+            }
+          } catch { /* ignore */ }
+        }));
+
+        // Persister en Redis pour la prochaine reconnexion
+        redis.saveUserRooms(userId, allServerIds, allChannelIds).catch(() => {});
+        logger.info(`${user.username} auto-joined ${allServerIds.length} server rooms, ${allChannelIds.length} channel rooms`);
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'Erreur join des rooms serveur');
+    }
+  };
+
+  await Promise.all([joinDmRooms(), joinGroupRooms(), joinServerRooms()]);
 
   // Données initiales simplifiées (pour éviter les erreurs 404)
   const servers: any[] = [];
@@ -1294,10 +1312,12 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     timestamp: new Date(),
   });
 
-  // Notifier les amis seulement (plus de broadcast serveur — member-list utilise GET_BULK_PRESENCE)
-  broadcastPresenceUpdate(userId, chosenStatus, friends, restoredText, restoredEmoji);
+  // Amis, contacts de MP et membres des serveurs en commun.
+  broadcastPresenceUpdate(userId, chosenStatus, friendList, restoredText, restoredEmoji);
 
-  // Envoyer les pings en attente (messages reçus hors ligne) — DB + Redis
+  // Envoyer les pings en attente (messages reçus hors ligne) — DB + Redis.
+  // En arrière-plan : rien n'en dépend pour poser les gestionnaires.
+  void (async () => {
   try {
     // 1. Notifications persistantes en DB (source de vérité)
     let dbNotifications: Record<string, { count: number; senderName: string; type?: string; channelName?: string }> = {};
@@ -1332,6 +1352,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       await redis.clearPendingPings(userId);
     }
   } catch { /* non bloquant */ }
+  })();
 
   // Map des suppressions en attente : messageId → userId
   // Utilisée quand l'utilisateur supprime un message avant que l'écriture DB soit terminée.
@@ -2460,11 +2481,23 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         timestamp: new Date(),
       });
 
+      // SFU : producteurs déjà publiés dans la salle (micros, caméras, écrans).
+      let existingProducers: { producerId: string; userId: string; kind: string }[] = [];
+      if (callMode === 'sfu') {
+        try {
+          const res = await serviceProxy.media.getProducers(callId);
+          existingProducers = (res?.producers ?? []).filter((p) => p.userId !== userId);
+        } catch {
+          // Salle absente (media-server redémarré) : on la recrée, vide.
+          await serviceProxy.media.createRoom(callId, callCat === 'server' ? 'server' : 'group').catch(() => {});
+        }
+      }
+
       // Confirmer au nouvel arrivant avec la liste des participants existants (pour créer les PCs)
       if (typeof callback === 'function') {
-        callback({ callId, existingParticipants, callMode });
+        callback({ callId, existingParticipants, existingProducers, callMode });
       } else {
-        socket.emit('CALL_JOIN_ACK', { callId, existingParticipants, callMode });
+        socket.emit('CALL_JOIN_ACK', { callId, existingParticipants, existingProducers, callMode });
       }
 
       logger.info(`${userId} a rejoint l'appel ${callCat} ${callId} (${newCount} participants, mode=${callMode})`);
@@ -2556,6 +2589,7 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       const remaining = await io.in(`call:${data.callId}`).fetchSockets();
       if (remaining.length === 0) {
         await serviceProxy.calls.endCall(data.callId, userId);
+        serviceProxy.media.destroyRoom(data.callId).catch(() => {});
         io.to(`call:${data.callId}`).emit('CALL_END', {
           type: 'CALL_END',
           payload: { callId: data.callId },
@@ -2740,14 +2774,31 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         }
       }
 
-      const call = await serviceProxy.calls.createServerCall({
-        channelId: data.channelId,
-        serverId: data.serverId,
-        initiatorId: userId,
-        type: data.type || 'voice',
-      }) as { id: string; callCategory: string };
-
-      const callId = call.id;
+      let callId: string;
+      try {
+        const call = await serviceProxy.calls.createServerCall({
+          channelId: data.channelId,
+          serverId: data.serverId,
+          initiatorId: userId,
+          type: data.type || 'voice',
+        }) as { id: string; callCategory: string };
+        callId = call.id;
+      } catch (err: any) {
+        // 409 : un appel est déjà ouvert sur ce salon. Avant, l'erreur devenait
+        // « Impossible de créer l'appel » et personne ne pouvait plus entrer.
+        const existingCallId = err?.statusCode === 409 ? existingCallIdOf(err) : null;
+        if (!existingCallId) throw err;
+        const live = (await io.in(`call:${existingCallId}`).fetchSockets()).length > 0;
+        if (live) {
+          // Des membres y sont : le client le rejoint (CALL_JOIN, producteurs existants compris).
+          if (typeof callback === 'function') callback({ existingCallId });
+          return;
+        }
+        // Appel fantôme (onglet fermé, passerelle redémarrée) : repris à neuf.
+        callId = existingCallId;
+        await serviceProxy.calls.joinCall(callId, userId).catch(() => {});
+        await serviceProxy.media.destroyRoom(callId).catch(() => {});
+      }
       socket.join(`call:${callId}`);
       // Mémoriser l'appel actif du salon pour que le plafond de participants
       // s'applique aux suivants.
@@ -2760,21 +2811,9 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
         logger.error({ err: sfuErr }, 'Impossible de créer la salle SFU pour appel serveur:');
       }
 
-      // Notifier le canal (bannière passive, pas de dialogue modal)
-      io.to(chRoom(data.serverId, data.channelId)).emit('CALL_INCOMING', {
-        type: 'CALL_INCOMING',
-        payload: {
-          callId,
-          channelId: data.channelId,
-          serverId: data.serverId,
-          callCategory: 'server',
-          isGroup: false,
-          initiatorId: userId,
-          callerName: (socket as any).user?.displayName || (socket as any).user?.username || userId,
-          callType: data.type || 'voice',
-        },
-        timestamp: new Date(),
-      });
+      // Pas de CALL_INCOMING : rejoindre un vocal de serveur ne sonne chez
+      // personne. Les membres voient la présence sous le salon (VOICE_STATE_UPDATE) ;
+      // l'ancien envoi faisait apparaître un modal « X vous appelle » comme en MP.
 
       if (typeof callback === 'function') callback({ callId, id: callId });
     } catch (error) {
@@ -2926,34 +2965,71 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
     try {
       const serverId: string | undefined = data?.serverId;
       if (!isId(serverId)) return;
-
-      // Vérifier que l'user est vraiment membre (il vient de rejoindre via HTTP)
-      const isMember = await serviceProxy.servers.isMember(serverId, userId).catch(() => false);
-      if (!isMember) {
-        socket.emit('SERVER_ERROR', { type: 'SERVER_ERROR', error: 'NOT_A_MEMBER', serverId });
+      if (!checkServerJoinRate(userId)) {
+        emitError(socket, 'RATE_LIMITED', { message: 'Trop de join/leave — patientez une minute.' });
         return;
       }
 
-      // Rejoindre les rooms socket (si pas déjà dedans)
-      socket.join(`server:${serverId}`);
+      // Vérifier que l'user est vraiment membre (il vient de rejoindre via HTTP)
+      const record = await serviceProxy.servers.getMemberRecord(serverId, userId).catch(() => null);
+      if (!record?.isMember) {
+        socket.emit('SERVER_ERROR', { type: 'SERVER_ERROR', error: 'NOT_A_MEMBER', serverId });
+        return;
+      }
+      invalidateServerPerms(serverId, userId);
+
+      // Rejoindre les rooms socket (si pas déjà dedans), sur tous les onglets.
+      io.in(`user:${userId}`).socketsJoin(`server:${serverId}`);
+      const joinedChannels: string[] = [];
 
       let serverInfo: any = null;
       try {
         // Charger les channels depuis le node
         const chResult = await forwardToNode(serverId, 'CHANNEL_LIST', { userId });
         if (chResult?.channels) {
-          for (const ch of chResult.channels) {
-            if (isId(ch?.id)) socket.join(chRoom(serverId, ch.id));
-          }
+          for (const ch of chResult.channels) if (isId(ch?.id)) joinedChannels.push(ch.id);
         }
       } catch {
         // Fallback microservice — salons visibles uniquement
         try {
           const channels = (await serviceProxy.servers.getServerChannels(serverId, userId)) || [];
-          for (const ch of channels) {
-            if (isId(ch?.id)) socket.join(chRoom(serverId, ch.id));
-          }
+          for (const ch of channels) if (isId(ch?.id)) joinedChannels.push(ch.id);
         } catch { /* ignore */ }
+      }
+      for (const id of joinedChannels) io.in(`user:${userId}`).socketsJoin(chRoom(serverId, id));
+
+      // Cache des rooms (reconnexion) et diffusion de présence vers ce serveur.
+      redis.getUserRooms(userId).then((cached) => {
+        if (!cached || cached.serverIds.includes(serverId)) return;
+        return redis.saveUserRooms(
+          userId,
+          [...cached.serverIds, serverId],
+          [...cached.channelIds, ...joinedChannels.map((id) => `${serverId}:${id}`)],
+        );
+      }).catch(() => {});
+
+      // Nouveau membre (arrivé il y a moins de 2 min) : la liste des membres se
+      // met à jour chez tout le monde. Un membre existant qui repasse par
+      // l'invitation n'est pas réannoncé (ses rôles seraient écrasés).
+      const joinedAtMs = record.joinedAt ? new Date(record.joinedAt).getTime() : NaN;
+      if (Number.isFinite(joinedAtMs) && Date.now() - joinedAtMs < 120_000 && !connectedNodes.has(serverId)) {
+        io.to(`server:${serverId}`).emit('MEMBER_JOIN', {
+          type: 'MEMBER_JOIN',
+          payload: {
+            serverId,
+            member: {
+              userId,
+              username: user.username,
+              displayName: user.displayName || user.username,
+              avatarUrl: user.avatarUrl || null,
+              nickname: record.nickname ?? null,
+              roleIds: record.roleIds ?? [],
+              joinedAt: record.joinedAt,
+              status: 'online',
+            },
+          },
+          timestamp: new Date(),
+        });
       }
 
       // Charger les infos serveur si pas encore disponibles
@@ -3826,9 +3902,20 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
        * à chaque ouverture de la liste. Un seul appel groupé suffit.
        */
       const withPresence = async (members: any[]): Promise<any[]> => {
-        const ids = members.map(uid).filter(Boolean);
-        const online = await redis.getOnlineSet(ids).catch(() => new Set<string>());
-        return members.map((m) => ({ ...m, status: online.has(uid(m)) ? 'online' : 'offline' }));
+        const ids = [...new Set(members.map(uid).filter(Boolean))];
+        // Un seul pipeline Redis : statut choisi (absent, ne pas déranger),
+        // invisible → hors ligne, et le réglage « afficher mon statut ».
+        const list = await redis.getBulkPresence(ids).catch(() => [] as Awaited<ReturnType<typeof redis.getBulkPresence>>);
+        const byId = new Map(list.map((p) => [p.userId, p]));
+        const hidden = new Set<string>();
+        await Promise.all(list
+          .filter((p) => p.status !== 'offline' && p.userId !== userId)
+          .map(async (p) => { if (await isPresenceHidden(p.userId).catch(() => false)) hidden.add(p.userId); }));
+        return members.map((m) => {
+          const p = byId.get(uid(m));
+          if (!p || hidden.has(uid(m))) return { ...m, status: 'offline', customStatus: null };
+          return { ...m, status: p.status, customStatus: p.customStatus ?? null };
+        });
       };
 
       // Les membres du microservice servent à la fois de référence (filtrage
@@ -5012,7 +5099,41 @@ io.on('connection', async (socket: AuthenticatedSocket) => {
       logger.error({ err: error }, `Erreur lors de la déconnexion de ${userId}:`);
     }
   });
+
+  // Appels : fermer l'onglet n'envoie jamais CALL_LEAVE. Sans ce nettoyage,
+  // l'appel restait « en cours » en base et le salon vocal renvoyait 409 à
+  // tous ceux qui essayaient de le rejoindre. Délai de grâce : une simple
+  // reconnexion (CALL_REJOIN) ne coupe pas l'appel.
+  socket.on('disconnecting', () => {
+    for (const room of socket.rooms) {
+      if (!room.startsWith('call:')) continue;
+      const callId = room.slice('call:'.length);
+      setTimeout(() => { endCallIfEmpty(callId, userId).catch(() => {}); }, 15_000);
+    }
+  });
+
+  // Tous les gestionnaires sont posés : distribuer les évènements en attente.
+  releaseHandlers();
 });
+
+/** Termine un appel dont plus aucune socket ne fait partie (base + salle SFU). */
+async function endCallIfEmpty(callId: string, byUserId: string): Promise<void> {
+  if ((await io.in(`call:${callId}`).fetchSockets()).length > 0) return;
+  await serviceProxy.calls.endCall(callId, byUserId).catch(() => {});
+  serviceProxy.media.destroyRoom(callId).catch(() => {});
+}
+
+/** `existingCallId` d'une réponse 409 du service calls (« appel déjà actif »). */
+function existingCallIdOf(err: unknown): string | null {
+  const m = /^Service error: \d{3} (.*)$/s.exec(err instanceof Error ? err.message : '');
+  if (!m) return null;
+  try {
+    const id = JSON.parse(m[1])?.existingCallId;
+    return isId(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
 
 // ============ AUTO-IDLE : détection d'inactivité côté gateway ============
 
@@ -5522,10 +5643,15 @@ async function broadcastPresenceUpdate(
     }
   } catch { /* non bloquant — la présence reste diffusée aux amis au minimum */ }
 
-  for (const fid of recipients) {
-    io.to(`user:${fid}`).emit('PRESENCE_UPDATE', presencePayload);
-  }
-  // Broadcast serveur supprimé — les member-lists utilisent GET_BULK_PRESENCE à la demande
+  // Membres des serveurs en commun : sans eux, la liste des membres d'un
+  // serveur ne bougeait jamais (statut figé au chargement). Une seule émission
+  // vers toutes les rooms : Socket.IO ne livre qu'une fois par socket.
+  const rooms = [...recipients].map((fid) => `user:${fid}`);
+  try {
+    const cached = await redis.getUserRooms(userId);
+    for (const sid of cached?.serverIds ?? []) if (isId(sid)) rooms.push(`server:${sid}`);
+  } catch { /* non bloquant — amis et MP au minimum */ }
+  if (rooms.length > 0) io.to(rooms).emit('PRESENCE_UPDATE', presencePayload);
 }
 
 // ============ DÉMARRAGE ============
