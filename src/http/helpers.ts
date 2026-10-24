@@ -78,6 +78,16 @@ export function getServiceUrl(serviceType: ServiceType, fallback: string): strin
   return best?.endpoint ?? '';
 }
 
+/**
+ * Variante pour les services qui ne sont pas toujours déclarés au LB
+ * (hébergement, abonnements) : une instance en ligne est préférée, sinon
+ * l'URL .env reste utilisée, y compris en production.
+ */
+export function getServiceUrlOrEnv(serviceType: ServiceType, fallback: string): string {
+  if (!IS_PRODUCTION) return fallback;
+  return serviceRegistry.selectBest(serviceType)?.endpoint || fallback;
+}
+
 /** Rewrite Express URL for a server-node: /api/servers/:id/X → /X */
 export function rewriteNodePath(req: express.Request, serverId: string): string {
   const original = apiPath(req);

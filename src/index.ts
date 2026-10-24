@@ -32,7 +32,7 @@ import {
   TRUSTED_PROXIES, IP_ENDPOINT_RE,
 } from './config/env';
 import {
-  getClientIP, extractUserIdFromJWT, safeJson, getServiceUrl, rewriteNodePath,
+  getClientIP, extractUserIdFromJWT, safeJson, getServiceUrl, getServiceUrlOrEnv, rewriteNodePath,
 } from './http/helpers';
 import {
   proxyRequest, proxyToNode, proxyToNodeMultipart, proxyMultipartToService, proxyToMedia, proxyRawWebhook,
@@ -405,14 +405,16 @@ app.all('/api/bots', (req, res) => proxyRequest(getServiceUrl('bots', BOTS_URL),
 // Routes Hébergement serveurs (ServerHosting)
 // Corps brut + en-têtes de signature relayés tels quels : réencoder le JSON et
 // perdre `stripe-signature` rendait toute vérification de webhook impossible.
-app.all('/api/subscriptions/webhooks/*', (req, res) => proxyRawWebhook(SUBSCRIPTIONS_URL, req, res));
-app.all('/api/hosting/*', (req, res) => proxyRequest(SERVERHOSTING_URL, req, res));
-app.all('/api/hosting', (req, res) => proxyRequest(SERVERHOSTING_URL, req, res));
+const hostingUrl = () => getServiceUrlOrEnv('serverhosting', SERVERHOSTING_URL);
+const subscriptionsUrl = () => getServiceUrlOrEnv('subscriptions', SUBSCRIPTIONS_URL);
+app.all('/api/subscriptions/webhooks/*', (req, res) => proxyRawWebhook(subscriptionsUrl(), req, res));
+app.all('/api/hosting/*', (req, res) => proxyRequest(hostingUrl(), req, res, SERVERHOSTING_URL, 'serverhosting'));
+app.all('/api/hosting', (req, res) => proxyRequest(hostingUrl(), req, res, SERVERHOSTING_URL, 'serverhosting'));
 // Routes Abonnements & Paiements
-app.all('/api/subscriptions/plans*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
-app.all('/api/subscriptions/checkout/*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
-app.all('/api/subscriptions/*', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
-app.all('/api/subscriptions', (req, res) => proxyRequest(SUBSCRIPTIONS_URL, req, res));
+app.all('/api/subscriptions/plans*', (req, res) => proxyRequest(subscriptionsUrl(), req, res, SUBSCRIPTIONS_URL, 'subscriptions'));
+app.all('/api/subscriptions/checkout/*', (req, res) => proxyRequest(subscriptionsUrl(), req, res, SUBSCRIPTIONS_URL, 'subscriptions'));
+app.all('/api/subscriptions/*', (req, res) => proxyRequest(subscriptionsUrl(), req, res, SUBSCRIPTIONS_URL, 'subscriptions'));
+app.all('/api/subscriptions', (req, res) => proxyRequest(subscriptionsUrl(), req, res, SUBSCRIPTIONS_URL, 'subscriptions'));
 registerMediaRoutes(app);
 registerHealthRoutes(app);
 
@@ -5776,6 +5778,8 @@ async function loadInstancesFromDB(): Promise<void> {
     { id: 'servers-default',  type: 'servers',  url: SERVERS_URL },
     { id: 'bots-default',     type: 'bots',     url: BOTS_URL },
     { id: 'media-default',    type: 'media',    url: MEDIA_URL },
+    { id: 'serverhosting-default', type: 'serverhosting', url: SERVERHOSTING_URL },
+    { id: 'subscriptions-default', type: 'subscriptions', url: SUBSCRIPTIONS_URL },
   ];
 
   for (const d of defaults) {

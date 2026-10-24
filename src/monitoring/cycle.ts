@@ -23,6 +23,9 @@ export const MONITORED_SERVICES: { name: string; url: string }[] = [
   { name: 'servers',  url: `${process.env.SERVERS_SERVICE_URL  || 'http://localhost:3005'}/health` },
   { name: 'bots',     url: `${process.env.BOTS_SERVICE_URL     || 'http://localhost:3006'}/health` },
   { name: 'media',    url: `${process.env.MEDIA_SERVICE_URL    || 'https://media.s.backend.alfychat.app'}/health` },
+  { name: 'serverhosting', url: `${process.env.SERVERHOSTING_SERVICE_URL || 'http://localhost:3008'}/health` },
+  { name: 'subscriptions', url: `${process.env.SUBSCRIPTIONS_SERVICE_URL || 'http://localhost:3009'}/health` },
+  { name: 'media-server',  url: `${process.env.MEDIA_SERVER_URL          || 'http://localhost:3010'}/health` },
 ];
 
 export const MONITORING_INTERVAL_MS = parseInt(process.env.MONITORING_INTERVAL || '60000');

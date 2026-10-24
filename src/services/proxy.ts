@@ -701,7 +701,18 @@ class CallsProxy {
 // ============ MEDIA SERVER PROXY ============
 
 class MediaServerProxy {
-  constructor(private baseUrl: string) {}
+  constructor(private fallbackUrl: string) {}
+
+  /**
+   * Instance épinglée, pas « la moins chargée » : une salle n'existe que sur le
+   * SFU qui l'a créée, alterner entre instances couperait les appels en cours.
+   * Sans instance déclarée au LB, l'URL .env reste utilisée (même en prod).
+   */
+  private get baseUrl(): string {
+    const pinned = serviceRegistry.getInstances('media-server')
+      .sort((a, b) => a.id.localeCompare(b.id))[0];
+    return pinned?.endpoint || this.fallbackUrl;
+  }
 
   private headers() {
     return {

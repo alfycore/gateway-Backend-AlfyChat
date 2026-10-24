@@ -5,7 +5,7 @@ import { proxyRequest } from './proxy';
 import { requireAdmin } from '../monitoring/admin-guard';
 import { monitoringDB } from '../utils/monitoring-db';
 import type { ServiceUptimeDay } from '../utils/monitoring-db';
-import { serviceRegistry, type ServiceType } from '../utils/service-registry';
+import { serviceRegistry, SERVICE_TYPES, isServiceType } from '../utils/service-registry';
 import { lbRegistry, generateServiceKey } from '../lb/registry';
 import { gatewayRegistry } from '../lb/gateway-registry';
 import { logger } from '../utils/logger';
@@ -274,13 +274,31 @@ export function registerAdminRoutes(app: Express): void {
       ...i,
       score: serviceRegistry.computeScore(i),
     }));
-    res.json({ instances });
+    res.json({ instances, types: SERVICE_TYPES });
+  });
+
+  /**
+   * GET /api/admin/services/degraded — liste les instances dégradées.
+   * Déclarée avant /:type, qui l'interceptait sinon (type « degraded » → liste vide).
+   */
+  app.get('/api/admin/services/degraded', async (req, res) => {
+    if (!await requireAdmin(req, res)) return;
+    const degraded = serviceRegistry.getDegraded().map((i) => ({
+      id: i.id,
+      serviceType: i.serviceType,
+      endpoint: i.endpoint,
+      domain: i.domain,
+      degradedAt: i.degradedAt,
+      degradedReason: i.degradedReason,
+    }));
+    res.json({ degraded });
   });
 
   /** GET /api/admin/services/:type — instances d'un type donné (y compris désactivées) */
   app.get('/api/admin/services/:type', async (req, res) => {
     if (!await requireAdmin(req, res)) return;
-    const instances = serviceRegistry.getInstances(req.params.type as ServiceType, true, true).map((i) => ({
+    if (!isServiceType(req.params.type)) return res.status(400).json({ error: 'Type de service inconnu' });
+    const instances = serviceRegistry.getInstances(req.params.type, true, true).map((i) => ({
       ...i,
       score: serviceRegistry.computeScore(i),
     }));
@@ -290,33 +308,52 @@ export function registerAdminRoutes(app: Express): void {
   /** POST /api/admin/services — ajoute manuellement une instance */
   app.post('/api/admin/services', async (req, res) => {
     if (!await requireAdmin(req, res)) return;
-    const { id, serviceType, endpoint, domain, location } = req.body ?? {};
-    const VALID_TYPES: ServiceType[] = ['users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media'];
-    if (!id || !VALID_TYPES.includes(serviceType) || !endpoint || !domain || !location) {
-      return res.status(400).json({ error: 'id, serviceType, endpoint, domain, location requis' });
+    const { serviceType } = req.body ?? {};
+    const id       = String(req.body?.id ?? '').trim();
+    const endpoint = String(req.body?.endpoint ?? '').trim().replace(/\/+$/, '');
+    const location = String(req.body?.location ?? '').trim().toUpperCase();
+
+    if (!id || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(id)) {
+      return res.status(400).json({ error: 'Identifiant invalide (lettres, chiffres, . _ - ; 64 caractères max)' });
     }
-    // Rejeter les endpoints IP
-    if (IP_ENDPOINT_RE.test(String(endpoint))) {
+    if (!isServiceType(serviceType)) {
+      return res.status(400).json({ error: `Type inconnu — attendus : ${SERVICE_TYPES.join(', ')}` });
+    }
+    if (!location) return res.status(400).json({ error: 'Zone requise' });
+    let host: string;
+    try {
+      const url = new URL(endpoint);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('protocol');
+      host = url.host;
+    } catch {
+      return res.status(400).json({ error: 'URL invalide — format attendu : https://messages.exemple.app' });
+    }
+    if (IP_ENDPOINT_RE.test(endpoint)) {
       return res.status(400).json({ error: 'Adresse IP non autorisée — utilisez un nom de domaine' });
     }
+    // Ré-enregistrer un id existant écrasait l'instance et régénérait sa clé en silence
+    if (serviceRegistry.getById(id)) {
+      return res.status(409).json({ error: `Une instance « ${id} » existe déjà` });
+    }
+    // Le domaine public est facultatif : par défaut, celui de l'URL
+    const domain = String(req.body?.domain ?? '').trim() || host;
+
     const instance = serviceRegistry.register({
-      id: String(id),
-      serviceType: serviceType as ServiceType,
-      endpoint: String(endpoint),
-      domain: String(domain),
-      location: String(location).toUpperCase(),
+      id,
+      serviceType,
+      endpoint,
+      domain,
+      location,
       metrics: { ramUsage: 0, ramMax: 0, cpuUsage: 0, cpuMax: 100, bandwidthUsage: 0, requestCount20min: 0 },
       enabled: true,
     });
-    monitoringDB.upsertServiceInstance({
-      id: String(id), serviceType: String(serviceType),
-      endpoint: String(endpoint), domain: String(domain),
-      location: String(location).toUpperCase(),
-    }).catch(() => {});
-    // Générer une clé unique pour ce service
+    // Générer une clé unique pour ce service. L'UPDATE du hash doit suivre
+    // l'INSERT : lancés en parallèle, la clé pouvait ne jamais être persistée
+    // et l'instance restait sans clé valide au redémarrage du gateway.
     const { rawKey, hash } = generateServiceKey();
-    serviceKeyHashes.set(String(id), hash);
-    monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
+    serviceKeyHashes.set(id, hash);
+    await monitoringDB.upsertServiceInstance({ id, serviceType, endpoint, domain, location }).catch(() => {});
+    await monitoringDB.storeServiceKeyHash(id, rawKey).catch(() => {});
     // Ajouter à la whitelist et retirer des blacklists
     allowedServiceIds.add(String(id));
     bannedServiceIds.delete(String(id));
@@ -336,22 +373,6 @@ export function registerAdminRoutes(app: Express): void {
     if (!ok) return res.status(404).json({ error: 'Instance introuvable' });
     logger.info(`Admin: instance "${decodedId}" restaurée manuellement`);
     res.json({ success: true, message: `Instance "${decodedId}" remise en service` });
-  });
-
-  /**
-   * GET /api/admin/services/degraded — liste les instances dégradées
-   */
-  app.get('/api/admin/services/degraded', async (req, res) => {
-    if (!await requireAdmin(req, res)) return;
-    const degraded = serviceRegistry.getDegraded().map((i) => ({
-      id: i.id,
-      serviceType: i.serviceType,
-      endpoint: i.endpoint,
-      domain: i.domain,
-      degradedAt: i.degradedAt,
-      degradedReason: i.degradedReason,
-    }));
-    res.json({ degraded });
   });
 
   /**
@@ -572,9 +593,11 @@ export function registerAdminRoutes(app: Express): void {
   app.post('/api/admin/lb/services', async (req, res) => {
     if (!await requireAdmin(req, res)) return;
     const { id, serviceType, location } = req.body ?? {};
-    const VALID_TYPES: ServiceType[] = ['users','messages','friends','calls','servers','bots','media'];
-    if (!id || !VALID_TYPES.includes(serviceType) || !location) {
+    if (!id || !location) {
       return res.status(400).json({ error: 'id, serviceType, location requis' });
+    }
+    if (!isServiceType(serviceType)) {
+      return res.status(400).json({ error: `Type inconnu — attendus : ${SERVICE_TYPES.join(', ')}` });
     }
     if (lbRegistry.getById(String(id))) {
       return res.status(409).json({ error: `Un service avec l'id "${id}" existe déjà` });
@@ -582,19 +605,19 @@ export function registerAdminRoutes(app: Express): void {
     const { rawKey, hash } = generateServiceKey();
     lbRegistry.preRegister({
       id: String(id),
-      serviceType: serviceType as ServiceType,
+      serviceType,
       location: String(location).toUpperCase(),
       enabled: true,
       keyHash: hash,
     });
-    monitoringDB.upsertServiceInstance({
+    await monitoringDB.upsertServiceInstance({
       id: String(id),
       serviceType: String(serviceType),
       endpoint: '',
       domain: '',
       location: String(location).toUpperCase(),
     }).catch(() => {});
-    monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
+    await monitoringDB.storeServiceKeyHash(String(id), rawKey).catch(() => {});
     allowedServiceIds.add(String(id));
     bannedServiceIds.delete(String(id));
     logger.info(`Admin: service LB "${id}" créé — clé générée`);

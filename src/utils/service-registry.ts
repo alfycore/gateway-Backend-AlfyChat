@@ -4,6 +4,8 @@ export {
   lbRegistry,
   generateServiceKey,
   hashServiceKey,
+  SERVICE_TYPES,
+  isServiceType,
   type ServiceType,
   type ServiceMetrics,
   type ServiceEntry as ServiceInstance,

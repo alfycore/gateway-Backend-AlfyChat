@@ -6,8 +6,22 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { logger } from '../utils/logger';
 
-export type ServiceType =
-  | 'users' | 'messages' | 'friends' | 'calls' | 'servers' | 'bots' | 'media';
+/**
+ * Types de microservices enregistrables. Seule liste de référence : les routes
+ * admin la valident, le front la reçoit via GET /api/admin/services.
+ * `media-server` (SFU) n'est jamais réparti à la charge : ses salles vivent en
+ * mémoire, le gateway épingle une instance (voir MediaServerProxy).
+ */
+export const SERVICE_TYPES = [
+  'users', 'messages', 'friends', 'calls', 'servers', 'bots', 'media',
+  'serverhosting', 'subscriptions', 'media-server',
+] as const;
+
+export type ServiceType = typeof SERVICE_TYPES[number];
+
+export function isServiceType(v: unknown): v is ServiceType {
+  return typeof v === 'string' && (SERVICE_TYPES as readonly string[]).includes(v);
+}
 
 export interface ServiceMetrics {
   cpuUsage: number;
