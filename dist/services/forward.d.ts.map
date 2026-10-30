@@ -1,1 +1,0 @@
-{"version":3,"file":"forward.d.ts","sourceRoot":"","sources":["../../src/services/forward.ts"],"names":[],"mappings":"AAIA,OAAO,EAAE,MAAM,EAAE,MAAM,WAAW,CAAC;AAInC,2DAA2D;AAC3D,wBAAgB,aAAa,CAAC,QAAQ,EAAE,MAAM,GAAG,MAAM,GAAG,IAAI,CAK7D;AAED,iEAAiE;AACjE,wBAAgB,aAAa,CAC3B,QAAQ,EAAE,MAAM,EAChB,KAAK,EAAE,MAAM,EACb,IAAI,EAAE,GAAG,EACT,SAAS,SAAQ,GAChB,OAAO,CAAC,GAAG,CAAC,CAad"}

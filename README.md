@@ -1,108 +1,32 @@
-# AlfyChat — Gateway
+# AlfyChat — gateway (Rust)
 
-Gateway centralisée WebSocket et reverse proxy pour AlfyChat.
+Point d'entrée unique de la plateforme (port 3000) : API HTTP (proxy vers les microservices, répartition de charge,
+administration), Socket.IO (temps réel) et espace de noms `/server-nodes` (serveurs auto-hébergés).
 
-![Node.js](https://img.shields.io/badge/Bun-1.2-black?logo=bun)
-![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript)
-![Socket.io](https://img.shields.io/badge/Socket.io-4-010101?logo=socket.io)
-![License](https://img.shields.io/badge/License-Source_Available-blue)
+Réécriture en Rust du gateway TypeScript/Express : mêmes routes, mêmes événements Socket.IO, mêmes variables
+d'environnement, mêmes tables MySQL et clés Redis. La version TypeScript reste sur la branche `main`.
 
-## Rôle
+## Pile
+`axum` (HTTP) · `socketioxide` + `socketioxide-redis` (Socket.IO v4, multi-instances) · `redis` · `sqlx` (MySQL) ·
+`reqwest` (proxy et appels aux services) · `jsonwebtoken` · `lettre` (alertes e-mail).
 
-La gateway est le point d'entrée unique de l'infrastructure AlfyChat. Elle assure :
+## Prérequis
+- **Redis ≥ 7** (protocole RESP3 exigé par l'adaptateur Socket.IO).
+- ⚠️ L'adaptateur `socketioxide-redis` n'est **pas compatible** avec `@socket.io/redis-adapter` : ne jamais faire
+  cohabiter un gateway Node et un gateway Rust sur le même Redis pendant une bascule (préfixe Redis distinct : `alfy-gw`).
 
-- **Reverse proxy** vers les microservices REST
-- **WebSocket** (Socket.io) pour la messagerie temps réel, la présence et les appels
-- **Service registry** — enregistrement et découverte dynamique des instances
-- **Rate limiting** par rôle (anonyme, utilisateur, admin)
-- **Load balancing** avec fallback automatique
-- **Monitoring** de la santé des services
-- **Gestion des incidents** (page de statut publique)
-
-## Stack technique
-
-| Catégorie | Technologies |
-|-----------|-------------|
-| Runtime | Bun |
-| Langage | TypeScript |
-| WebSocket | Socket.io |
-| Proxy | HTTP natif |
-| Auth | JWT |
-| Cache / Présence | Redis |
-| Monitoring DB | SQLite (interne) |
-
-## Architecture globale
-
-```
-Frontend (:4000)  →  Gateway (:3000)  ←  ce service
-                         │
-                         ├── users    (:3001)
-                         ├── messages  (:3002)
-                         ├── friends   (:3003)
-                         ├── calls     (:3004)
-                         ├── servers   (:3005)
-                         ├── bots      (:3006)
-                         └── media     (:3007)
-```
-
-## Démarrage
-
-### Prérequis
-
-- [Bun](https://bun.sh/) ≥ 1.2
-- Redis 7
-
-### Variables d'environnement
-
-```env
-PORT=3000
-REDIS_URL=redis://localhost:6379
-JWT_SECRET=
-USERS_SERVICE_URL=http://localhost:3001
-MESSAGES_SERVICE_URL=http://localhost:3002
-FRIENDS_SERVICE_URL=http://localhost:3003
-CALLS_SERVICE_URL=http://localhost:3004
-SERVERS_SERVICE_URL=http://localhost:3005
-BOTS_SERVICE_URL=http://localhost:3006
-MEDIA_SERVICE_URL=https://media.alfychat.com
-```
-
-### Installation
-
+## Lancer
 ```bash
-bun install
+cargo run --release            # variables : voir .env (JWT_SECRET et INTERNAL_SECRET obligatoires)
+cargo test                     # tests unitaires
+docker build -t alfychat-gateway .
 ```
 
-### Développement
+## Tests de parité avec la version TypeScript
+`tools/go-rewrite-parity/gateway/` (dépôt racine) : faux microservices + scénario Socket.IO (50 évènements) + 44 requêtes
+HTTP rejouées sur le TS (`git archive main`, construit) et sur le Rust, puis comparées.
 
-```bash
-bun run dev
-```
-
-### Build production
-
-```bash
-bun run build
-bun run start
-```
-
-### Docker
-
-```bash
-docker compose up gateway
-```
-
-## Structure du projet
-
-```
-src/
-├── index.ts             # Point d'entrée, initialisation Socket.io
-├── handlers/            # Gestionnaires d'événements WebSocket
-├── services/            # Service registry, monitoring, Redis
-├── types/               # Types TypeScript
-└── utils/               # Proxy, rate limiting, utilitaires
-```
-
-## Contribution
-
-Voir [CONTRIBUTING.md](./CONTRIBUTING.md).
+## Écarts connus
+- Une erreur d'authentification Socket.IO n'expose que `message` (pas le champ `data` du TS, p. ex. `bannedUntil`) :
+  socketioxide ne transmet que le texte.
+- Les paquets d'événements portant plusieurs arguments de données ne sont pas pris en charge (le client n'en envoie qu'un).
