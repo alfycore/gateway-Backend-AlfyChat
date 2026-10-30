@@ -3,3 +3,4 @@
 .env.local
 /logs
 /node_modules
+/dist
