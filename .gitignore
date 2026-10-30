@@ -1,9 +1,6 @@
-/node_modules
-
-# Environment variables
+/target
 .env
 .env.local
-.env.*.local
-.env
-
-.env
+/logs
+/node_modules
+/dist
