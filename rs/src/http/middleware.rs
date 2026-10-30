@@ -105,7 +105,7 @@ pub fn apply_cors(base: &mut HeaderMap, method: &Method, headers: &HeaderMap) ->
     false
 }
 
-fn merge_base(resp: &mut Resp, base: &HeaderMap) {
+pub fn merge_base(resp: &mut Resp, base: &HeaderMap) {
     for (name, value) in base.iter() {
         if name == header::VARY {
             let existing = resp.headers().get(header::VARY).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();

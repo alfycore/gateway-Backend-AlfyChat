@@ -29,6 +29,8 @@ pub struct ConnectedClient {
     pub user_id: String,
     pub session_id: String,
     pub connected_at: DateTime<Utc>,
+    /// Profil de l'utilisateur (nom, avatar) — lu pour les listes de participants d'appel.
+    pub user: Value,
 }
 
 #[derive(Clone)]

@@ -734,6 +734,7 @@ dependencies = [
  "sha2",
  "socket2 0.5.10",
  "socketioxide",
+ "socketioxide-core",
  "socketioxide-redis",
  "sqlx",
  "subtle",

@@ -11,6 +11,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 socketioxide = { version = "0.18", features = ["state", "extensions", "v4"] }
 socketioxide-redis = "0.4"
+socketioxide-core = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
