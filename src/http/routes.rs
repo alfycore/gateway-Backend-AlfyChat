@@ -8,7 +8,8 @@ pub fn build() -> Router {
     let mut r = Router::default();
 
     // Auth & utilisateurs
-    for p in ["/api/auth/*", "/api/users/*", "/api/users", "/api/rgpd/*"] {
+    // `/api/reports` : signalements de contenu, servis par le service users.
+    for p in ["/api/auth/*", "/api/users/*", "/api/users", "/api/rgpd/*", "/api/reports/*", "/api/reports"] {
         r.all(p, proxy_h("users", |c| &c.users_url, true, false));
     }
 
