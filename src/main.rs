@@ -1,6 +1,7 @@
 //! AlfyChat — gateway (Rust). Port de `gateway/src` (TypeScript/Express + Socket.IO).
 
 mod anomaly;
+mod channel_kinds;
 mod config;
 mod http;
 mod iso;

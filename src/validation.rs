@@ -366,10 +366,7 @@ pub fn validate_server_input(data: &Value) -> VResult<Map<String, Value>> {
     Ok(out)
 }
 
-const CHANNEL_TYPES: [&str; 16] = [
-    "text", "voice", "forum", "announcement", "stage", "category", "gallery", "poll", "suggestion", "doc", "counting", "vent", "thread", "media",
-    "minigame", "trivia",
-];
+use crate::channel_kinds::CHANNEL_TYPES;
 
 static CHANNEL_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,64}$").unwrap());
 

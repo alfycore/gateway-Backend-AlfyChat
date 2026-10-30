@@ -453,7 +453,7 @@ async fn voice_join(c: Arc<SockCtx>, data: Value, _ack: Ack) {
                     return;
                 };
                 let t = target.get("type").and_then(|t| t.as_str());
-                if t != Some("voice") && t != Some("stage") {
+                if !t.map(crate::channel_kinds::is_voice_kind).unwrap_or(false) {
                     let _ = c.socket.emit("error", &json!({ "message": "Ce salon n'est pas un salon vocal" }));
                     return;
                 }
@@ -649,7 +649,7 @@ async fn voice_moderate(c: Arc<SockCtx>, data: Value, mut ack: Ack) {
     if action == "move" {
         let to = field(&data, "channelId");
         let meta = if val_is_id(to) { get_channel_meta(&app, &server_id, to.as_str().unwrap()).await } else { None };
-        let ok = meta.map(|m| m.kind == "voice" || m.kind == "stage").unwrap_or(false);
+        let ok = meta.map(|m| crate::channel_kinds::is_voice_kind(&m.kind)).unwrap_or(false);
         if !ok {
             return respond(&mut ack, json!({ "error": "INVALID_CHANNEL" }));
         }

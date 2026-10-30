@@ -469,6 +469,18 @@ async fn server_message_send(c: Arc<SockCtx>, data: Value, _ack: Ack) {
         let content = v.content;
         let attachments = v.attachments;
 
+        // Règle du type de salon (lecture seule, médias seuls, liens seuls…), sauf pour la modération.
+        if let Some(rule) = get_channel_meta(&app, &server_id, &channel_id).await.and_then(|m| crate::channel_kinds::rule_of(&m.kind)) {
+            let has_files = attachments.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+            if !rule.allows(&content, has_files) && !check_channel_permission(&app, &c.user_id, &server_id, &channel_id, MANAGE_MESSAGES).await {
+                let _ = c.socket.emit(
+                    "SERVER_MESSAGE_ERROR",
+                    &json!({ "error": "CHANNEL_RULE", "rule": rule.code(), "message": rule.message(), "channelId": channel_id }),
+                );
+                return Ok(());
+            }
+        }
+
         // AutoMod : appliqué à tous sauf aux modérateurs
         if !content.is_empty() && !app.has_node(&server_id) {
             let exempt = check_server_permission_any(&app, &c.user_id, &server_id, MANAGE_MESSAGES | MANAGE_SERVER).await;
