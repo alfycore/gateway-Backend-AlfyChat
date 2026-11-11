@@ -384,6 +384,9 @@ async fn message_send(c: Arc<SockCtx>, data: Value, _ack: Ack) {
     let is_dm_conv = conversation_id.starts_with("dm_");
     let is_group = recipient_id.is_none() && !is_dm_conv;
     let e2ee = data.get("e2eeType").cloned();
+    // Le serveur ne peut pas déchiffrer : la notification porte des identifiants
+    // et l'application mobile compose elle-même le texte (notification-decrypt.ts).
+    let chiffre = e2ee.as_ref().map(|e| truthy(Some(e))).unwrap_or(false) || content.starts_with("ecdh:") || content.starts_with("e2e1:");
     let mut m = Map::new();
     m.insert("id".into(), json!(message_id));
     m.insert("conversationId".into(), json!(conversation_id));
@@ -440,7 +443,13 @@ async fn message_send(c: Arc<SockCtx>, data: Value, _ack: Ack) {
                 } else {
                     "Nouveau message".to_string()
                 };
-                let (a, payload) = (app.clone(), json!({ "userId": rid, "title": c.display_name(), "body": body, "url": format!("/channels/me/{uid}"), "type": "message", "conversationKey": uid }));
+                let (a, payload) = (
+                    app.clone(),
+                    json!({
+                        "userId": rid, "title": c.display_name(), "body": body, "url": format!("/channels/me/{uid}"), "type": "message",
+                        "conversationKey": uid, "messageId": message_id, "conversationId": conversation_id, "senderId": uid, "encrypted": chiffre
+                    }),
+                );
                 tokio::spawn(async move { a.svc.users_send_push(payload).await });
             }
         }
@@ -466,7 +475,7 @@ async fn message_send(c: Arc<SockCtx>, data: Value, _ack: Ack) {
 
     // Groupe : push pour chaque participant hors ligne
     if is_group {
-        let (a, cid, uid2, sender_name) = (app.clone(), conversation_id.clone(), uid.clone(), c.display_name());
+        let (a, cid, uid2, sender_name, mid) = (app.clone(), conversation_id.clone(), uid.clone(), c.display_name(), message_id.clone());
         let body = if e2ee.as_ref().map(|e| !truthy(Some(e))).unwrap_or(true) && !content.is_empty() && !content.starts_with("ecdh:") {
             preview(&content)
         } else {
@@ -482,7 +491,10 @@ async fn message_send(c: Arc<SockCtx>, data: Value, _ack: Ack) {
                 }
                 if a.io().within(format!("user:{pid}")).sockets().is_empty() {
                     a.svc
-                        .users_send_push(json!({ "userId": pid, "title": sender_name, "body": body, "url": format!("/channels/me/{cid}"), "type": "message", "conversationKey": cid }))
+                        .users_send_push(json!({
+                            "userId": pid, "title": sender_name, "body": body, "url": format!("/channels/me/{cid}"), "type": "message",
+                            "conversationKey": cid, "messageId": mid, "conversationId": cid, "senderId": uid2, "encrypted": chiffre
+                        }))
                         .await;
                 }
             }
